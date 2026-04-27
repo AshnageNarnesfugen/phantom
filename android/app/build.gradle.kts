@@ -11,15 +11,13 @@ plugins {
 // fails after flutter clean because the build/app → android/app/build symlink is gone.
 layout.buildDirectory.set(rootProject.rootDir.parentFile.resolve("build/app"))
 
-// Load signing properties from key.properties (local dev) or environment variables (CI)
+// Load signing properties from key.properties (local dev only).
+// In CI, apksigner re-signs the APK after the build, so AGP uses debug signing.
 val keyPropertiesFile = rootProject.file("key.properties")
 val keyProperties = Properties()
 if (keyPropertiesFile.exists()) {
     keyPropertiesFile.inputStream().use { keyProperties.load(it) }
 }
-
-fun signingProp(propName: String, envName: String): String? =
-    keyProperties.getProperty(propName) ?: System.getenv(envName)
 
 android {
     namespace = "com.phantom.phantom_messenger"
@@ -36,10 +34,10 @@ android {
     }
 
     signingConfigs {
-        val storeFilePath = signingProp("storeFile", "SIGNING_STORE_FILE")
-        val storePass    = signingProp("storePassword", "SIGNING_STORE_PASSWORD")
-        val keyAlias     = signingProp("keyAlias", "SIGNING_KEY_ALIAS")
-        val keyPass      = signingProp("keyPassword", "SIGNING_KEY_PASSWORD")
+        val storeFilePath = keyProperties.getProperty("storeFile")
+        val storePass    = keyProperties.getProperty("storePassword")
+        val keyAlias     = keyProperties.getProperty("keyAlias")
+        val keyPass      = keyProperties.getProperty("keyPassword")
 
         if (storeFilePath != null && storePass != null && keyAlias != null && keyPass != null) {
             create("release") {
@@ -61,6 +59,7 @@ android {
 
     buildTypes {
         release {
+            // Local dev uses key.properties; CI re-signs with apksigner after build.
             val releaseSigning = signingConfigs.findByName("release")
             signingConfig = releaseSigning ?: signingConfigs.getByName("debug")
             isMinifyEnabled = true

@@ -31,37 +31,32 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
-      - name: Decode and convert keystore to JKS
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
-          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-        run: |
-          echo "$KEYSTORE_BASE64" | base64 --decode > android/phantom-src.p12
-          keytool -importkeystore \
-            -srckeystore android/phantom-src.p12 \
-            -srcstorepass "$SIGNING_STORE_PASSWORD" \
-            -srckeypass "$SIGNING_KEY_PASSWORD" \
-            -srcalias "$SIGNING_KEY_ALIAS" \
-            -destkeystore android/phantom-release.jks \
-            -deststoretype JKS \
-            -deststorepass "$SIGNING_STORE_PASSWORD" \
-            -destkeypass "$SIGNING_KEY_PASSWORD" \
-            -destalias "$SIGNING_KEY_ALIAS" \
-            -noprompt
-          rm -f android/phantom-src.p12
-
-      - name: Build release APK
-        env:
-          SIGNING_STORE_FILE: ${{ github.workspace }}/android/phantom-release.jks
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+      - name: Build release APK (debug-signed, will be re-signed)
         run: |
           flutter build apk --release \
             --obfuscate \
             --split-debug-info=build/debug-info
+
+      - name: Sign APK with apksigner
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 --decode > /tmp/phantom-release.p12
+
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | tail -1)
+          echo "Using apksigner: $APKSIGNER"
+
+          "$APKSIGNER" sign \
+            --ks /tmp/phantom-release.p12 \
+            --ks-pass "pass:$SIGNING_STORE_PASSWORD" \
+            --ks-key-alias "$SIGNING_KEY_ALIAS" \
+            --key-pass "pass:$SIGNING_KEY_PASSWORD" \
+            build/app/outputs/flutter-apk/app-release.apk
+
+          rm -f /tmp/phantom-release.p12
 
       - name: Rename APK with commit SHA
         id: apk
