@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 import 'dart:math';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -143,11 +144,31 @@ class BluetoothMeshTransport {
       canRelay: true,
       hasPending: _store.pendingCount > 0,
     ).toAdvPayload();
-    await _gattServer.start(advPayload);
+    final startResult = await _gattServer.start(advPayload);
+    if (!startResult.success) {
+      _emitState(MeshState.unavailable(startResult.reason ?? 'No se pudo iniciar BLE'));
+      return;
+    }
 
     // Wire incoming GATT server writes to our receive pipeline
     _subs.add(_gattServer.received.listen((data) {
       _receivePacket(data);
+    }));
+
+    // React to server-side lifecycle events
+    _subs.add(_gattServer.events.listen((event) {
+      switch (event) {
+        case ClientConnected() || ClientDisconnected():
+          _emitState(MeshState.active(peerCount: _peers.length));
+        case MtuChanged(:final isSane):
+          if (!isSane) {
+            // Peer chipset is old — packets will be fragmented into many ATT writes
+            _emitState(MeshState.active(peerCount: _peers.length));
+          }
+        case AdvertiseFailed():
+          // Non-fatal: mesh still works via scanning
+          _emitState(MeshState.active(peerCount: _peers.length));
+      }
     }));
 
     await _startScanning();
@@ -224,6 +245,12 @@ class BluetoothMeshTransport {
     try {
       // Conectar con timeout
       await peer.device.connect(license: License.free, timeout: const Duration(seconds: 8));
+
+      // Request maximum MTU so large mesh packets don't get fragmented into
+      // dozens of 20-byte ATT writes. Android negotiates; iOS does it automatically.
+      if (Platform.isAndroid) {
+        await peer.device.requestMtu(517);
+      }
 
       // Descubrir servicios y cachear la característica
       final services = await peer.device.discoverServices();

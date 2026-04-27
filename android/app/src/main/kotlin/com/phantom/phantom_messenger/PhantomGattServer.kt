@@ -4,9 +4,21 @@ import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import io.flutter.plugin.common.MethodChannel
 import java.util.UUID
+
+/**
+ * Thrown by [PhantomGattServer.start] when the server cannot be started.
+ * [code] maps to the PlatformException code surfaced on the Dart side:
+ *   BT_DISABLED        — adapter is off; user needs to enable Bluetooth
+ *   PERMISSION_DENIED  — BLUETOOTH_CONNECT / ADVERTISE not granted
+ *   GATT_SERVER_FAILED — system rejected openGattServer() (rare hardware issue)
+ */
+class GattStartException(val code: String, override val message: String) : Exception(message)
 
 private val PHANTOM_SVC_UUID  = UUID.fromString("50480001-4d45-5348-424c-450000000001")
 private val PHANTOM_CHAR_UUID = UUID.fromString("50480001-4d45-5348-424c-450000000002")
@@ -34,6 +46,10 @@ private val CCCD_UUID         = UUID.fromString("00002902-0000-1000-8000-00805f9
  *     → notifyCharacteristicChanged for each connected central
  *       → remote phone's characteristic.onValueReceived stream
  *         → their _receivePacket()
+ *
+ * Threading: GATT callbacks arrive on a binder pool thread. All Flutter channel
+ * calls and mutable state (connectedDevices, phantomChar) are dispatched to the
+ * main thread via mainHandler to avoid races.
  */
 @SuppressLint("MissingPermission")
 class PhantomGattServer(
@@ -43,7 +59,10 @@ class PhantomGattServer(
     private val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val btAdapter get() = btManager.adapter
 
+    // All state is read/written only on the main thread (see threading note above).
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var gattServer: BluetoothGattServer? = null
+    private var phantomChar: BluetoothGattCharacteristic? = null
     private val connectedDevices = mutableSetOf<BluetoothDevice>()
     private var advertiseCallback: AdvertiseCallback? = null
 
@@ -54,9 +73,12 @@ class PhantomGattServer(
      *
      * @param msdPayload 8-byte MeshAdvertisement payload:
      *   [0xFF][0xFF][0x50][hint0][hint1][hint2][hint3][caps]
-     *   (same format as MeshAdvertisement.toAdvPayload())
+     * @throws GattStartException if BT is off, permissions are missing, or the GATT server fails.
      */
     fun start(msdPayload: ByteArray) {
+        if (!btAdapter.isEnabled) {
+            throw GattStartException("BT_DISABLED", "Bluetooth está apagado")
+        }
         startGattServer()
         startAdvertising(msdPayload)
     }
@@ -80,13 +102,16 @@ class PhantomGattServer(
             )
         }
 
+        phantomChar = char
+
         val service = BluetoothGattService(
             PHANTOM_SVC_UUID,
             BluetoothGattService.SERVICE_TYPE_PRIMARY,
         ).also { it.addCharacteristic(char) }
 
         gattServer = btManager.openGattServer(context, gattCallback)
-            .also { it.addService(service) }
+            ?.also { it.addService(service) }
+            ?: throw GattStartException("GATT_SERVER_FAILED", "No se pudo abrir el GATT server")
     }
 
     private fun startAdvertising(msdPayload: ByteArray) {
@@ -96,7 +121,7 @@ class PhantomGattServer(
         // Android addManufacturerData(companyId=0xFFFF, data=[0x50, h0, h1, h2, h3, caps])
         val companyId = 0xFFFF
         val advBytes  = if (msdPayload.size >= 8) msdPayload.drop(2).toByteArray()
-                        else byteArrayOf(0x50, 0, 0, 0, 0, 0) // fallback
+                        else byteArrayOf(0x50, 0, 0, 0, 0, 0)
 
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
@@ -112,9 +137,24 @@ class PhantomGattServer(
             .build()
 
         val cb = object : AdvertiseCallback() {
-            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { /* advertising started */ }
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {}
             override fun onStartFailure(errorCode: Int) {
-                // Non-fatal — mesh still works via scanning if advertising fails
+                when (errorCode) {
+                    // Transient failures — retry after a short delay
+                    ADVERTISE_FAILED_INTERNAL_ERROR,
+                    ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> {
+                        mainHandler.postDelayed({
+                            if (advertiseCallback != null) {
+                                btAdapter.bluetoothLeAdvertiser
+                                    ?.startAdvertising(settings, data, this)
+                            }
+                        }, 5_000)
+                    }
+                    // Permanent failure — notify Dart so the UI can inform the user
+                    else -> mainHandler.post {
+                        channel.invokeMethod("onAdvertiseFailed", errorCode)
+                    }
+                }
             }
         }
         advertiseCallback = cb
@@ -131,19 +171,42 @@ class PhantomGattServer(
         }
         gattServer?.close()
         gattServer = null
+        phantomChar = null
         connectedDevices.clear()
     }
 
     // ── Notify all connected centrals ─────────────────────────────────────────
 
-    fun notifyAll(data: ByteArray) {
-        val server = gattServer ?: return
-        val char = server.getService(PHANTOM_SVC_UUID)
-            ?.getCharacteristic(PHANTOM_CHAR_UUID) ?: return
-        char.value = data
-        connectedDevices.toSet().forEach { device ->
-            server.notifyCharacteristicChanged(device, char, false)
+    /**
+     * Push [data] to every connected central via GATT notification.
+     * Returns the number of centrals that were successfully notified.
+     *
+     * Must be called from the main thread (MethodCallHandler guarantee).
+     *
+     * On API 33+: uses the new per-call data parameter to avoid the shared
+     * characteristic.value buffer that causes corruption under concurrent calls.
+     * On older APIs: characteristic.value is set once per device iteration;
+     * since this runs on the main thread it is never concurrent.
+     */
+    fun notifyAll(data: ByteArray): Int {
+        val server = gattServer ?: return 0
+        val char = phantomChar ?: return 0
+
+        var delivered = 0
+        for (device in connectedDevices.toList()) {
+            val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                @Suppress("NewApi")
+                server.notifyCharacteristicChanged(device, char, false, data) ==
+                    BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                char.value = data
+                @Suppress("DEPRECATION")
+                server.notifyCharacteristicChanged(device, char, false)
+            }
+            if (ok) delivered++
         }
+        return delivered
     }
 
     // ── GATT server callbacks ─────────────────────────────────────────────────
@@ -155,11 +218,21 @@ class PhantomGattServer(
             status: Int,
             newState: Int,
         ) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                connectedDevices.add(device)
-            } else {
-                connectedDevices.remove(device)
+            // Dispatch to main thread so connectedDevices is only touched there.
+            mainHandler.post {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    connectedDevices.add(device)
+                    channel.invokeMethod("onClientConnected", device.address)
+                } else {
+                    connectedDevices.remove(device)
+                    channel.invokeMethod("onClientDisconnected", device.address)
+                }
             }
+        }
+
+        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            // Notify Dart so the transport layer can warn about low-MTU peers.
+            mainHandler.post { channel.invokeMethod("onMtuChanged", mtu) }
         }
 
         override fun onCharacteristicWriteRequest(
@@ -171,13 +244,16 @@ class PhantomGattServer(
             offset: Int,
             value: ByteArray,
         ) {
+            // sendResponse must be called from the callback thread
             if (responseNeeded) {
                 gattServer?.sendResponse(
                     device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null,
                 )
             }
-            // Forward the raw bytes to Dart as a List<Int>
-            channel.invokeMethod("onWrite", value.map { it.toInt() and 0xFF })
+            // Copy before posting — Android may reuse the buffer after this returns
+            val copy = value.copyOf()
+            // Send ByteArray directly; StandardMethodCodec maps it to Uint8List on Dart side
+            mainHandler.post { channel.invokeMethod("onWrite", copy) }
         }
 
         override fun onDescriptorWriteRequest(

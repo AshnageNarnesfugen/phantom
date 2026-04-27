@@ -26,22 +26,21 @@ class MainActivity : FlutterActivity() {
         channel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "start" -> {
-                    val bytes = (call.arguments as List<*>)
-                        .map { (it as Int).toByte() }
-                        .toByteArray()
-                    server.start(bytes)
-                    result.success(null)
+                    // Dart sends Uint8List → arrives as ByteArray via StandardMethodCodec
+                    try {
+                        server.start(call.arguments as ByteArray)
+                        result.success(null)
+                    } catch (e: GattStartException) {
+                        result.error(e.code, e.message, null)
+                    }
                 }
                 "stop" -> {
                     server.stop()
                     result.success(null)
                 }
                 "notifyAll" -> {
-                    val bytes = (call.arguments as List<*>)
-                        .map { (it as Int).toByte() }
-                        .toByteArray()
-                    server.notifyAll(bytes)
-                    result.success(null)
+                    val delivered = server.notifyAll(call.arguments as ByteArray)
+                    result.success(delivered)
                 }
                 else -> result.notImplemented()
             }
