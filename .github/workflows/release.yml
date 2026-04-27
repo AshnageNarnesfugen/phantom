@@ -50,13 +50,19 @@ jobs:
           fi
 
           # Secrets stored as base64 to avoid newline encoding issues
-          echo "$SIGNING_PRIVATE_KEY" | base64 --decode > /tmp/signing-key.pem
+          echo "$SIGNING_PRIVATE_KEY" | base64 --decode > /tmp/signing-key-raw.pem
           echo "$SIGNING_CERTIFICATE" | base64 --decode > /tmp/signing-cert.pem
 
-          # Verify the key is RSA
-          openssl rsa -in /tmp/signing-key.pem -check -noout
+          # apksigner requires PKCS#8 format; convert from PKCS#1 if needed
+          openssl pkcs8 -topk8 -nocrypt \
+            -in /tmp/signing-key-raw.pem \
+            -out /tmp/signing-key.pem
 
-          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | tail -1)
+          # Use older build-tools apksigner (34.x) — 37.x has ML-DSA regression
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | grep -v "35\|36\|37" | tail -1)
+          if [ -z "$APKSIGNER" ]; then
+            APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | tail -1)
+          fi
           echo "Using apksigner: $APKSIGNER"
 
           "$APKSIGNER" sign \
@@ -64,7 +70,7 @@ jobs:
             --cert /tmp/signing-cert.pem \
             build/app/outputs/flutter-apk/app-release.apk
 
-          rm -f /tmp/signing-key.pem /tmp/signing-cert.pem
+          rm -f /tmp/signing-key-raw.pem /tmp/signing-key.pem /tmp/signing-cert.pem
 
       - name: Rename APK with commit SHA
         id: apk
