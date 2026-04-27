@@ -42,35 +42,19 @@ jobs:
           SIGNING_PRIVATE_KEY: ${{ secrets.SIGNING_PRIVATE_KEY }}
           SIGNING_CERTIFICATE: ${{ secrets.SIGNING_CERTIFICATE }}
         run: |
-          # Diagnose secret availability (shows length, never content)
-          echo "SIGNING_PRIVATE_KEY length: ${#SIGNING_PRIVATE_KEY}"
-          echo "SIGNING_CERTIFICATE length: ${#SIGNING_CERTIFICATE}"
-          if [ -z "$SIGNING_PRIVATE_KEY" ]; then
-            echo "ERROR: SIGNING_PRIVATE_KEY secret is not set"; exit 1
-          fi
-
-          # Secrets stored as base64 to avoid newline encoding issues
+          # Decode base64 secrets
           echo "$SIGNING_PRIVATE_KEY" | base64 --decode > /tmp/signing-key-raw.pem
           echo "$SIGNING_CERTIFICATE" | base64 --decode > /tmp/signing-cert.pem
 
-          # Debug: show key type and ASN.1 OID
-          echo "--- Key file header ---"
-          head -1 /tmp/signing-key-raw.pem
-          echo "--- ASN.1 structure ---"
-          openssl asn1parse -in /tmp/signing-key-raw.pem 2>&1 | head -10 || true
-
-          # Force traditional PKCS#1 RSA output, then convert to PKCS#8
-          openssl rsa -in /tmp/signing-key-raw.pem -out /tmp/signing-key-rsa.pem 2>&1
-          echo "--- After rsa export, convert to PKCS#8 DER ---"
+          # Convert to PKCS#1 then to PKCS#8 DER (compatible with apksigner 34.x)
+          openssl rsa -in /tmp/signing-key-raw.pem -out /tmp/signing-key-rsa.pem 2>/dev/null
           openssl pkcs8 -topk8 -nocrypt -outform DER \
             -in /tmp/signing-key-rsa.pem \
             -out /tmp/signing-key.der
 
+          # Use apksigner 34.x — newer versions have regressions with RSA keys
           APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | grep -v "35\|36\|37" | tail -1)
-          if [ -z "$APKSIGNER" ]; then
-            APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | tail -1)
-          fi
-          echo "Using apksigner: $APKSIGNER"
+          [ -z "$APKSIGNER" ] && APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | tail -1)
 
           "$APKSIGNER" sign \
             --key /tmp/signing-key.der \
