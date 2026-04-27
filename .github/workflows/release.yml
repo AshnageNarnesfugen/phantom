@@ -25,7 +25,6 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.27.0"
           channel: stable
           cache: true
 
@@ -50,22 +49,24 @@ jobs:
             --split-debug-info=build/debug-info
 
       - name: Rename APK with commit SHA
+        id: apk
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           VERSION=$(grep '^version:' pubspec.yaml | sed 's/version: //' | tr -d '\n')
+          APK_NAME="phantom-${VERSION}-${SHORT_SHA}.apk"
           mv build/app/outputs/flutter-apk/app-release.apk \
-             build/app/outputs/flutter-apk/phantom-${VERSION}-${SHORT_SHA}.apk
-          echo "APK_NAME=phantom-${VERSION}-${SHORT_SHA}.apk" >> $GITHUB_ENV
+             build/app/outputs/flutter-apk/${APK_NAME}
+          echo "name=${APK_NAME}" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.sha }}
-          name: "Phantom ${{ env.APK_NAME }}"
+          name: "Phantom ${{ steps.apk.outputs.name }}"
           body: |
             **Commit:** [`${{ github.sha }}`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
             **Message:** ${{ github.event.head_commit.message }}
 
             > Automated build. Install by enabling "Install from unknown sources" on your device.
-          files: build/app/outputs/flutter-apk/${{ env.APK_NAME }}
+          files: build/app/outputs/flutter-apk/${{ steps.apk.outputs.name }}
           prerelease: true
