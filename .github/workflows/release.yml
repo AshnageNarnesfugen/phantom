@@ -31,11 +31,26 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
-      - name: Decode keystore
+      - name: Decode and convert keystore to JKS
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
         run: |
-          echo "$KEYSTORE_BASE64" | base64 --decode > android/phantom-release.jks
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/phantom-src.p12
+          keytool -importkeystore \
+            -srckeystore android/phantom-src.p12 \
+            -srcstorepass "$SIGNING_STORE_PASSWORD" \
+            -srckeypass "$SIGNING_KEY_PASSWORD" \
+            -srcalias "$SIGNING_KEY_ALIAS" \
+            -destkeystore android/phantom-release.jks \
+            -deststoretype JKS \
+            -deststorepass "$SIGNING_STORE_PASSWORD" \
+            -destkeypass "$SIGNING_KEY_PASSWORD" \
+            -destalias "$SIGNING_KEY_ALIAS" \
+            -noprompt
+          rm -f android/phantom-src.p12
 
       - name: Build release APK
         env:
