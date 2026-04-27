@@ -31,7 +31,7 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
-      - name: Build release APK (debug-signed, will be re-signed)
+      - name: Build release APK
         run: |
           flutter build apk --release \
             --obfuscate \
@@ -39,24 +39,31 @@ jobs:
 
       - name: Sign APK with apksigner
         env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_PRIVATE_KEY: ${{ secrets.SIGNING_PRIVATE_KEY }}
+          SIGNING_CERTIFICATE: ${{ secrets.SIGNING_CERTIFICATE }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          echo "$KEYSTORE_BASE64" | base64 --decode > /tmp/phantom-release.p12
+          echo "$SIGNING_PRIVATE_KEY" > /tmp/signing-key.pem
+          echo "$SIGNING_CERTIFICATE" > /tmp/signing-cert.pem
+
+          openssl pkcs12 -export \
+            -legacy \
+            -in /tmp/signing-cert.pem \
+            -inkey /tmp/signing-key.pem \
+            -out /tmp/phantom-release.p12 \
+            -name "phantom" \
+            -passout "pass:$SIGNING_KEY_PASSWORD"
 
           APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | tail -1)
-          echo "Using apksigner: $APKSIGNER"
 
           "$APKSIGNER" sign \
             --ks /tmp/phantom-release.p12 \
-            --ks-pass "pass:$SIGNING_STORE_PASSWORD" \
-            --ks-key-alias "$SIGNING_KEY_ALIAS" \
+            --ks-pass "pass:$SIGNING_KEY_PASSWORD" \
+            --ks-key-alias "phantom" \
             --key-pass "pass:$SIGNING_KEY_PASSWORD" \
             build/app/outputs/flutter-apk/app-release.apk
 
-          rm -f /tmp/phantom-release.p12
+          rm -f /tmp/signing-key.pem /tmp/signing-cert.pem /tmp/phantom-release.p12
 
       - name: Rename APK with commit SHA
         id: apk
