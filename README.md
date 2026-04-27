@@ -1,50 +1,50 @@
 # Phantom Messenger
 
-**Sin número de teléfono. Sin servidor. Sin metadatos.**
+**No phone number. No server. No metadata.**
 
-Phantom es un mensajero Android cifrado de extremo a extremo diseñado para comunicaciones donde la privacidad no es opcional. Tu identidad es una frase de 12 palabras que existe solo en tu dispositivo. No hay cuenta que crear, no hay servidor que confiar, no hay empresa que pueda entregarte.
+Phantom is an end-to-end encrypted Android messenger designed for communications where privacy is not optional. Your identity is a 12-word phrase that exists only on your device. There is no account to create, no server to trust, no company that can hand you over.
 
 ---
 
-## Cómo funciona
+## How it works
 
-### Identidad
+### Identity
 
-Tu identidad se deriva determinísticamente desde una **seed phrase BIP39** (12 palabras):
+Your identity is derived deterministically from a **BIP39 seed phrase** (12 words):
 
 ```
-seed phrase (12 palabras)
-  → entropy 512-bit via PBKDF2
-    → Ed25519 keypair    (firma de mensajes)
-    → X25519 keypair     (cifrado Diffie-Hellman)
-      → PhantomID        (base58check del X25519 public key — lo que compartes)
+seed phrase (12 words)
+  → 512-bit entropy via PBKDF2
+    → Ed25519 keypair    (message signing)
+    → X25519 keypair     (Diffie-Hellman encryption)
+      → PhantomID        (base58check of X25519 public key — what you share)
 ```
 
-No hay registro. No hay email. No hay número de teléfono. Si pierdes tu seed phrase, pierdes acceso permanentemente — no hay recuperación de cuenta porque no hay cuenta.
+No registration. No email. No phone number. If you lose your seed phrase, you lose access permanently — there is no account recovery because there is no account.
 
-### Cifrado: X3DH + Double Ratchet + Kyber-768
+### Encryption: X3DH + Double Ratchet + Kyber-768
 
-El protocolo de mensajería es idéntico al de Signal, con soporte adicional para criptografía post-cuántica:
+The messaging protocol is identical to Signal's, with additional support for post-quantum cryptography:
 
-**Primer mensaje (X3DH — Extended Triple Diffie-Hellman):**
+**First message (X3DH — Extended Triple Diffie-Hellman):**
 ```
 DH1 = DH(IK_Alice,  SPK_Bob)
 DH2 = DH(EK_Alice,  IK_Bob)
 DH3 = DH(EK_Alice,  SPK_Bob)
 SK  = HKDF(DH1 ‖ DH2 ‖ DH3)
 ```
-Kyber-768 (resistente a computadoras cuánticas) se mezcla en el SK cuando ambos dispositivos lo soportan.
+Kyber-768 (quantum-resistant) is mixed into SK when both devices support it.
 
-**Mensajes siguientes (Double Ratchet con header encryption):**
-- Cada mensaje usa una clave diferente derivada con HKDF
-- Compromiso de una clave no compromete mensajes anteriores ni futuros (forward secrecy + break-in recovery)
-- Los headers del ratchet también van cifrados — un observador no puede correlacionar mensajes
+**Subsequent messages (Double Ratchet with header encryption):**
+- Each message uses a different key derived via HKDF
+- Compromising one key does not compromise past or future messages (forward secrecy + break-in recovery)
+- Ratchet headers are also encrypted — an observer cannot correlate messages
 
-### Cómo agregar un contacto
+### How to add a contact
 
-En lugar de números de teléfono o usernames, Phantom usa **ContactAddress**: un blob de ~220 caracteres en base64url que contiene tu PreKeyBundle completo (identity key, signed prekey, one-time prekeys, public key Kyber). Lo compartes una vez — por QR, por texto, por cualquier canal — y ambos pueden iniciar conversaciones.
+Instead of phone numbers or usernames, Phantom uses a **ContactAddress**: a ~220-character base64url blob containing your full PreKeyBundle (identity key, signed prekey, one-time prekeys, Kyber public key). You share it once — via QR code, text, or any channel — and both parties can initiate conversations.
 
-### Transporte
+### Transport
 
 All configured internet transports run **concurrently** — there is no priority order among them. Messages are published to every active backend simultaneously; incoming messages arrive from all of them and the Double Ratchet discards duplicates automatically.
 
@@ -59,25 +59,25 @@ The only fallback boundary is **internet → BLE mesh → offline queue** (72h T
 
 The transport layer **does not know the content** — it only moves encrypted bytes. Messages are published to topics derived from the recipient's PhantomID: `/phantom/v1/{phantomId}`.
 
-### Almacenamiento local
+### Local storage
 
-Todo se guarda en **Hive con AES-GCM**. La clave de cifrado se deriva de tu seed phrase via HKDF-SHA512 con salt `phantom-storage-v1`. Nada sale del dispositivo sin cifrar.
+Everything is stored in **Hive with AES-GCM**. The encryption key is derived from your seed phrase via HKDF-SHA512 with salt `phantom-storage-v1`. Nothing leaves the device unencrypted.
 
 ---
 
-## Instalación
+## Installation
 
-### Desde GitHub Releases (recomendado)
+### From GitHub Releases (recommended)
 
-1. Descarga el APK más reciente desde [Releases](https://github.com/AshnageNarnesfugen/phantom/releases)
-2. En tu Android: **Ajustes → Seguridad → Instalar apps desconocidas** → habilitar para tu navegador/gestor de archivos
-3. Abre el APK e instala
+1. Download the latest APK from [Releases](https://github.com/AshnageNarnesfugen/phantom/releases)
+2. On your Android device: **Settings → Security → Install unknown apps** → enable for your browser/file manager
+3. Open the APK and install
 
-> Cada push a `main` genera automáticamente un release firmado con RSA-4096.
+> Every push to `main` automatically generates a release signed with RSA-4096.
 
-### Desde el código fuente
+### From source
 
-**Prerrequisitos:** Flutter ≥ 3.27, Java 21, Android SDK
+**Prerequisites:** Flutter ≥ 3.27, Java 21, Android SDK
 
 ```bash
 git clone https://github.com/AshnageNarnesfugen/phantom
@@ -86,36 +86,36 @@ flutter pub get
 flutter build apk --release
 ```
 
-El APK queda en `build/app/outputs/flutter-apk/app-release.apk`.
+The APK will be at `build/app/outputs/flutter-apk/app-release.apk`.
 
 ---
 
-## Uso
+## Usage
 
-### Primera vez: crear cuenta
+### First time: create an account
 
-1. Abre Phantom → **Create new account**
-2. La app genera una seed phrase de 12 palabras
-3. **Anótala en papel y guárdala en un lugar seguro** — es tu única credencial
-4. La app deriva tu identidad y queda lista
+1. Open Phantom → **Create new account**
+2. The app generates a 12-word seed phrase
+3. **Write it down on paper and store it somewhere safe** — it is your only credential
+4. The app derives your identity and is ready to use
 
-### Restaurar en otro dispositivo
+### Restore on another device
 
-1. Abre Phantom → **Restore account**
-2. Introduce tus 12 palabras en orden
-3. Tu identidad (PhantomID, claves) se reconstruye determinísticamente — idéntica al original
+1. Open Phantom → **Restore account**
+2. Enter your 12 words in order
+3. Your identity (PhantomID, keys) is reconstructed deterministically — identical to the original
 
-### Agregar un contacto
+### Add a contact
 
-1. Ve a **Add contact**
-2. Pega el **ContactAddress** de la otra persona (los ~220 caracteres que te compartió)
-3. Envía un primer mensaje — el handshake X3DH ocurre automáticamente en el fondo
+1. Go to **Add contact**
+2. Paste the other person's **ContactAddress** (the ~220 characters they shared with you)
+3. Send a first message — the X3DH handshake happens automatically in the background
 
-Para que alguien te agregue a ti, comparte tu ContactAddress desde **Settings → My contact address**.
+For someone to add you, share your ContactAddress from **Settings → My contact address**.
 
-### Transportes opcionales del sistema
+### Optional system transports
 
-**IPFS (transporte por defecto cuando hay internet):**
+**IPFS (default internet transport):**
 ```bash
 # Arch Linux
 yay -S kubo
@@ -124,33 +124,33 @@ ipfs config --json Experimental.Pubsub true
 ipfs daemon --enable-pubsub-experiment &
 ```
 
-**Bluetooth mesh (automático cuando no hay internet):**
-Android pide los permisos necesarios en runtime la primera vez que se necesitan.
+**Bluetooth mesh (automatic when there is no internet):**
+Android requests the necessary permissions at runtime the first time they are needed.
 
 ---
 
-## Arquitectura del código
+## Code architecture
 
 ```
 lib/
 ├── main.dart                        — startup, secure storage, routing
-├── core_provider.dart               — InheritedWidget con PhantomCore y ThemeController
+├── core_provider.dart               — InheritedWidget with PhantomCore and ThemeController
 ├── core/
 │   ├── identity/identity.dart       — BIP39 → Ed25519 + X25519 → PhantomID
 │   ├── crypto/
-│   │   ├── x3dh.dart                — handshake inicial, ContactAddress (165 bytes)
-│   │   ├── double_ratchet.dart      — forward secrecy con header encryption
+│   │   ├── x3dh.dart                — initial handshake, ContactAddress (165 bytes)
+│   │   ├── double_ratchet.dart      — forward secrecy with header encryption
 │   │   └── hybrid_kem.dart          — Kyber-768 + X25519 hybrid KEM
 │   ├── protocol/
-│   │   ├── frame.dart               — WireFrame: INIT (0x49) y MSG (0x4D)
+│   │   ├── frame.dart               — WireFrame: INIT (0x49) and MSG (0x4D)
 │   │   └── message.dart             — PhantomMessage, PhantomEnvelope, StoredMessage
 │   ├── storage/
-│   │   ├── phantom_storage.dart     — Hive AES-GCM, clave derivada de seed
-│   │   └── backup_manager.dart      — export/import cifrado de backup
-│   └── phantom_core.dart            — fachada principal: createAccount, sendMessage…
+│   │   ├── phantom_storage.dart     — Hive AES-GCM, key derived from seed
+│   │   └── backup_manager.dart      — encrypted backup export/import
+│   └── phantom_core.dart            — main facade: createAccount, sendMessage…
 ├── transport/
-│   ├── transport.dart               — interfaz abstracta + IPFS + Yggdrasil + I2P
-│   ├── transport_manager_v2.dart    — detección automática + fallback internet→BLE
+│   ├── transport.dart               — abstract interface + IPFS + Yggdrasil + I2P
+│   ├── transport_manager_v2.dart    — automatic detection + internet→BLE fallback
 │   └── bluetooth/
 │       ├── bluetooth_mesh_transport.dart
 │       ├── gatt_server_channel.dart
@@ -164,27 +164,27 @@ lib/
 
 ---
 
-## Modelo de seguridad
+## Security model
 
-Phantom asume que el adversario conoce el protocolo completo. La seguridad no depende del secreto del código.
+Phantom assumes the adversary knows the full protocol. Security does not depend on code secrecy.
 
-**Lo que Phantom protege:**
-- Contenido de los mensajes (cifrado E2E, nadie más puede leerlos)
-- Metadatos de red (el transporte solo ve bytes cifrados y un topic hash)
-- Identidad del remitente en mensajes individuales (header encryption)
+**What Phantom protects:**
+- Message content (E2E encrypted, no one else can read it)
+- Network metadata (the transport sees only encrypted bytes and a topic hash)
+- Sender identity within individual messages (header encryption)
 
-**Lo que Phantom no protege (por diseño):**
-- El hecho de que dos PhantomIDs se comunican (observable por quien controla el transporte)
-- Ataques físicos al dispositivo si el SO está comprometido
-- Pérdida de la seed phrase
+**What Phantom does not protect (by design):**
+- The fact that two PhantomIDs are communicating (observable by whoever controls the transport)
+- Physical attacks on the device if the OS is compromised
+- Loss of the seed phrase
 
-**Propiedades criptográficas:**
-- **Forward secrecy:** comprometer la clave de hoy no descifra mensajes de ayer
-- **Break-in recovery:** comprometer la clave de hoy no descifra mensajes de mañana
-- **Post-quantum:** resistente a ataques con computadoras cuánticas (Kyber-768)
+**Cryptographic properties:**
+- **Forward secrecy:** compromising today's key does not decrypt yesterday's messages
+- **Break-in recovery:** compromising today's key does not decrypt tomorrow's messages
+- **Post-quantum:** resistant to attacks from quantum computers (Kyber-768)
 
 ---
 
-## Licencia
+## License
 
-[AGPL-3.0](LICENSE) — el código es libre, las modificaciones deben serlo también.
+[AGPL-3.0](LICENSE) — the code is free, modifications must be too.
