@@ -42,6 +42,13 @@ jobs:
           SIGNING_PRIVATE_KEY: ${{ secrets.SIGNING_PRIVATE_KEY }}
           SIGNING_CERTIFICATE: ${{ secrets.SIGNING_CERTIFICATE }}
         run: |
+          # Diagnose secret availability (shows length, never content)
+          echo "SIGNING_PRIVATE_KEY length: ${#SIGNING_PRIVATE_KEY}"
+          echo "SIGNING_CERTIFICATE length: ${#SIGNING_CERTIFICATE}"
+          if [ -z "$SIGNING_PRIVATE_KEY" ]; then
+            echo "ERROR: SIGNING_PRIVATE_KEY secret is not set"; exit 1
+          fi
+
           # Secrets stored as base64 to avoid newline encoding issues
           echo "$SIGNING_PRIVATE_KEY" | base64 --decode > /tmp/signing-key.pem
           echo "$SIGNING_CERTIFICATE" | base64 --decode > /tmp/signing-cert.pem
