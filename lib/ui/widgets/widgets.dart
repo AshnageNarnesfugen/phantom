@@ -4,14 +4,12 @@ import '../theme/phantom_theme.dart';
 import '../../core/protocol/message.dart' show MessageStatus;
 
 // ── ChatBubble ────────────────────────────────────────────────────────────────
-// El widget más importante — future theme hook: el tema puede reemplazar esto
-// completamente con su propio BubbleWidget.
 
 class ChatBubble extends StatelessWidget {
   final String text;
   final bool isOutgoing;
-  final String timeLabel;   // ya con ruido aplicado, formateado
-  final bool showTail;      // primer mensaje de un bloque del mismo sender
+  final String timeLabel;   // already formatted with noise applied
+  final bool showTail;      // first message in a run from the same sender
   final MessageStatus status;
 
   const ChatBubble({
@@ -287,7 +285,7 @@ class ConversationTile extends StatelessWidget {
   final String? lastMessage;
   final String? timeLabel;
   final int unreadCount;
-  final bool isOnline;       // placeholder — en Phantom no hay "online"
+  final bool isOnline;       // placeholder — Phantom has no "online" status
   final VoidCallback onTap;
 
   const ConversationTile({
@@ -316,7 +314,7 @@ class ConversationTile extends StatelessWidget {
         ),
         child: Row(
           children: [
-            // Avatar — letra inicial + accent ring si hay unread
+            // Avatar — initial letter + accent ring when there are unreads
             _Avatar(
               name: displayName,
               hasUnread: unreadCount > 0,
@@ -324,7 +322,7 @@ class ConversationTile extends StatelessWidget {
             ),
             const SizedBox(width: 12),
 
-            // Texto
+            // Text content
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -451,7 +449,6 @@ class _Avatar extends StatelessWidget {
 }
 
 // ── PhantomIdDisplay ──────────────────────────────────────────────────────────
-// Muestra un PhantomID con opción de copiar y QR futuro.
 
 class PhantomIdDisplay extends StatefulWidget {
   final String phantomId;

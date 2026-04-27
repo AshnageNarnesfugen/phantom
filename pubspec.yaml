@@ -12,39 +12,39 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # ── Identidad / BIP39 ──────────────────────────────────────────────────────
+  # ── Identity / BIP39 ───────────────────────────────────────────────────────
   bip39: ^1.0.6
   ed25519_hd_key: ^2.2.1
   bs58check: ^1.0.2
 
-  # ── Criptografía ───────────────────────────────────────────────────────────
+  # ── Cryptography ───────────────────────────────────────────────────────────
   cryptography: ^2.9.0
 
-  # ── Storage local cifrado ──────────────────────────────────────────────────
-  # Hive con serialización JSON manual — no necesitamos hive_generator
-  # ni build_runner (tienen conflicto de analyzer con el SDK actual).
+  # ── Encrypted local storage ────────────────────────────────────────────────
+  # Hive with manual JSON serialization — hive_generator and build_runner
+  # are not needed (they conflict with the current analyzer version).
   hive: ^2.2.3
   hive_flutter: ^1.1.0
 
-  # ── Transporte BLE ─────────────────────────────────────────────────────────
+  # ── BLE transport ──────────────────────────────────────────────────────────
   flutter_blue_plus: ^2.2.1
 
-  # ── Conectividad (internet vs BLE fallback) ────────────────────────────────
+  # ── Connectivity (internet vs BLE fallback) ────────────────────────────────
   connectivity_plus: ^7.1.1
 
-  # ── Permisos runtime (BT, localización) ───────────────────────────────────
+  # ── Runtime permissions (BT, location) ────────────────────────────────────
   permission_handler: ^12.0.1
 
   # ── HTTP (IPFS API) ────────────────────────────────────────────────────────
   http: ^1.2.1
 
-  # ── Path provider (storage path en mobile/desktop) ─────────────────────────
+  # ── Path provider (storage path on mobile/desktop) ─────────────────────────
   path_provider: ^2.1.3
 
   # ── Secure storage (seed phrase persistence) ───────────────────────────────
   flutter_secure_storage: ^10.0.0
 
-  # ── Utilidades ─────────────────────────────────────────────────────────────
+  # ── Utilities ──────────────────────────────────────────────────────────────
   uuid: ^4.3.3
   convert: ^3.1.1
   meta: ^1.12.0
@@ -55,8 +55,8 @@ dependency_overrides:
     path: local_packages/post_quantum
 
 dev_dependencies:
-  # flutter_test ya provee expect/test/group.
-  # No usamos package:test (conflicto de analyzer con el SDK).
+  # flutter_test already provides expect/test/group.
+  # package:test is not used (conflicts with the analyzer version).
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0

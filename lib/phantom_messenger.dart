@@ -1,6 +1,6 @@
 /// Phantom Messenger — Public API
 ///
-/// Import este archivo para acceder a todo el core:
+/// Import this file to access the full core:
 ///
 /// ```dart
 /// import 'package:phantom_messenger/phantom_messenger.dart';

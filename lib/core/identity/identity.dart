@@ -5,32 +5,32 @@ import 'package:cryptography/cryptography.dart';
 import 'package:bs58check/bs58check.dart' as bs58check;
 import 'package:meta/meta.dart';
 
-/// Phantom identity derivada deterministicamente desde una seed phrase BIP39.
+/// Phantom identity derived deterministically from a BIP39 seed phrase.
 ///
-/// Flujo:
-///   seed phrase (12/24 palabras)
+/// Derivation flow:
+///   seed phrase (12/24 words)
 ///     → entropy (512 bits via PBKDF2)
 ///       → Ed25519 keypair (signing)
-///         → X25519 keypair (Diffie-Hellman / cifrado)
-///           → PhantomID (base58check del public key X25519)
+///         → X25519 keypair (Diffie-Hellman / encryption)
+///           → PhantomID (base58check of X25519 public key)
 ///
-/// La seed phrase es la ÚNICA credencial. Sin email, sin número, sin servidor.
+/// The seed phrase is the ONLY credential. No email, no phone number, no server.
 @immutable
 class PhantomIdentity {
-  /// Clave privada Ed25519 (para firmar mensajes).
+  /// Ed25519 private key (for signing messages).
   final SimpleKeyPairData signingKeyPair;
 
-  /// Clave privada X25519 (para DH / cifrado E2E).
+  /// X25519 private key (for DH / E2E encryption).
   final SimpleKeyPairData encryptionKeyPair;
 
-  /// ID público — lo que compartes con otros usuarios.
-  /// Formato: base58check del public key X25519 (43-44 chars).
+  /// Public ID — what you share with other users.
+  /// Format: base58check of X25519 public key (43-44 chars).
   final String phantomId;
 
-  /// Public key X25519 en bytes (para DH).
+  /// X25519 public key bytes (for DH).
   final Uint8List encryptionPublicKeyBytes;
 
-  /// Public key Ed25519 en bytes (para verificar firmas).
+  /// Ed25519 public key bytes (for signature verification).
   final Uint8List signingPublicKeyBytes;
 
   const PhantomIdentity._({
@@ -41,43 +41,43 @@ class PhantomIdentity {
     required this.signingPublicKeyBytes,
   });
 
-  /// Genera una identidad NUEVA con seed phrase aleatoria.
+  /// Generates a NEW identity with a random seed phrase.
   static Future<({PhantomIdentity identity, String seedPhrase})>
       generateNew() async {
-    final mnemonic = bip39.generateMnemonic(strength: 256); // 24 palabras
+    final mnemonic = bip39.generateMnemonic(strength: 256); // 24 words
     final identity = await fromSeedPhrase(mnemonic);
     return (identity: identity, seedPhrase: mnemonic);
   }
 
-  /// Restaura una identidad existente desde seed phrase.
-  /// Lanza [InvalidSeedPhraseException] si la phrase es inválida.
+  /// Restores an existing identity from a seed phrase.
+  /// Throws [InvalidSeedPhraseException] if the phrase is invalid.
   static Future<PhantomIdentity> fromSeedPhrase(String seedPhrase) async {
     final normalized = seedPhrase.trim().toLowerCase();
     if (!bip39.validateMnemonic(normalized)) {
       throw const InvalidSeedPhraseException(
-        'Seed phrase inválida: verifica las palabras y el orden.',
+        'Invalid seed phrase: check the words and their order.',
       );
     }
 
-    // BIP39 → seed de 512 bits
+    // BIP39 → 512-bit seed
     final seedBytes = Uint8List.fromList(bip39.mnemonicToSeed(normalized));
 
-    // Derivar Ed25519 signing keypair via BIP32-Ed25519
+    // Derive Ed25519 signing keypair via BIP32-Ed25519
     // Path: m/phantom'/0'/signing' (hardened)
     final signingRaw = await _deriveEd25519(seedBytes, "m/44'/7331'/0'/0'");
 
-    // Derivar X25519 encryption keypair
-    // Path: m/phantom'/0'/encryption' (hardened, path diferente)
+    // Derive X25519 encryption keypair
+    // Path: m/phantom'/0'/encryption' (hardened, distinct path)
     final encryptionRaw = await _deriveX25519FromSeed(seedBytes, "m/44'/7331'/0'/1");
 
-    // Construir keypairs usando la librería cryptography
+    // Build keypairs using the cryptography library
     final edAlgo = Ed25519();
     final signingKP = await edAlgo.newKeyPairFromSeed(signingRaw);
 
     final x25519Algo = X25519();
     final encryptionKP = await x25519Algo.newKeyPairFromSeed(encryptionRaw);
 
-    // Extraer public keys en bytes
+    // Extract public keys as bytes
     final signingPub = await signingKP.extractPublicKey();
     final encryptionPub = await encryptionKP.extractPublicKey();
 
@@ -85,7 +85,7 @@ class PhantomIdentity {
     final encryptionPubBytes = Uint8List.fromList(encryptionPub.bytes);
 
     // PhantomID = base58check(version_byte + X25519_public_key)
-    // Version byte 0x50 ('P' de Phantom)
+    // Version byte 0x50 ('P' for Phantom)
     final idPayload = Uint8List(33);
     idPayload[0] = 0x50;
     idPayload.setRange(1, 33, encryptionPubBytes);
@@ -100,32 +100,32 @@ class PhantomIdentity {
     );
   }
 
-  /// Decodifica un PhantomID y extrae el public key X25519.
-  /// Lanza [InvalidPhantomIdException] si el ID es inválido.
+  /// Decodes a PhantomID and extracts the X25519 public key.
+  /// Throws [InvalidPhantomIdException] if the ID is invalid.
   static Uint8List decodeId(String phantomId) {
     try {
       final decoded = bs58check.decode(phantomId);
       if (decoded.length != 33 || decoded[0] != 0x50) {
-        throw const InvalidPhantomIdException('ID con formato incorrecto.');
+        throw const InvalidPhantomIdException('ID has incorrect format.');
       }
       return Uint8List.fromList(decoded.sublist(1));
     } catch (e) {
-      throw InvalidPhantomIdException('PhantomID inválido: $e');
+      throw InvalidPhantomIdException('Invalid PhantomID: $e');
     }
   }
 
-  // ── Derivación de claves ──────────────────────────────────────────────────
+  // ── Key derivation ────────────────────────────────────────────────────────
 
-  /// Deriva 32 bytes para Ed25519 usando ed25519_hd_key (BIP32-Ed25519).
+  /// Derives 32 bytes for Ed25519 using ed25519_hd_key (BIP32-Ed25519).
   static Future<Uint8List> _deriveEd25519(
       Uint8List seed, String path) async {
     final key = await ED25519_HD_KEY.derivePath(path, seed);
     return Uint8List.fromList(key.key);
   }
 
-  /// Deriva 32 bytes para X25519 usando HKDF desde el seed BIP39.
-  /// X25519 no tiene derivación HD estándar, así que usamos HKDF con
-  /// el path como "info" para separación de dominios.
+  /// Derives 32 bytes for X25519 using HKDF from the BIP39 seed.
+  /// X25519 has no standard HD derivation, so we use HKDF with
+  /// the path as "info" for domain separation.
   static Future<Uint8List> _deriveX25519FromSeed(
       Uint8List seed, String path) async {
     final hkdf = Hkdf(
@@ -135,7 +135,7 @@ class PhantomIdentity {
     final secretKey = SecretKey(seed);
     final output = await hkdf.deriveKey(
       secretKey: secretKey,
-      nonce: Uint8List(0), // sin salt — el seed ya tiene alta entropía
+      nonce: Uint8List(0), // no salt — seed already has high entropy
       info: Uint8List.fromList('phantom-x25519-$path'.codeUnits),
     );
     return Uint8List.fromList(await output.extractBytes());
@@ -145,7 +145,7 @@ class PhantomIdentity {
   String toString() => 'PhantomIdentity(id: $phantomId)';
 }
 
-// ── Excepciones ──────────────────────────────────────────────────────────────
+// ── Exceptions ───────────────────────────────────────────────────────────────
 
 class InvalidSeedPhraseException implements Exception {
   final String message;

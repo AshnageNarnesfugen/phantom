@@ -5,16 +5,16 @@ import 'bluetooth/bluetooth_mesh_transport.dart';
 import 'bluetooth/mesh_protocol.dart';
 import 'bluetooth/message_store.dart';
 
-/// TransportManager v2 — gestiona todos los transportes con fallback automático.
+/// TransportManager v2 — manages all transports with automatic fallback.
 ///
-/// Prioridad de transporte:
-///   1. Internet disponible → IPFS / I2P / Yggdrasil (según config)
-///   2. Sin internet        → Bluetooth mesh
-///   3. Sin BT ni internet  → Mensajes quedan en MessageStore local (72h TTL)
+/// Transport priority:
+///   1. Internet available  → IPFS / I2P / Yggdrasil (per config)
+///   2. No internet         → Bluetooth mesh
+///   3. No BT or internet   → Messages queued in local MessageStore (72h TTL)
 ///
-/// El switch entre modos es transparente para la app.
-/// Los mensajes pendientes en el store se entregan en cuanto
-/// aparece el transporte apropiado.
+/// Mode switching is transparent to the app.
+/// Pending messages in the store are delivered as soon as the
+/// appropriate transport becomes available.
 
 enum TransportMode { internet, bluetoothMesh, offline }
 
@@ -22,8 +22,8 @@ class TransportManagerV2 {
   final BluetoothMeshTransport _btMesh;
   final MessageStore _store;
 
-  // Transporte de internet (del TransportManager original)
-  // Aquí representado como callback para no reimplementar todo
+  // Internet transport (from the original TransportManager)
+  // Represented as a callback to avoid re-implementing everything
   final Future<void> Function({
     required String recipientId,
     required Uint8List encryptedEnvelope,
@@ -33,7 +33,7 @@ class TransportManagerV2 {
   bool _initialized = false;
   String _ourId = '';
 
-  // Streams públicos
+  // Public streams
   final _incomingController = StreamController<IncomingEnvelope>.broadcast();
   final _modeController = StreamController<TransportMode>.broadcast();
 
@@ -54,26 +54,26 @@ class TransportManagerV2 {
         _store = store,
         _internetPublish = internetPublish;
 
-  // ── Inicialización ────────────────────────────────────────────────────────
+  // ── Initialization ────────────────────────────────────────────────────────
 
   Future<void> initialize({required String ourId}) async {
     if (_initialized) return;
     _initialized = true;
     _ourId = ourId;
 
-    // Monitorear conectividad — connectivity_plus v6+ emite List<ConnectivityResult>
+    // Monitor connectivity — connectivity_plus v6+ emits List<ConnectivityResult>
     _subs.add(
       Connectivity().onConnectivityChanged.listen((results) {
         _handleConnectivityChange(results);
       }),
     );
 
-    // Iniciar BLE mesh siempre (funciona en paralelo o como fallback)
+    // Always start BLE mesh (works in parallel or as fallback)
     final btOk = await _btMesh.initialize();
     if (btOk) {
       await _btMesh.start();
 
-      // Recibir mensajes del mesh BLE
+      // Receive messages from the BLE mesh
       _subs.add(
         _btMesh.deliveredEnvelopes.listen((envelope) {
           _incomingController.add(IncomingEnvelope(
@@ -85,12 +85,12 @@ class TransportManagerV2 {
       );
     }
 
-    // Verificar conectividad inicial — v6+ devuelve List<ConnectivityResult>
+    // Check initial connectivity — v6+ returns List<ConnectivityResult>
     final results = await Connectivity().checkConnectivity();
     _handleConnectivityChange(results);
   }
 
-  // ── Envío ─────────────────────────────────────────────────────────────────
+  // ── Sending ───────────────────────────────────────────────────────────────
 
   Future<SendResult> publish({
     required String recipientId,
@@ -106,7 +106,7 @@ class TransportManagerV2 {
           );
           return SendResult.sent(via: TransportSource.internet);
         } catch (e) {
-          // Internet falló — intentar BLE como fallback
+          // Internet failed — fall back to BLE
           return _sendViaBluetooth(
             recipientId: recipientId,
             fullMessageId: fullMessageId,
@@ -122,7 +122,7 @@ class TransportManagerV2 {
         );
 
       case TransportMode.offline:
-        // Sin transporte disponible — guardar en store local
+        // No transport available — save to local store
         final ok = _store.enqueue(
           MeshPacket.message(
             fullMessageId: fullMessageId,
@@ -134,7 +134,7 @@ class TransportManagerV2 {
         );
         return ok
             ? SendResult.queued()
-            : SendResult.failed('Store lleno');
+            : SendResult.failed('Store full');
     }
   }
 
@@ -144,7 +144,7 @@ class TransportManagerV2 {
     required Uint8List encryptedEnvelope,
   }) async {
     if (_btMesh.peerCount == 0) {
-      // Sin peers BLE — guardar en store para cuando aparezcan
+      // No BLE peers — save to store until they appear
       _store.enqueue(
         MeshPacket.message(
           fullMessageId: fullMessageId,
@@ -166,7 +166,7 @@ class TransportManagerV2 {
     return SendResult.sent(via: TransportSource.bluetoothMesh);
   }
 
-  // ── Conectividad ──────────────────────────────────────────────────────────
+  // ── Connectivity ──────────────────────────────────────────────────────────
 
   void _handleConnectivityChange(List<ConnectivityResult> results) {
     final hasInternet = results.any((r) =>
@@ -185,7 +185,7 @@ class TransportManagerV2 {
       _mode = newMode;
       _modeController.add(_mode);
 
-      // Al recuperar internet, intentar entregar mensajes del store
+      // When internet is recovered, try to flush the store
       if (newMode == TransportMode.internet) {
         _flushStoreViaInternet();
       }
@@ -216,7 +216,7 @@ class TransportManagerV2 {
     }
   }
 
-  // ── Estado público ────────────────────────────────────────────────────────
+  // ── Public state ──────────────────────────────────────────────────────────
 
   MessageStore get messageStore => _store;
 
@@ -235,7 +235,7 @@ class TransportManagerV2 {
   }
 }
 
-// ── Tipos de resultado ────────────────────────────────────────────────────────
+// ── Result types ──────────────────────────────────────────────────────────────
 
 enum TransportSource { internet, bluetoothMesh, stored }
 

@@ -5,20 +5,20 @@ import 'package:uuid/uuid.dart';
 import 'package:meta/meta.dart';
 import '../crypto/double_ratchet.dart';
 
-/// Protocolo de mensajes de Phantom.
+/// Phantom message protocol.
 ///
-/// Garantías de privacidad:
-///   - Sin remitente en el envelope (sealed sender)
-///   - Sin timestamps reales (ruido de ±5 min)
-///   - Padding a bloque fijo de 1KB — todos los mensajes tienen el mismo tamaño
-///   - Sin metadatos de sesión en el wire format
-///   - MAC del envelope con HMAC-SHA256 (integridad del envelope completo)
+/// Privacy guarantees:
+///   - No sender in the envelope (sealed sender)
+///   - No real timestamps (±5 min noise)
+///   - Fixed 1 KB block padding — all messages are the same size on the wire
+///   - No session metadata in the wire format
+///   - Envelope MAC via ChaCha20-Poly1305 AEAD (covers header + ciphertext)
 
-// ── Tamaño de bloque para padding ────────────────────────────────────────────
+// ── Block size for padding ────────────────────────────────────────────────────
 
-const int _blockSize = 1024; // bytes — todos los mensajes ocupan múltiplos de 1KB
+const int _blockSize = 1024; // bytes — all messages are multiples of 1 KB
 
-// ── Tipos de contenido ────────────────────────────────────────────────────────
+// ── Content types ─────────────────────────────────────────────────────────────
 
 enum MessageType {
   text(0x01),
@@ -35,29 +35,29 @@ enum MessageType {
   static MessageType fromCode(int code) {
     return MessageType.values.firstWhere(
       (t) => t.code == code,
-      orElse: () => throw ProtocolException('Tipo de mensaje desconocido: $code'),
+      orElse: () => throw ProtocolException('Unknown message type: $code'),
     );
   }
 }
 
-// ── Mensaje interno (antes de cifrar) ─────────────────────────────────────────
+// ── Internal message (before encryption) ──────────────────────────────────────
 
 @immutable
 class PhantomMessage {
-  /// ID único del mensaje (UUID v4).
+  /// Unique message ID (UUID v4).
   final String id;
 
-  /// Tipo de contenido.
+  /// Content type.
   final MessageType type;
 
-  /// Contenido serializado (texto UTF-8, bytes de imagen, etc.).
+  /// Serialized content (UTF-8 text, image bytes, etc.).
   final Uint8List content;
 
-  /// Timestamp con ruido añadido (±5 minutos) — no el real.
-  /// En microsegundos Unix para mayor resistencia a análisis.
+  /// Noisy timestamp (±5 minutes) — not the real time.
+  /// Microseconds since Unix epoch for stronger traffic-analysis resistance.
   final int noisyTimestampUs;
 
-  /// Referencia al mensaje que se responde (opcional).
+  /// Reference to the message being replied to (optional).
   final String? replyToId;
 
   PhantomMessage({
@@ -69,7 +69,7 @@ class PhantomMessage {
   })  : id = id ?? const Uuid().v4(),
         noisyTimestampUs = timestampUs ?? _noisyTimestamp();
 
-  /// Constructor para mensajes de texto.
+  /// Factory constructor for plain text messages.
   factory PhantomMessage.text(String text, {String? replyToId}) {
     return PhantomMessage(
       type: MessageType.text,
@@ -78,7 +78,7 @@ class PhantomMessage {
     );
   }
 
-  /// Serializa a bytes para cifrar.
+  /// Serializes to bytes for encryption.
   Uint8List serialize() {
     final idBytes = utf8.encode(id);
     final replyBytes = replyToId != null ? utf8.encode(replyToId!) : <int>[];
@@ -100,31 +100,31 @@ class PhantomMessage {
   static PhantomMessage deserialize(Uint8List bytes) {
     // Minimum: 1 (type) + 8 (ts) + 2 (idLen) + 0 (id) + 2 (replyLen) + 4 (contentLen) = 17
     if (bytes.length < 17) {
-      throw const ProtocolException('Mensaje serializado demasiado corto.');
+      throw const ProtocolException('Serialized message too short.');
     }
     int offset = 0;
 
     final typeCode = bytes[offset++];
     final type = MessageType.fromCode(typeCode);
 
-    if (offset + 8 > bytes.length) throw const ProtocolException('Truncado al leer timestamp.');
+    if (offset + 8 > bytes.length) throw const ProtocolException('Truncated reading timestamp.');
     final timestamp = _readInt64BE(bytes, offset);
     offset += 8;
 
-    if (offset + 2 > bytes.length) throw const ProtocolException('Truncado al leer idLen.');
+    if (offset + 2 > bytes.length) throw const ProtocolException('Truncated reading idLen.');
     final idLen = _readInt16BE(bytes, offset);
     offset += 2;
     if (idLen < 0 || offset + idLen > bytes.length) {
-      throw ProtocolException('idLen inválido: $idLen');
+      throw ProtocolException('Invalid idLen: $idLen');
     }
     final id = utf8.decode(bytes.sublist(offset, offset + idLen));
     offset += idLen;
 
-    if (offset + 2 > bytes.length) throw const ProtocolException('Truncado al leer replyLen.');
+    if (offset + 2 > bytes.length) throw const ProtocolException('Truncated reading replyLen.');
     final replyLen = _readInt16BE(bytes, offset);
     offset += 2;
     if (replyLen < 0 || offset + replyLen > bytes.length) {
-      throw ProtocolException('replyLen inválido: $replyLen');
+      throw ProtocolException('Invalid replyLen: $replyLen');
     }
     String? replyToId;
     if (replyLen > 0) {
@@ -132,11 +132,11 @@ class PhantomMessage {
     }
     offset += replyLen;
 
-    if (offset + 4 > bytes.length) throw const ProtocolException('Truncado al leer contentLen.');
+    if (offset + 4 > bytes.length) throw const ProtocolException('Truncated reading contentLen.');
     final contentLen = _readInt32BE(bytes, offset);
     offset += 4;
     if (contentLen < 0 || offset + contentLen > bytes.length) {
-      throw ProtocolException('contentLen inválido: $contentLen');
+      throw ProtocolException('Invalid contentLen: $contentLen');
     }
     final content = Uint8List.fromList(bytes.sublist(offset, offset + contentLen));
 
@@ -151,32 +151,32 @@ class PhantomMessage {
 
   String get textContent => utf8.decode(content);
 
-  // CSPRNG compartido — inicializado una vez por proceso.
+  // Shared CSPRNG — initialized once per process.
   static final _rng = Random.secure();
 
   static int _noisyTimestamp() {
     final realUs = DateTime.now().microsecondsSinceEpoch;
-    // Ruido CSPRNG uniforme ±5 minutos en microsegundos.
-    // Random.secure() usa el CSPRNG del SO — no determinístico.
+    // Uniform CSPRNG noise ±5 minutes in microseconds.
+    // Random.secure() uses the OS CSPRNG — non-deterministic.
     final noiseUs = _rng.nextInt(600000000) - 300000000;
     return realUs + noiseUs;
   }
 }
 
-// ── Envelope cifrado (lo que va por la red) ───────────────────────────────────
+// ── Encrypted envelope (what travels over the wire) ───────────────────────────
 
 @immutable
 class PhantomEnvelope {
-  /// Versión del protocolo (1 byte).
+  /// Protocol version (1 byte).
   static const int protocolVersion = 0x01;
 
-  /// Header cifrado del Double Ratchet (sealed sender).
+  /// Encrypted Double Ratchet header (sealed sender).
   final Uint8List encryptedHeader;
 
-  /// Ciphertext del mensaje con padding.
+  /// Padded message ciphertext.
   final Uint8List ciphertext;
 
-  /// Nonce usado para cifrar el mensaje (12 bytes, aleatorio).
+  /// Nonce used to encrypt the message (12 bytes, random).
   final Uint8List nonce;
 
   const PhantomEnvelope({
@@ -210,35 +210,35 @@ class PhantomEnvelope {
   static PhantomEnvelope fromWireFormat(Uint8List wire) {
     // Minimum: 1 (ver) + 4 (hLen) + 0 (header) + 4 (cLen) + 0 (cipher) + 12 (nonce) = 21
     if (wire.length < 21) {
-      throw const ProtocolException('Envelope demasiado corto.');
+      throw const ProtocolException('Envelope too short.');
     }
     int offset = 0;
 
     final version = wire[offset++];
     if (version != protocolVersion) {
       throw ProtocolException(
-          'Versión de protocolo no soportada: $version (esperado: $protocolVersion)');
+          'Unsupported protocol version: $version (expected: $protocolVersion)');
     }
 
-    if (offset + 4 > wire.length) throw const ProtocolException('Envelope truncado al leer headerLen.');
+    if (offset + 4 > wire.length) throw const ProtocolException('Envelope truncated reading headerLen.');
     final headerLen = _readInt32BE(wire, offset);
     offset += 4;
     if (headerLen < 0 || offset + headerLen > wire.length) {
-      throw ProtocolException('headerLen inválido: $headerLen');
+      throw ProtocolException('Invalid headerLen: $headerLen');
     }
     final encHeader = Uint8List.fromList(wire.sublist(offset, offset + headerLen));
     offset += headerLen;
 
-    if (offset + 4 > wire.length) throw const ProtocolException('Envelope truncado al leer ciphertextLen.');
+    if (offset + 4 > wire.length) throw const ProtocolException('Envelope truncated reading ciphertextLen.');
     final cipherLen = _readInt32BE(wire, offset);
     offset += 4;
     if (cipherLen < 16 || offset + cipherLen > wire.length) {
-      throw ProtocolException('ciphertextLen inválido: $cipherLen');
+      throw ProtocolException('Invalid ciphertextLen: $cipherLen');
     }
     final cipher = Uint8List.fromList(wire.sublist(offset, offset + cipherLen));
     offset += cipherLen;
 
-    if (offset + 12 > wire.length) throw const ProtocolException('Nonce truncado.');
+    if (offset + 12 > wire.length) throw const ProtocolException('Nonce truncated.');
     final nonce = Uint8List.fromList(wire.sublist(offset, offset + 12));
 
     return PhantomEnvelope(
@@ -249,14 +249,14 @@ class PhantomEnvelope {
   }
 }
 
-// ── Encoder / Decoder de alto nivel ──────────────────────────────────────────
+// ── High-level encoder / decoder ─────────────────────────────────────────────
 
 class PhantomProtocol {
   final RatchetSession _session;
 
   PhantomProtocol(this._session);
 
-  /// Cifra un [PhantomMessage] y devuelve el wire format listo para transmitir.
+  /// Encrypts a [PhantomMessage] and returns the wire-format bytes ready to transmit.
   Future<Uint8List> encode(PhantomMessage message) async {
     final serialized = message.serialize();
     final padded = _applyPadding(serialized);
@@ -271,7 +271,7 @@ class PhantomProtocol {
     return envelope.toWireFormat();
   }
 
-  /// Descifra un wire format y devuelve el [PhantomMessage].
+  /// Decrypts wire-format bytes and returns the [PhantomMessage].
   Future<PhantomMessage> decode(Uint8List wire) async {
     final envelope = PhantomEnvelope.fromWireFormat(wire);
 
@@ -294,8 +294,8 @@ class PhantomProtocol {
 
   // ── Padding ────────────────────────────────────────────────────────────────
 
-  /// Padding PKCS#7 a múltiplos de _blockSize.
-  /// El tamaño fijo elimina análisis de tráfico por tamaño de mensaje.
+  /// PKCS#7 padding to multiples of _blockSize.
+  /// Fixed size eliminates traffic analysis based on message length.
   static Uint8List _applyPadding(Uint8List data) {
     final targetSize = ((data.length ~/ _blockSize) + 1) * _blockSize;
     final padLen = targetSize - data.length;
@@ -306,17 +306,17 @@ class PhantomProtocol {
   }
 
   static Uint8List _removePadding(Uint8List data) {
-    if (data.isEmpty) throw const ProtocolException('Datos vacíos al remover padding.');
+    if (data.isEmpty) throw const ProtocolException('Empty data when removing padding.');
     final padLen = data.last;
     if (padLen == 0 || padLen > _blockSize) {
-      throw ProtocolException('Padding inválido: $padLen');
+      throw ProtocolException('Invalid padding: $padLen');
     }
     return data.sublist(0, data.length - padLen);
   }
 
 }
 
-// ── Modelo de mensaje almacenado localmente ───────────────────────────────────
+// ── Locally stored message model ─────────────────────────────────────────────
 
 enum MessageStatus { sending, sent, delivered, read, failed }
 enum MessageDirection { outgoing, incoming }
@@ -324,7 +324,7 @@ enum MessageDirection { outgoing, incoming }
 @immutable
 class StoredMessage {
   final String id;
-  final String conversationId; // phantomId del contacto
+  final String conversationId; // phantomId of the contact
   final MessageType type;
   final Uint8List content;
   final int timestampUs;
@@ -343,7 +343,7 @@ class StoredMessage {
     this.replyToId,
   });
 
-  /// Texto del mensaje (solo válido si type == text).
+  /// Message text (only valid when type == text).
   String get textContent => utf8.decode(content);
 
   DateTime get timestamp =>
@@ -381,7 +381,7 @@ class StoredMessage {
   }
 }
 
-// ── Excepciones ───────────────────────────────────────────────────────────────
+// ── Exceptions ────────────────────────────────────────────────────────────────
 
 class ProtocolException implements Exception {
   final String message;
@@ -390,7 +390,7 @@ class ProtocolException implements Exception {
   String toString() => 'ProtocolException: $message';
 }
 
-// ── Utilidades de serialización binaria ───────────────────────────────────────
+// ── Binary serialization helpers ─────────────────────────────────────────────
 
 Uint8List _int16BE(int v) => Uint8List(2)
   ..[0] = (v >> 8) & 0xFF
