@@ -6,13 +6,15 @@ import 'package:meta/meta.dart';
 
 /// Abstract transport layer.
 ///
-/// Supports multiple backends with automatic detection and fallback:
-///   1. Yggdrasil (IPv6 mesh — lower latency, no central server)
-///   2. I2P (maximum privacy — layered onion routing, slower)
-///   3. IPFS pubsub (decentralized — works without dedicated nodes)
+/// All configured backends run concurrently when available:
+///   - Yggdrasil (IPv6 mesh — lower latency, no central server)
+///   - I2P (maximum privacy — layered onion routing, slower)
+///   - IPFS pubsub (decentralized — works without dedicated nodes)
 ///
-/// The app tries backends in that order and uses the first available one.
-/// Users can force a specific transport in settings.
+/// Messages are published to every active backend simultaneously.
+/// Incoming messages arrive from all active backends; the Double Ratchet
+/// naturally discards duplicates by rejecting already-seen counters.
+/// The only fallback boundary is internet (all backends) vs BLE mesh.
 
 // ── Abstract interface ────────────────────────────────────────────────────────
 
@@ -54,12 +56,18 @@ class IncomingEnvelope {
 
 class TransportManager {
   final List<PhantomTransport> _transports;
-  PhantomTransport? _activeTransport;
+  final List<PhantomTransport> _activeTransports = [];
   final StreamController<IncomingEnvelope> _incomingController =
       StreamController.broadcast();
 
   Stream<IncomingEnvelope> get incoming => _incomingController.stream;
-  String? get activeTransportName => _activeTransport?.name;
+
+  /// Names of all currently active transports (empty until [initialize] is called).
+  List<String> get activeTransportNames =>
+      _activeTransports.map((t) => t.name).toList();
+
+  /// True once at least one transport is active.
+  bool get isActive => _activeTransports.isNotEmpty;
 
   TransportManager({
     String? ipfsApiUrl,
@@ -74,42 +82,48 @@ class TransportManager {
           IpfsTransport(apiUrl: ipfsApiUrl ?? 'http://127.0.0.1:5001'),
         ];
 
-  /// Initializes and selects the best available transport.
+  /// Starts all available transports concurrently.
+  /// Throws only when no transport at all is reachable.
   Future<void> initialize({required String ourId}) async {
     for (final transport in _transports) {
       final available = await transport.checkAvailability();
       if (available) {
-        _activeTransport = transport;
-        // Start listening in the background
+        _activeTransports.add(transport);
         transport.subscribe(ourId: ourId).listen(
           _incomingController.add,
-          onError: (e) => _handleTransportError(e),
+          onError: (_) {}, // individual transport errors are non-fatal
         );
-        return;
       }
     }
-    throw const TransportException(
-        'No transport available. Make sure IPFS, I2P, or Yggdrasil is running.');
+    if (_activeTransports.isEmpty) {
+      throw const TransportException(
+          'No transport available. Make sure IPFS, I2P, or Yggdrasil is running.');
+    }
   }
 
+  /// Publishes to every active transport simultaneously.
+  /// Succeeds if at least one transport delivers the message.
   Future<void> publish({
     required String recipientId,
     required Uint8List encryptedEnvelope,
   }) async {
-    final transport = _activeTransport;
-    if (transport == null) {
+    if (_activeTransports.isEmpty) {
       throw const TransportException('TransportManager not initialized.');
     }
-    await transport.publish(
-      recipientId: recipientId,
-      encryptedEnvelope: encryptedEnvelope,
-    );
-  }
-
-  void _handleTransportError(dynamic error) {
-    // In production: attempt fallback to the next transport.
-    // For now just propagate the error.
-    _incomingController.addError(error);
+    Object? lastError;
+    int successes = 0;
+    for (final transport in _activeTransports) {
+      try {
+        await transport.publish(
+          recipientId: recipientId,
+          encryptedEnvelope: encryptedEnvelope,
+        );
+        successes++;
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    if (successes == 0) throw lastError!;
   }
 
   Future<void> dispose() async {

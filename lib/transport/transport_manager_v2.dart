@@ -5,16 +5,15 @@ import 'bluetooth/bluetooth_mesh_transport.dart';
 import 'bluetooth/mesh_protocol.dart';
 import 'bluetooth/message_store.dart';
 
-/// TransportManager v2 — manages all transports with automatic fallback.
+/// TransportManager v2 — top-level transport coordinator.
 ///
-/// Transport priority:
-///   1. Internet available  → IPFS / I2P / Yggdrasil (per config)
-///   2. No internet         → Bluetooth mesh
-///   3. No BT or internet   → Messages queued in local MessageStore (72h TTL)
+/// Two modes, one fallback boundary:
+///   internet  → all available backends (IPFS, I2P, Yggdrasil) run concurrently
+///   no internet → Bluetooth mesh
+///   no BT either → messages queued in local MessageStore (72h TTL)
 ///
-/// Mode switching is transparent to the app.
-/// Pending messages in the store are delivered as soon as the
-/// appropriate transport becomes available.
+/// All internet transports publish and receive simultaneously; there is no
+/// priority order among them. The only fallback is internet → BLE → offline.
 
 enum TransportMode { internet, bluetoothMesh, offline }
 

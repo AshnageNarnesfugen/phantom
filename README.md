@@ -46,16 +46,18 @@ En lugar de números de teléfono o usernames, Phantom usa **ContactAddress**: u
 
 ### Transporte
 
-La app detecta automáticamente qué transporte está disponible y hace fallback en orden:
+All configured internet transports run **concurrently** — there is no priority order among them. Messages are published to every active backend simultaneously; incoming messages arrive from all of them and the Double Ratchet discards duplicates automatically.
 
-| Prioridad | Transporte | Característica |
-|-----------|-----------|----------------|
-| 1 | Yggdrasil | Mesh IPv6 global, sin servidor central |
-| 2 | I2P | Routing en capas tipo onion, máxima privacidad de red |
-| 3 | IPFS pubsub | Descentralizado, funciona sin nodos propios |
-| 4 | BLE Mesh | Sin internet — Bluetooth entre dispositivos cercanos |
+| Layer | Transport | When active |
+|-------|-----------|-------------|
+| Internet (concurrent) | Yggdrasil | Global IPv6 mesh, no central server |
+| Internet (concurrent) | I2P | Onion-layer routing, maximum network privacy |
+| Internet (concurrent) | IPFS pubsub | Decentralized, works without dedicated nodes |
+| Fallback | BLE Mesh | No internet — Bluetooth between nearby devices |
 
-El transporte **no conoce el contenido** — solo mueve bytes cifrados. Los mensajes se publican en topics derivados del PhantomID del destinatario: `/phantom/v1/{phantomId}`.
+The only fallback boundary is **internet → BLE mesh → offline queue** (72h TTL). BLE is not a tiebreaker among internet transports; it activates only when internet is fully absent.
+
+The transport layer **does not know the content** — it only moves encrypted bytes. Messages are published to topics derived from the recipient's PhantomID: `/phantom/v1/{phantomId}`.
 
 ### Almacenamiento local
 
