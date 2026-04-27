@@ -41,29 +41,21 @@ jobs:
         env:
           SIGNING_PRIVATE_KEY: ${{ secrets.SIGNING_PRIVATE_KEY }}
           SIGNING_CERTIFICATE: ${{ secrets.SIGNING_CERTIFICATE }}
-          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          echo "$SIGNING_PRIVATE_KEY" > /tmp/signing-key.pem
-          echo "$SIGNING_CERTIFICATE" > /tmp/signing-cert.pem
-
-          openssl pkcs12 -export \
-            -legacy \
-            -in /tmp/signing-cert.pem \
-            -inkey /tmp/signing-key.pem \
-            -out /tmp/phantom-release.p12 \
-            -name "phantom" \
-            -passout "pass:$SIGNING_KEY_PASSWORD"
+          # printf preserves newlines that GitHub may have encoded as \n in the secret
+          printf '%s' "$SIGNING_PRIVATE_KEY" | sed 's/\\n/\n/g' > /tmp/signing-key.pem
+          printf '%s' "$SIGNING_CERTIFICATE" | sed 's/\\n/\n/g' > /tmp/signing-cert.pem
 
           APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | tail -1)
+          echo "Using apksigner: $APKSIGNER"
 
+          # apksigner supports PEM key+cert directly — no keystore needed
           "$APKSIGNER" sign \
-            --ks /tmp/phantom-release.p12 \
-            --ks-pass "pass:$SIGNING_KEY_PASSWORD" \
-            --ks-key-alias "phantom" \
-            --key-pass "pass:$SIGNING_KEY_PASSWORD" \
+            --key /tmp/signing-key.pem \
+            --cert /tmp/signing-cert.pem \
             build/app/outputs/flutter-apk/app-release.apk
 
-          rm -f /tmp/signing-key.pem /tmp/signing-cert.pem /tmp/phantom-release.p12
+          rm -f /tmp/signing-key.pem /tmp/signing-cert.pem
 
       - name: Rename APK with commit SHA
         id: apk
