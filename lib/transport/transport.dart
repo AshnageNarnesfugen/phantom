@@ -82,26 +82,34 @@ class TransportManager {
           IpfsTransport(apiUrl: ipfsApiUrl ?? 'http://127.0.0.1:5001'),
         ];
 
-  /// Starts all available transports concurrently.
+  /// Checks all transports in parallel and starts every reachable one.
   /// Throws only when no transport at all is reachable.
   Future<void> initialize({required String ourId}) async {
-    for (final transport in _transports) {
-      final available = await transport.checkAvailability();
-      if (available) {
-        _activeTransports.add(transport);
-        transport.subscribe(ourId: ourId).listen(
-          _incomingController.add,
-          onError: (_) {}, // individual transport errors are non-fatal
-        );
-      }
+    final reachable = await Future.wait(
+      _transports.map((t) async {
+        try {
+          return await t.checkAvailability() ? t : null;
+        } catch (_) {
+          return null;
+        }
+      }),
+    );
+
+    for (final t in reachable.whereType<PhantomTransport>()) {
+      _activeTransports.add(t);
+      t.subscribe(ourId: ourId).listen(
+        _incomingController.add,
+        onError: (_) {}, // individual transport errors are non-fatal
+      );
     }
+
     if (_activeTransports.isEmpty) {
       throw const TransportException(
           'No transport available. Make sure IPFS, I2P, or Yggdrasil is running.');
     }
   }
 
-  /// Publishes to every active transport simultaneously.
+  /// Publishes to every active transport in parallel.
   /// Succeeds if at least one transport delivers the message.
   Future<void> publish({
     required String recipientId,
@@ -110,19 +118,15 @@ class TransportManager {
     if (_activeTransports.isEmpty) {
       throw const TransportException('TransportManager not initialized.');
     }
-    Object? lastError;
     int successes = 0;
-    for (final transport in _activeTransports) {
-      try {
-        await transport.publish(
-          recipientId: recipientId,
-          encryptedEnvelope: encryptedEnvelope,
-        );
-        successes++;
-      } catch (e) {
-        lastError = e;
-      }
-    }
+    Object? lastError;
+    await Future.wait([
+      for (final t in _activeTransports)
+        t
+            .publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope)
+            .then((_) { successes++; })
+            .onError((e, _) { lastError = e; }),
+    ]);
     if (successes == 0) throw lastError!;
   }
 
