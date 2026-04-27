@@ -42,14 +42,16 @@ jobs:
           SIGNING_PRIVATE_KEY: ${{ secrets.SIGNING_PRIVATE_KEY }}
           SIGNING_CERTIFICATE: ${{ secrets.SIGNING_CERTIFICATE }}
         run: |
-          # printf preserves newlines that GitHub may have encoded as \n in the secret
-          printf '%s' "$SIGNING_PRIVATE_KEY" | sed 's/\\n/\n/g' > /tmp/signing-key.pem
-          printf '%s' "$SIGNING_CERTIFICATE" | sed 's/\\n/\n/g' > /tmp/signing-cert.pem
+          # Secrets stored as base64 to avoid newline encoding issues
+          echo "$SIGNING_PRIVATE_KEY" | base64 --decode > /tmp/signing-key.pem
+          echo "$SIGNING_CERTIFICATE" | base64 --decode > /tmp/signing-cert.pem
+
+          # Verify the key is RSA
+          openssl rsa -in /tmp/signing-key.pem -check -noout
 
           APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | tail -1)
           echo "Using apksigner: $APKSIGNER"
 
-          # apksigner supports PEM key+cert directly — no keystore needed
           "$APKSIGNER" sign \
             --key /tmp/signing-key.pem \
             --cert /tmp/signing-cert.pem \
