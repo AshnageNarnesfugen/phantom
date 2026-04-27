@@ -1,0 +1,8 @@
+{
+    "java.configuration.updateBuildConfiguration": "automatic",
+    "java.project.sourcePaths": [],
+    "java.import.exclusions": [
+        "**/android/**"
+    ],
+    "kotlin.diagnostics.enabled": false
+}

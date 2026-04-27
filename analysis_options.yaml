@@ -1,0 +1,18 @@
+# analysis_options.yaml — usa flutter_lints estándar.
+# Las reglas unused_import/unused_field vienen por defecto en el analizador Dart.
+
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  exclude:
+    - local_packages/**
+  errors:
+    todo: ignore
+    deprecated_member_use: warning
+    unintended_html_in_doc_comment: ignore
+
+linter:
+  rules:
+    prefer_const_constructors: true
+    prefer_const_literals_to_create_immutables: true
+    avoid_print: false
