@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -11,7 +13,7 @@ layout.buildDirectory.set(rootProject.rootDir.parentFile.resolve("build/app"))
 
 // Load signing properties from key.properties (local dev) or environment variables (CI)
 val keyPropertiesFile = rootProject.file("key.properties")
-val keyProperties = java.util.Properties()
+val keyProperties = Properties()
 if (keyPropertiesFile.exists()) {
     keyPropertiesFile.inputStream().use { keyProperties.load(it) }
 }
@@ -30,7 +32,7 @@ android {
     }
 
     kotlinOptions {
-        jvmTarget = "21"
+        jvmTarget = JavaVersion.VERSION_21.toString()
     }
 
     signingConfigs {
