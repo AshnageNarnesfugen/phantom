@@ -53,12 +53,19 @@ jobs:
           echo "$SIGNING_PRIVATE_KEY" | base64 --decode > /tmp/signing-key-raw.pem
           echo "$SIGNING_CERTIFICATE" | base64 --decode > /tmp/signing-cert.pem
 
-          # apksigner requires PKCS#8 format; convert from PKCS#1 if needed
-          openssl pkcs8 -topk8 -nocrypt \
-            -in /tmp/signing-key-raw.pem \
-            -out /tmp/signing-key.pem
+          # Debug: show key type and ASN.1 OID
+          echo "--- Key file header ---"
+          head -1 /tmp/signing-key-raw.pem
+          echo "--- ASN.1 structure ---"
+          openssl asn1parse -in /tmp/signing-key-raw.pem 2>&1 | head -10 || true
 
-          # Use older build-tools apksigner (34.x) — 37.x has ML-DSA regression
+          # Force traditional PKCS#1 RSA output, then convert to PKCS#8
+          openssl rsa -in /tmp/signing-key-raw.pem -out /tmp/signing-key-rsa.pem 2>&1
+          echo "--- After rsa export, convert to PKCS#8 DER ---"
+          openssl pkcs8 -topk8 -nocrypt -outform DER \
+            -in /tmp/signing-key-rsa.pem \
+            -out /tmp/signing-key.der
+
           APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | grep -v "35\|36\|37" | tail -1)
           if [ -z "$APKSIGNER" ]; then
             APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | tail -1)
@@ -66,11 +73,11 @@ jobs:
           echo "Using apksigner: $APKSIGNER"
 
           "$APKSIGNER" sign \
-            --key /tmp/signing-key.pem \
+            --key /tmp/signing-key.der \
             --cert /tmp/signing-cert.pem \
             build/app/outputs/flutter-apk/app-release.apk
 
-          rm -f /tmp/signing-key-raw.pem /tmp/signing-key.pem /tmp/signing-cert.pem
+          rm -f /tmp/signing-key-raw.pem /tmp/signing-key-rsa.pem /tmp/signing-key.der /tmp/signing-cert.pem
 
       - name: Rename APK with commit SHA
         id: apk
