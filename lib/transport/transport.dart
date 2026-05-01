@@ -74,12 +74,14 @@ class TransportManager {
     String? i2pSocksHost,
     int? i2pSocksPort,
     String? yggdrasilAddress,
+    String? ntfyBaseUrl,
   }) : _transports = [
           if (yggdrasilAddress != null)
             YggdrasilTransport(address: yggdrasilAddress),
           if (i2pSocksHost != null && i2pSocksPort != null)
             I2PTransport(socksHost: i2pSocksHost, socksPort: i2pSocksPort),
           IpfsTransport(apiUrl: ipfsApiUrl ?? 'http://127.0.0.1:5001'),
+          NtfyTransport(baseUrl: ntfyBaseUrl ?? 'https://ntfy.sh'),
         ];
 
   /// Checks all transports in parallel and starts every reachable one.
@@ -359,4 +361,131 @@ class TransportException implements Exception {
   const TransportException(this.message);
   @override
   String toString() => 'TransportException: $message';
+}
+
+// ── ntfy.sh Relay Transport ───────────────────────────────────────────────────
+
+/// Relay transport via ntfy.sh — a free, open-source pub/sub service.
+///
+/// Each recipient has a topic derived from their PhantomID. Messages are
+/// published as binary attachments (no practical size limit). ntfy retains
+/// messages for 24 hours on the shared instance; self-hosting removes that
+/// cap (see https://ntfy.sh/docs/install/).
+///
+/// Privacy model: the ntfy server sees which topics are active (timing) but
+/// cannot read payloads — they are encrypted by Phantom's Double Ratchet.
+/// Topic names are derived from PhantomIDs, so anyone with a PhantomID can
+/// observe when that user receives messages.
+class NtfyTransport implements PhantomTransport {
+  final String _baseUrl;
+  final http.Client _client = http.Client();
+
+  /// Unix timestamp of the most-recently seen ntfy event.
+  /// Passed as `since=` on reconnect to avoid missing messages during gaps.
+  int _lastSeenAt = 0;
+
+  @override
+  final String name = 'ntfy-relay';
+
+  @override
+  bool get isAvailable => true;
+
+  NtfyTransport({String baseUrl = 'https://ntfy.sh'}) : _baseUrl = baseUrl;
+
+  @override
+  Future<bool> checkAvailability() async {
+    try {
+      final resp = await _client
+          .get(Uri.parse('$_baseUrl/v1/health'))
+          .timeout(const Duration(seconds: 5));
+      return resp.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<void> publish({
+    required String recipientId,
+    required Uint8List encryptedEnvelope,
+  }) async {
+    final topic = _topicForId(recipientId);
+    final response = await _client
+        .post(
+          Uri.parse('$_baseUrl/$topic'),
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Filename': 'msg.bin',
+          },
+          body: encryptedEnvelope,
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode != 200) {
+      throw TransportException(
+          'ntfy publish failed: ${response.statusCode} ${response.body}');
+    }
+  }
+
+  @override
+  Stream<IncomingEnvelope> subscribe({required String ourId}) async* {
+    final topic = _topicForId(ourId);
+
+    // On first open look back 5 minutes to recover messages missed while the
+    // app was closed. On reconnect, resume from the last acknowledged event.
+    if (_lastSeenAt == 0) {
+      _lastSeenAt = DateTime.now().millisecondsSinceEpoch ~/ 1000 - 300;
+    }
+
+    while (true) {
+      try {
+        final uri = Uri.parse('$_baseUrl/$topic/json?since=$_lastSeenAt');
+        final request = http.Request('GET', uri);
+        final streamed = await _client.send(request);
+
+        final lines = streamed.stream
+            .transform(utf8.decoder)
+            .transform(const LineSplitter());
+
+        await for (final line in lines) {
+          if (line.trim().isEmpty) continue;
+          try {
+            final event = jsonDecode(line) as Map<String, dynamic>;
+            if (event['event'] == 'open') continue;
+            if (event['event'] != 'message') continue;
+
+            final at = (event['time'] as num?)?.toInt() ?? 0;
+            if (at > _lastSeenAt) _lastSeenAt = at;
+
+            final attachment = event['attachment'] as Map<String, dynamic>?;
+            final attachUrl = attachment?['url'] as String?;
+            if (attachUrl == null) continue;
+
+            final binResp = await _client
+                .get(Uri.parse(attachUrl))
+                .timeout(const Duration(seconds: 10));
+            if (binResp.statusCode != 200) continue;
+
+            yield IncomingEnvelope(
+              data: binResp.bodyBytes,
+              transportName: name,
+              receivedAt: DateTime.now(),
+            );
+          } catch (_) {
+            continue;
+          }
+        }
+      } catch (_) {
+        // Pause before reconnecting on network error.
+        await Future.delayed(const Duration(seconds: 10));
+      }
+    }
+  }
+
+  /// PhantomIDs are base58-encoded (URL-safe alphanumeric) — safe as topic names.
+  static String _topicForId(String phantomId) => 'ph-$phantomId';
+
+  @override
+  Future<void> dispose() async {
+    _client.close();
+  }
 }

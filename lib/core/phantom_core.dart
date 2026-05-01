@@ -132,6 +132,7 @@ class PhantomCore {
       i2pSocksHost:    config?.i2pSocksHost,
       i2pSocksPort:    config?.i2pSocksPort,
       yggdrasilAddress: config?.yggdrasilAddress,
+      ntfyBaseUrl:     config?.ntfyBaseUrl,
     );
   }
 
@@ -514,6 +515,15 @@ class PhantomCore {
     final senderCaBytes   = frame.senderContactAddressBytes;
     final senderPhantomId = frame.senderPhantomId;
 
+    // If we already have a session for this sender the INIT frame is a
+    // duplicate (e.g. delivered by two transports simultaneously). Try the
+    // existing session so we don't overwrite ratchet state.
+    if (_sessions.containsKey(senderPhantomId) ||
+        await storage.getSessionState(senderPhantomId) != null) {
+      await _handleMsgFrame(frame);
+      return;
+    }
+
     final preKeyStore = await storage.getPreKeyStore();
     if (preKeyStore == null) return;
 
@@ -689,19 +699,22 @@ class TransportConfig {
   final String? i2pSocksHost;
   final int?    i2pSocksPort;
   final String? yggdrasilAddress;
+  final String? ntfyBaseUrl;
 
   const TransportConfig({
     this.ipfsApiUrl,
     this.i2pSocksHost,
     this.i2pSocksPort,
     this.yggdrasilAddress,
+    this.ntfyBaseUrl,
   });
 
   const TransportConfig.ipfsOnly({String? apiUrl})
       : ipfsApiUrl = apiUrl ?? 'http://127.0.0.1:5001',
         i2pSocksHost = null,
         i2pSocksPort = null,
-        yggdrasilAddress = null;
+        yggdrasilAddress = null,
+        ntfyBaseUrl = null;
 }
 
 class PhantomCoreException implements Exception {
