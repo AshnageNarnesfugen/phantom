@@ -410,8 +410,10 @@ class NtfyTransport implements PhantomTransport {
     required Uint8List encryptedEnvelope,
   }) async {
     final topic = _topicForId(recipientId);
+    // PUT creates a binary attachment (preserves arbitrary bytes).
+    // POST sends body as text and garbles non-UTF-8 bytes.
     final response = await _client
-        .post(
+        .put(
           Uri.parse('$_baseUrl/$topic'),
           headers: {
             'Content-Type': 'application/octet-stream',
@@ -430,10 +432,11 @@ class NtfyTransport implements PhantomTransport {
   Stream<IncomingEnvelope> subscribe({required String ourId}) async* {
     final topic = _topicForId(ourId);
 
-    // On first open look back 5 minutes to recover messages missed while the
-    // app was closed. On reconnect, resume from the last acknowledged event.
+    // On first open look back 3 hours — matching ntfy's attachment download
+    // window — to recover messages missed while the app was closed.
+    // On reconnect, resume from the last acknowledged event.
     if (_lastSeenAt == 0) {
-      _lastSeenAt = DateTime.now().millisecondsSinceEpoch ~/ 1000 - 300;
+      _lastSeenAt = DateTime.now().millisecondsSinceEpoch ~/ 1000 - 10800;
     }
 
     while (true) {
