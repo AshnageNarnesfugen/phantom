@@ -12,6 +12,7 @@ import 'protocol/message.dart';
 import 'protocol/frame.dart';
 import 'storage/phantom_storage.dart';
 import 'storage/backup_manager.dart';
+import 'presence_service.dart';
 import '../transport/transport.dart';
 import '../transport/transport_manager_v2.dart' hide IncomingEnvelope;
 import '../transport/bluetooth/bluetooth_mesh_transport.dart';
@@ -53,6 +54,10 @@ class PhantomCore {
   bool _transportAvailable = false;
   bool get isTransportAvailable => _transportAvailable;
 
+  PresenceService? _presence;
+  bool isContactOnline(String contactId) => _presence?.isOnline(contactId) ?? false;
+  Stream<String> get presenceChanges => _presence?.changes ?? const Stream.empty();
+
   TransportStatus? get transportStatus => _transportV2?.status;
   Stream<TransportMode> get transportModeChanges =>
       _transportV2?.modeChanges ?? const Stream.empty();
@@ -90,6 +95,7 @@ class PhantomCore {
     await core._initKyberKeys(result.seedPhrase);
     await core._initializePreKeys();
     await core._startTransport();
+    await core._startPresence();
 
     return (core: core, seedPhrase: result.seedPhrase);
   }
@@ -123,6 +129,7 @@ class PhantomCore {
     }
 
     await core._startTransport();
+    await core._startPresence();
     return core;
   }
 
@@ -337,6 +344,7 @@ class PhantomCore {
       kyber768PublicKeyBytes:   ca.kyber768PublicKeyBytes,
     );
     await storage.saveContact(contact);
+    _presence?.addContacts([contact.phantomId]);
     return contact;
   }
 
@@ -494,6 +502,42 @@ class PhantomCore {
       );
     }
   }
+
+  // ── Presence ───────────────────────────────────────────────────────────────
+
+  Future<void> _startPresence() async {
+    final contacts = await storage.getAllContacts();
+    _presence = PresenceService(myId);
+    await _presence!.start(contacts.map((c) => c.phantomId).toList());
+  }
+
+  // ── Contacts / conversation management ────────────────────────────────────
+
+  /// Permanently deletes a single message from local storage.
+  Future<void> deleteMessage(String conversationId, String messageId) =>
+      storage.deleteMessage(conversationId, messageId);
+
+  /// Archives or unarchives a conversation (contact stays, just hidden).
+  Future<void> setConversationArchived(String contactId, {required bool archived}) async {
+    final c = await storage.getContact(contactId);
+    if (c == null) return;
+    await storage.saveContact(c.copyWith(isArchived: archived));
+  }
+
+  /// Clears all messages and the session for a contact, but keeps the contact.
+  Future<void> deleteConversation(String contactId) async {
+    await storage.clearMessages(contactId);
+    _sessions.remove(contactId);
+    await storage.deleteSessionState(contactId);
+  }
+
+  /// Removes the contact and all associated data (messages, session).
+  Future<void> deleteContact(String contactId) async {
+    await deleteConversation(contactId);
+    await storage.deleteContact(contactId);
+  }
+
+  // ── Incoming bytes ─────────────────────────────────────────────────────────
 
   Future<void> _handleIncomingBytes(Uint8List data) async {
     try {
@@ -686,6 +730,7 @@ class PhantomCore {
     await _meshStoreSub?.cancel();
     await transport.dispose();
     await _transportV2?.dispose();
+    _presence?.dispose();
     await storage.close();
     await _incomingController.close();
   }

@@ -26,7 +26,8 @@ class PhantomApp extends StatefulWidget {
 }
 
 class _PhantomAppState extends State<PhantomApp> {
-  final _themeCtrl = ThemeController(accent: PhantomAccent.cyan, isDark: true);
+  // Starts with defaults; replaced by persisted values in _init().
+  ThemeController _themeCtrl = ThemeController();
   static const _secure = FlutterSecureStorage();
 
   PhantomCore? _core;
@@ -36,10 +37,18 @@ class _PhantomAppState extends State<PhantomApp> {
   void initState() {
     super.initState();
     _themeCtrl.addListener(() => setState(() {}));
-    _tryRestoreAccount();
+    _init();
+  }
+
+  Future<void> _init() async {
+    final persisted = await ThemeController.load();
+    persisted.addListener(() { if (mounted) setState(() {}); });
+    if (mounted) setState(() => _themeCtrl = persisted);
+    await _tryRestoreAccount();
   }
 
   Future<void> _tryRestoreAccount() async {
+    if (!mounted) return;
     try {
       final seed = await _secure.read(key: _seedKey);
       if (seed != null) {

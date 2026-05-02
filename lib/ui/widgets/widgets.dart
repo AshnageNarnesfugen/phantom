@@ -11,6 +11,7 @@ class ChatBubble extends StatelessWidget {
   final String timeLabel;   // already formatted with noise applied
   final bool showTail;      // first message in a run from the same sender
   final MessageStatus status;
+  final String? replyPreview; // truncated text of the replied-to message
 
   const ChatBubble({
     super.key,
@@ -19,6 +20,7 @@ class ChatBubble extends StatelessWidget {
     required this.timeLabel,
     this.showTail = false,
     this.status = MessageStatus.sent,
+    this.replyPreview,
   });
 
   @override
@@ -55,6 +57,30 @@ class ChatBubble extends StatelessWidget {
               isOutgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (replyPreview != null) ...[
+              Container(
+                padding: const EdgeInsets.fromLTRB(8, 5, 8, 5),
+                margin: const EdgeInsets.only(bottom: 6),
+                decoration: BoxDecoration(
+                  color: textColor.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border(
+                    left: BorderSide(color: textColor.withValues(alpha: 0.4), width: 2),
+                  ),
+                ),
+                child: Text(
+                  replyPreview!,
+                  style: TextStyle(
+                    color: textColor.withValues(alpha: 0.6),
+                    fontSize: 12,
+                    fontFamily: 'monospace',
+                    height: 1.3,
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
             Text(
               text,
               style: TextStyle(
@@ -118,11 +144,15 @@ class _StatusIcon extends StatelessWidget {
 class MessageInput extends StatefulWidget {
   final void Function(String text) onSend;
   final VoidCallback? onAttach;
+  final String? replyPreview;
+  final VoidCallback? onCancelReply;
 
   const MessageInput({
     super.key,
     required this.onSend,
     this.onAttach,
+    this.replyPreview,
+    this.onCancelReply,
   });
 
   @override
@@ -155,7 +185,38 @@ class _MessageInputState extends State<MessageInput> {
   Widget build(BuildContext context) {
     final t = PhantomTheme.tokensOf(context);
 
-    return Container(
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (widget.replyPreview != null)
+          Container(
+            padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+            decoration: BoxDecoration(
+              color: t.bgSubtle,
+              border: Border(top: BorderSide(color: t.divider, width: 0.5)),
+            ),
+            child: Row(
+              children: [
+                Container(width: 2, height: 32, color: t.accentLight),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    widget.replyPreview!,
+                    style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                IconButton(
+                  icon: Icon(Icons.close, size: 16, color: t.iconDefault),
+                  onPressed: widget.onCancelReply,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                ),
+              ],
+            ),
+          ),
+        Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
         color: t.bgSurface,
@@ -222,7 +283,9 @@ class _MessageInputState extends State<MessageInput> {
           ],
         ),
       ),
-    );
+    ),   // closes inner Container (input bar)
+      ], // closes Column children
+    );   // closes Column
   }
 
   @override
@@ -285,8 +348,9 @@ class ConversationTile extends StatelessWidget {
   final String? lastMessage;
   final String? timeLabel;
   final int unreadCount;
-  final bool isOnline;       // placeholder — Phantom has no "online" status
+  final bool isOnline;
   final VoidCallback onTap;
+  final VoidCallback? onLongPress;
 
   const ConversationTile({
     super.key,
@@ -297,6 +361,7 @@ class ConversationTile extends StatelessWidget {
     this.unreadCount = 0,
     this.isOnline = false,
     required this.onTap,
+    this.onLongPress,
   });
 
   @override
@@ -305,6 +370,7 @@ class ConversationTile extends StatelessWidget {
 
     return InkWell(
       onTap: onTap,
+      onLongPress: onLongPress,
       splashColor: t.accentLight.withValues(alpha: 0.06),
       highlightColor: Colors.transparent,
       child: Container(
@@ -314,10 +380,11 @@ class ConversationTile extends StatelessWidget {
         ),
         child: Row(
           children: [
-            // Avatar — initial letter + accent ring when there are unreads
+            // Avatar — initial letter + accent ring + online dot
             _Avatar(
               name: displayName,
               hasUnread: unreadCount > 0,
+              isOnline: isOnline,
               tokens: t,
             ),
             const SizedBox(width: 12),
@@ -409,41 +476,61 @@ class ConversationTile extends StatelessWidget {
 class _Avatar extends StatelessWidget {
   final String name;
   final bool hasUnread;
+  final bool isOnline;
   final PhantomTokens tokens;
 
   const _Avatar({
     required this.name,
     required this.hasUnread,
+    required this.isOnline,
     required this.tokens,
   });
 
   @override
   Widget build(BuildContext context) {
     final letter = name.isNotEmpty ? name[0].toUpperCase() : '?';
-    return Container(
-      width: 44,
-      height: 44,
-      decoration: BoxDecoration(
-        color: tokens.bgSubtle,
-        borderRadius: BorderRadius.circular(tokens.radiusCard),
-        border: Border.all(
-          color: hasUnread
-              ? tokens.accentLight.withValues(alpha: 0.5)
-              : tokens.divider,
-          width: hasUnread ? 1.5 : 0.5,
-        ),
-      ),
-      child: Center(
-        child: Text(
-          letter,
-          style: TextStyle(
-            color: hasUnread ? tokens.accentLight : tokens.textSecondary,
-            fontSize: 17,
-            fontFamily: 'monospace',
-            fontWeight: FontWeight.w500,
+    return Stack(
+      children: [
+        Container(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+            color: tokens.bgSubtle,
+            borderRadius: BorderRadius.circular(tokens.radiusCard),
+            border: Border.all(
+              color: hasUnread
+                  ? tokens.accentLight.withValues(alpha: 0.5)
+                  : tokens.divider,
+              width: hasUnread ? 1.5 : 0.5,
+            ),
+          ),
+          child: Center(
+            child: Text(
+              letter,
+              style: TextStyle(
+                color: hasUnread ? tokens.accentLight : tokens.textSecondary,
+                fontSize: 17,
+                fontFamily: 'monospace',
+                fontWeight: FontWeight.w500,
+              ),
+            ),
           ),
         ),
-      ),
+        if (isOnline)
+          Positioned(
+            right: 0,
+            bottom: 0,
+            child: Container(
+              width: 11,
+              height: 11,
+              decoration: BoxDecoration(
+                color: const Color(0xFF4CAF50),
+                shape: BoxShape.circle,
+                border: Border.all(color: tokens.bgBase, width: 2),
+              ),
+            ),
+          ),
+      ],
     );
   }
 }

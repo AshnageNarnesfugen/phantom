@@ -629,14 +629,17 @@ class ConversationsScreen extends StatefulWidget {
 class _ConversationsScreenState extends State<ConversationsScreen> {
   List<ContactRecord>? _contacts;
   final Map<String, StoredMessage?> _lastMessages = {};
-  StreamSubscription<StoredMessage>? _sub;
+  StreamSubscription<StoredMessage>? _msgSub;
+  StreamSubscription<String>? _presenceSub;
+  bool _showArchived = false;
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     final core = CoreProvider.of(context).core;
-    if (core != null && _sub == null) {
-      _sub = core.incomingMessages.listen((_) => _loadData(core));
+    if (core != null && _msgSub == null) {
+      _msgSub = core.incomingMessages.listen((_) => _loadData(core));
+      _presenceSub = core.presenceChanges.listen((_) { if (mounted) setState(() {}); });
       _loadData(core);
     }
   }
@@ -647,17 +650,59 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
     for (final c in contacts) {
       lastMsgs[c.phantomId] = await core.getLastMessage(c.phantomId);
     }
-    if (mounted) {
-      setState(() {
-        _contacts = contacts;
-        _lastMessages.addAll(lastMsgs);
-      });
-    }
+    if (mounted) setState(() { _contacts = contacts; _lastMessages.addAll(lastMsgs); });
+  }
+
+  List<ContactRecord> get _visible {
+    if (_contacts == null) return [];
+    return _contacts!.where((c) => c.isArchived == _showArchived).toList();
+  }
+
+  bool get _hasArchived => _contacts?.any((c) => c.isArchived) ?? false;
+
+  void _showConvMenu(BuildContext ctx, PhantomTokens t, PhantomCore core, ContactRecord c) {
+    showModalBottomSheet(
+      context: ctx,
+      backgroundColor: t.bgSurface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(t.radiusCard))),
+      builder: (_) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 8),
+          Container(width: 36, height: 3, decoration: BoxDecoration(color: t.divider, borderRadius: BorderRadius.circular(2))),
+          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Text(c.displayName, style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 13)),
+          ),
+          _MenuItem(icon: Icons.archive_outlined, label: c.isArchived ? 'unarchive' : 'archive', tokens: t,
+            onTap: () async {
+              Navigator.pop(ctx);
+              await core.setConversationArchived(c.phantomId, archived: !c.isArchived);
+              _loadData(core);
+            }),
+          _MenuItem(icon: Icons.delete_sweep_outlined, label: 'clear history', tokens: t,
+            onTap: () async {
+              Navigator.pop(ctx);
+              await core.deleteConversation(c.phantomId);
+              _loadData(core);
+            }),
+          _MenuItem(icon: Icons.person_remove_outlined, label: 'delete contact', tokens: t, danger: true,
+            onTap: () async {
+              Navigator.pop(ctx);
+              await core.deleteContact(c.phantomId);
+              _loadData(core);
+            }),
+          const SizedBox(height: 16),
+        ],
+      ),
+    );
   }
 
   @override
   void dispose() {
-    _sub?.cancel();
+    _msgSub?.cancel();
+    _presenceSub?.cancel();
     super.dispose();
   }
 
@@ -673,38 +718,42 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
       );
     }
 
+    final visible = _visible;
+
     return Scaffold(
       backgroundColor: t.bgBase,
       appBar: AppBar(
         backgroundColor: t.bgSurface,
         elevation: 0,
         title: Text(
-          'phantom',
-          style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 18,
-              fontWeight: FontWeight.w300, letterSpacing: 4),
+          _showArchived ? 'archived' : 'phantom',
+          style: TextStyle(color: _showArchived ? t.textSecondary : t.accentLight,
+              fontFamily: 'monospace', fontSize: 18, fontWeight: FontWeight.w300, letterSpacing: 4),
         ),
         actions: [
+          if (_hasArchived || _showArchived)
+            IconButton(
+              icon: Icon(_showArchived ? Icons.inbox_outlined : Icons.archive_outlined,
+                  color: t.iconDefault, size: 20),
+              tooltip: _showArchived ? 'back' : 'archived',
+              onPressed: () => setState(() => _showArchived = !_showArchived),
+            ),
           IconButton(
             icon: Icon(Icons.settings_outlined, color: t.iconDefault, size: 20),
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const SettingsScreen()),
-            ),
+            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen())),
           ),
         ],
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(0.5),
-          child: Divider(height: 0.5, color: t.divider),
-        ),
+        bottom: PreferredSize(preferredSize: const Size.fromHeight(0.5),
+            child: Divider(height: 0.5, color: t.divider)),
       ),
       body: _contacts == null
           ? Center(child: CircularProgressIndicator(color: t.accentLight, strokeWidth: 1))
-          : _contacts!.isEmpty
-              ? _EmptyContacts(tokens: t)
+          : visible.isEmpty
+              ? _EmptyContacts(tokens: t, archived: _showArchived)
               : ListView.builder(
-                  itemCount: _contacts!.length,
+                  itemCount: visible.length,
                   itemBuilder: (context, i) {
-                    final c    = _contacts![i];
+                    final c    = visible[i];
                     final last = _lastMessages[c.phantomId];
                     return ConversationTile(
                       displayName: c.displayName,
@@ -712,19 +761,15 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
                       lastMessage: last?.type == MessageType.text ? last?.textContent : null,
                       timeLabel:   last != null ? _formatTime(last.timestamp) : null,
                       unreadCount: 0,
-                      onTap: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => ChatScreen(
-                            contactName: c.displayName,
-                            contactId:   c.phantomId,
-                          ),
-                        ),
-                      ).then((_) => _loadData(core)),
+                      isOnline:    core.isContactOnline(c.phantomId),
+                      onTap: () => Navigator.push(context,
+                        MaterialPageRoute(builder: (_) => ChatScreen(
+                          contactName: c.displayName, contactId: c.phantomId))).then((_) => _loadData(core)),
+                      onLongPress: () => _showConvMenu(context, t, core, c),
                     );
                   },
                 ),
-      floatingActionButton: FloatingActionButton(
+      floatingActionButton: _showArchived ? null : FloatingActionButton(
         backgroundColor: t.bgSurface,
         elevation: 0,
         shape: RoundedRectangleBorder(
@@ -732,10 +777,8 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
           side: BorderSide(color: t.inputBorder, width: 0.5),
         ),
         child: Icon(Icons.edit_outlined, color: t.accentLight, size: 20),
-        onPressed: () => Navigator.push(
-          context,
-          MaterialPageRoute(builder: (_) => const AddContactScreen()),
-        ).then((_) => _loadData(core)),
+        onPressed: () => Navigator.push(context,
+            MaterialPageRoute(builder: (_) => const AddContactScreen())).then((_) => _loadData(core)),
       ),
     );
   }
@@ -751,7 +794,8 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
 
 class _EmptyContacts extends StatelessWidget {
   final PhantomTokens tokens;
-  const _EmptyContacts({required this.tokens});
+  final bool archived;
+  const _EmptyContacts({required this.tokens, this.archived = false});
 
   @override
   Widget build(BuildContext context) {
@@ -759,13 +803,15 @@ class _EmptyContacts extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.people_outline, color: tokens.textDisabled, size: 48),
+          Icon(archived ? Icons.archive_outlined : Icons.people_outline,
+              color: tokens.textDisabled, size: 48),
           const SizedBox(height: 16),
-          Text('no contacts yet',
+          Text(archived ? 'no archived chats' : 'no contacts yet',
               style: TextStyle(color: tokens.textSecondary, fontFamily: 'monospace', fontSize: 14)),
           const SizedBox(height: 6),
-          Text('tap + to add someone',
-              style: TextStyle(color: tokens.textDisabled, fontFamily: 'monospace', fontSize: 12)),
+          if (!archived)
+            Text('tap + to add someone',
+                style: TextStyle(color: tokens.textDisabled, fontFamily: 'monospace', fontSize: 12)),
         ],
       ),
     );
@@ -790,6 +836,8 @@ class _ChatScreenState extends State<ChatScreen> {
   final _scrollCtrl = ScrollController();
   List<StoredMessage>? _messages;
   StreamSubscription<StoredMessage>? _sub;
+  StreamSubscription<String>? _presenceSub;
+  StoredMessage? _replyTo;
 
   @override
   void didChangeDependencies() {
@@ -798,6 +846,9 @@ class _ChatScreenState extends State<ChatScreen> {
     if (core != null && _sub == null) {
       _sub = core.incomingMessages.listen((msg) {
         if (msg.conversationId == widget.contactId) _loadMessages(core);
+      });
+      _presenceSub = core.presenceChanges.listen((id) {
+        if (id == widget.contactId && mounted) setState(() {});
       });
       _loadMessages(core);
     }
@@ -824,16 +875,72 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _send(String text) async {
     final core = CoreProvider.of(context).core;
     if (core == null) return;
-    final stored = await core.sendMessage(recipientId: widget.contactId, text: text);
+    final replyId = _replyTo?.id;
+    if (mounted) setState(() => _replyTo = null);
+    final stored = await core.sendMessage(
+      recipientId: widget.contactId,
+      text: text,
+      replyToId: replyId,
+    );
     if (mounted) {
       setState(() => _messages = [...(_messages ?? []), stored]);
       WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
     }
   }
 
+  void _showMsgMenu(BuildContext ctx, PhantomTokens t, PhantomCore? core, StoredMessage msg) {
+    final isOut = msg.direction == MessageDirection.outgoing;
+    showModalBottomSheet(
+      context: ctx,
+      backgroundColor: t.bgSurface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(t.radiusCard))),
+      builder: (_) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 8),
+          Container(width: 36, height: 3, decoration: BoxDecoration(color: t.divider, borderRadius: BorderRadius.circular(2))),
+          const SizedBox(height: 8),
+          _MenuItem(icon: Icons.reply_outlined, label: 'reply', tokens: t,
+            onTap: () { Navigator.pop(ctx); if (mounted) setState(() => _replyTo = msg); }),
+          if (msg.type == MessageType.text)
+            _MenuItem(icon: Icons.copy_outlined, label: 'copy', tokens: t,
+              onTap: () { Navigator.pop(ctx); Clipboard.setData(ClipboardData(text: msg.textContent)); }),
+          _MenuItem(icon: Icons.forward_outlined, label: 'forward', tokens: t,
+            onTap: () { Navigator.pop(ctx); _showForwardStub(ctx, t); }),
+          if (isOut)
+            _MenuItem(icon: Icons.delete_outline, label: 'delete', tokens: t, danger: true,
+              onTap: () async {
+                Navigator.pop(ctx);
+                await core?.deleteMessage(widget.contactId, msg.id);
+                if (mounted) setState(() => _messages?.removeWhere((m) => m.id == msg.id));
+              }),
+          const SizedBox(height: 16),
+        ],
+      ),
+    );
+  }
+
+  void _showForwardStub(BuildContext ctx, PhantomTokens t) {
+    ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
+      backgroundColor: t.bgSurface,
+      content: Text('forward — coming soon', style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 13)),
+      duration: const Duration(seconds: 2),
+    ));
+  }
+
+  String? _replyPreviewFor(StoredMessage msg) {
+    if (msg.replyToId == null) return null;
+    final origin = _messages?.cast<StoredMessage?>().firstWhere(
+      (m) => m?.id == msg.replyToId, orElse: () => null);
+    if (origin == null) return null;
+    final text = origin.type == MessageType.text ? origin.textContent : '[file]';
+    return text.length > 60 ? '${text.substring(0, 60)}…' : text;
+  }
+
   @override
   void dispose() {
     _sub?.cancel();
+    _presenceSub?.cancel();
     _scrollCtrl.dispose();
     super.dispose();
   }
@@ -852,12 +959,28 @@ class _ChatScreenState extends State<ChatScreen> {
           icon: Icon(Icons.arrow_back, color: t.textSecondary, size: 20),
           onPressed: () => Navigator.pop(context),
         ),
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        title: Row(
           children: [
-            Text(widget.contactName,
-                style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 15)),
-            PhantomIdDisplay(phantomId: widget.contactId, compact: true),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(widget.contactName,
+                      style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 15)),
+                  PhantomIdDisplay(phantomId: widget.contactId, compact: true),
+                ],
+              ),
+            ),
+            if (core?.isContactOnline(widget.contactId) == true)
+              Container(
+                width: 9, height: 9,
+                margin: const EdgeInsets.only(right: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF4CAF50),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: t.bgSurface, width: 1.5),
+                ),
+              ),
           ],
         ),
         actions: [
@@ -893,18 +1016,30 @@ class _ChatScreenState extends State<ChatScreen> {
 
                           return Padding(
                             padding: EdgeInsets.only(bottom: nextSame ? 2 : 10),
-                            child: ChatBubble(
-                              text:      msg.type == MessageType.text ? msg.textContent : '[file]',
-                              isOutgoing: isOut,
-                              timeLabel: _formatTime(msg.timestamp),
-                              showTail:  !nextSame,
-                              status:    msg.status,
+                            child: GestureDetector(
+                              onLongPress: () => _showMsgMenu(context, t, core, msg),
+                              child: ChatBubble(
+                                text:         msg.type == MessageType.text ? msg.textContent : '[file]',
+                                isOutgoing:   isOut,
+                                timeLabel:    _formatTime(msg.timestamp),
+                                showTail:     !nextSame,
+                                status:       msg.status,
+                                replyPreview: _replyPreviewFor(msg),
+                              ),
                             ),
                           );
                         },
                       ),
           ),
-          MessageInput(onSend: _send),
+          MessageInput(
+            onSend: _send,
+            replyPreview: _replyTo != null
+                ? (_replyTo!.type == MessageType.text ? _replyTo!.textContent : '[file]')
+                : null,
+            onCancelReply: _replyTo != null
+                ? () { if (mounted) setState(() => _replyTo = null); }
+                : null,
+          ),
         ],
       ),
     );

@@ -136,6 +136,12 @@ class PhantomStorage {
     await box.put(messageId, msg.copyWith(status: status).toJson());
   }
 
+  Future<void> deleteMessage(String conversationId, String messageId) async {
+    _assertInitialized();
+    final box = await _openBox(_messagesBoxName(conversationId));
+    await box.delete(messageId);
+  }
+
   Future<void> clearMessages(String conversationId) async {
     _assertInitialized();
     final box = await _openBox(_messagesBoxName(conversationId));
@@ -286,6 +292,7 @@ class ContactRecord {
 
   final int addedAtUs;
   final bool isVerified;
+  final bool isArchived;
 
   ContactRecord({
     required this.phantomId,
@@ -298,6 +305,7 @@ class ContactRecord {
     this.kyber768PublicKeyBytes,
     int? addedAtUs,
     this.isVerified = false,
+    this.isArchived = false,
   }) : addedAtUs = addedAtUs ?? DateTime.now().microsecondsSinceEpoch;
 
   String get displayName => nickname ?? _shortId;
@@ -315,6 +323,7 @@ class ContactRecord {
         'sig':    base64.encode(signedPreKeySignature),
         'added':  addedAtUs,
         'ver':    isVerified,
+        'arch':   isArchived,
         if (kyber768PublicKeyBytes != null)
           'kyber768_pk': base64.encode(kyber768PublicKeyBytes!),
       };
@@ -332,11 +341,12 @@ class ContactRecord {
             : null,
         addedAtUs:                j['added']  as int,
         isVerified:               j['ver']    as bool? ?? false,
+        isArchived:               j['arch']   as bool? ?? false,
       );
 
-  ContactRecord copyWith({String? nickname, bool? isVerified}) => ContactRecord(
+  ContactRecord copyWith({String? nickname, bool? isVerified, bool? isArchived}) => ContactRecord(
         phantomId:                phantomId,
-        nickname:                 nickname ?? this.nickname,
+        nickname:                 nickname   ?? this.nickname,
         encryptionPublicKeyBytes: encryptionPublicKeyBytes,
         signingPublicKeyBytes:    signingPublicKeyBytes,
         signedPreKeyBytes:        signedPreKeyBytes,
@@ -345,6 +355,7 @@ class ContactRecord {
         kyber768PublicKeyBytes:   kyber768PublicKeyBytes,
         addedAtUs:                addedAtUs,
         isVerified:               isVerified ?? this.isVerified,
+        isArchived:               isArchived ?? this.isArchived,
       );
 }
 

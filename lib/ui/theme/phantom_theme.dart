@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 // ── Accent presets ────────────────────────────────────────────────────────────
 // Lo único que el usuario puede cambiar ahora.
@@ -160,6 +161,10 @@ class PhantomTheme extends InheritedWidget {
 // ── ThemeController — gestiona el estado global del tema ─────────────────────
 
 class ThemeController extends ChangeNotifier {
+  static const _store    = FlutterSecureStorage();
+  static const _keyAccent = 'theme_accent';
+  static const _keyDark   = 'theme_dark';
+
   PhantomAccent _accent;
   bool _isDark;
 
@@ -168,6 +173,22 @@ class ThemeController extends ChangeNotifier {
     bool isDark = true,
   })  : _accent = accent,
         _isDark = isDark;
+
+  /// Loads persisted theme from secure storage; falls back to defaults.
+  static Future<ThemeController> load() async {
+    final accentStr = await _store.read(key: _keyAccent);
+    final darkStr   = await _store.read(key: _keyDark);
+    final accent = PhantomAccent.values.firstWhere(
+      (a) => a.name == accentStr,
+      orElse: () => PhantomAccent.cyan,
+    );
+    return ThemeController(accent: accent, isDark: darkStr != 'false');
+  }
+
+  Future<void> _persist() async {
+    await _store.write(key: _keyAccent, value: _accent.name);
+    await _store.write(key: _keyDark,   value: _isDark.toString());
+  }
 
   PhantomAccent get accent => _accent;
   bool get isDark => _isDark;
@@ -178,11 +199,13 @@ class ThemeController extends ChangeNotifier {
   void setAccent(PhantomAccent accent) {
     _accent = accent;
     notifyListeners();
+    _persist();
   }
 
   void toggleDarkMode() {
     _isDark = !_isDark;
     notifyListeners();
+    _persist();
   }
 
   // MaterialTheme para widgets Flutter estándar (AppBar, etc.)
