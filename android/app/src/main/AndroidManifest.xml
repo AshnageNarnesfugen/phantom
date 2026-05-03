@@ -42,6 +42,9 @@
     <!-- Media access — Android ≤ 12 -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32"/>
+    <!-- Gallery save — Android ≤ 9 (API 29+) uses MediaStore without this -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29"/>
 
     <!-- BLE feature — no requerida, permite instalar en dispositivos sin BLE -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false"/>

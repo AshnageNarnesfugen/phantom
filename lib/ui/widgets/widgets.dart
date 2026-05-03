@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:ui' as ui;
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -71,24 +70,21 @@ class ChatBubble extends StatelessWidget {
 
     final inner = _buildInner(t, textColor, isImage);
 
+    // Glass mode: no BackdropFilter per-bubble — the wallpaper is pre-blurred
+    // at the scene level, keeping blur constant during scroll.
     final Widget bubble = glassEnabled
-        ? ClipRRect(
-            borderRadius: br,
-            child: BackdropFilter(
-              filter: ui.ImageFilter.blur(sigmaX: glassBlur, sigmaY: glassBlur),
-              child: Container(
-                padding: pad,
-                decoration: BoxDecoration(
-                  color: (isOutgoing ? t.accentLight : t.bgSurface)
-                      .withValues(alpha: isOutgoing
-                          ? glassOpacity
-                          : (glassOpacity * 1.6).clamp(0.0, 1.0)),
-                  border: Border.all(
-                      color: textColor.withValues(alpha: 0.18), width: 0.5),
-                ),
-                child: inner,
-              ),
+        ? Container(
+            padding: pad,
+            decoration: BoxDecoration(
+              color: (isOutgoing ? t.accentLight : t.bgSurface)
+                  .withValues(alpha: isOutgoing
+                      ? (glassOpacity + 0.14).clamp(0.10, 1.0)
+                      : (glassOpacity * 2.0).clamp(0.12, 1.0)),
+              borderRadius: br,
+              border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.15), width: 0.5),
             ),
+            child: inner,
           )
         : Container(
             padding: pad,
@@ -116,7 +112,14 @@ class ChatBubble extends StatelessWidget {
     );
   }
 
+  // In glass mode enforce readable text regardless of wallpaper colours.
+  Color _effectiveTextColor(Color base) {
+    if (!glassEnabled) return base;
+    return Colors.white.withValues(alpha: isOutgoing ? 0.95 : 0.88);
+  }
+
   Widget _buildInner(PhantomTokens t, Color textColor, bool isImage) {
+    textColor = _effectiveTextColor(textColor);
     return Column(
       crossAxisAlignment:
           isOutgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,
@@ -232,6 +235,9 @@ class ChatBubble extends StatelessWidget {
             fontSize: 15,
             height: 1.45,
             fontFamily: 'monospace',
+            shadows: glassEnabled
+                ? [Shadow(color: Colors.black.withValues(alpha: 0.55), blurRadius: 4)]
+                : null,
           ),
         );
     }
@@ -593,7 +599,9 @@ class _MessageInputState extends State<MessageInput> {
               children: [
                 _IconBtn(
                   icon: Icons.add,
-                  color: t.iconDefault,
+                  color: widget.glassEnabled
+                      ? Colors.white.withValues(alpha: 0.80)
+                      : t.iconDefault,
                   onTap: () => _showAttachSheet(context, t),
                 ),
                 const SizedBox(width: 8),
@@ -668,8 +676,10 @@ class _MessageInputState extends State<MessageInput> {
                               ? Icons.stop_circle_outlined
                               : Icons.mic_none,
                           color: _isRecording
-                              ? const Color(0xFFCF6679)
-                              : t.iconDefault,
+                              ? const Color(0xFFFF6B6B)
+                              : (widget.glassEnabled
+                                  ? Colors.white.withValues(alpha: 0.80)
+                                  : t.iconDefault),
                           onTap: _toggleRecord,
                         ),
                 ),
@@ -741,30 +751,22 @@ class _GlassBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (!enabled) {
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        decoration: BoxDecoration(
-          color: bgColor,
-          border: Border(top: BorderSide(color: divider, width: 0.5)),
-        ),
-        child: child,
-      );
-    }
-    return ClipRect(
-      child: BackdropFilter(
-        filter: ui.ImageFilter.blur(sigmaX: blur, sigmaY: blur),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          decoration: BoxDecoration(
-            color: bgColor.withValues(alpha: (opacity * 1.8).clamp(0.0, 1.0)),
-            border: Border(
-                top: BorderSide(
-                    color: divider.withValues(alpha: 0.3), width: 0.5)),
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: enabled
+            ? bgColor.withValues(alpha: (opacity * 1.8).clamp(0.12, 0.85))
+            : bgColor,
+        border: Border(
+          top: BorderSide(
+            color: enabled
+                ? divider.withValues(alpha: 0.25)
+                : divider,
+            width: 0.5,
           ),
-          child: child,
         ),
       ),
+      child: child,
     );
   }
 }

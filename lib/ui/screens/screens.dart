@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:gal/gal.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import '../../core_provider.dart';
@@ -1108,6 +1109,23 @@ class _ChatScreenState extends State<ChatScreen> {
     ));
   }
 
+  void _openImageViewer(
+      BuildContext context, PhantomTokens t, PhantomCore? core, Uint8List imageBytes) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => _ImageViewer(
+          imageBytes:  imageBytes,
+          tokens:      t,
+          core:        core,
+          contactId:   widget.contactId,
+          contactName: widget.contactName,
+        ),
+      ),
+    );
+  }
+
   String? _replyPreviewFor(StoredMessage msg) {
     if (msg.replyToId == null) return null;
     final origin = _messages?.cast<StoredMessage?>().firstWhere(
@@ -1136,20 +1154,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final bgPath = g ? (_deviceWallpaperPath ?? _wallpaperPath) : null;
 
     final appBar = AppBar(
-      backgroundColor: g ? Colors.transparent : t.bgSurface,
+      backgroundColor: g
+          ? t.bgSurface.withValues(alpha: (_glassOpacity * 2.2).clamp(0.12, 0.88))
+          : t.bgSurface,
       elevation: 0,
-      flexibleSpace: g
-          ? ClipRect(
-              child: BackdropFilter(
-                filter: ui.ImageFilter.blur(
-                    sigmaX: _glassBlur, sigmaY: _glassBlur),
-                child: Container(
-                  color: t.bgSurface.withValues(
-                      alpha: (_glassOpacity * 2.0).clamp(0.0, 1.0)),
-                ),
-              ),
-            )
-          : null,
       leading: IconButton(
         icon: Icon(Icons.arrow_back, color: t.textSecondary, size: 20),
         onPressed: () => Navigator.pop(context),
@@ -1216,10 +1224,18 @@ class _ChatScreenState extends State<ChatScreen> {
     if (g) {
       body = Stack(
         children: [
-          // Full-screen background layer
+          // Full-screen background layer — wallpaper is blurred once here so
+          // per-bubble BackdropFilter is not needed (avoids scroll artifacts).
           Positioned.fill(
             child: bgPath != null
-                ? Image.file(File(bgPath), fit: BoxFit.cover)
+                ? ImageFiltered(
+                    imageFilter: ui.ImageFilter.blur(
+                      sigmaX: _glassBlur,
+                      sigmaY: _glassBlur,
+                      tileMode: TileMode.clamp,
+                    ),
+                    child: Image.file(File(bgPath), fit: BoxFit.cover),
+                  )
                 : _GlassFallback(accent: t.accentLight),
           ),
           // Content (offset for AppBar via extendBodyBehindAppBar)
@@ -1282,6 +1298,9 @@ class _ChatScreenState extends State<ChatScreen> {
           padding: EdgeInsets.only(bottom: nextSame ? 2 : 10),
           child: GestureDetector(
             onLongPress: () => _showMsgMenu(context, t, core, msg),
+            onTap: msg.type == MessageType.image
+                ? () => _openImageViewer(context, t, core, msg.content)
+                : null,
             child: ChatBubble(
               text:         msg.type == MessageType.text
                   ? msg.textContent
@@ -1916,6 +1935,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     );
                   }).toList(),
                 ),
+                const SizedBox(height: 16),
+                _IntensitySlider(
+                  value:    provider.themeCtrl.intensity,
+                  accent:   t.accentLight,
+                  tokens:   t,
+                  onChange: provider.themeCtrl.setIntensity,
+                ),
               ],
             ),
           ),
@@ -2436,6 +2462,66 @@ class _GlassFallback extends StatelessWidget {
   }
 }
 
+// Inline intensity slider used directly inside the appearance section.
+class _IntensitySlider extends StatelessWidget {
+  final double value;
+  final Color accent;
+  final PhantomTokens tokens;
+  final ValueChanged<double> onChange;
+
+  const _IntensitySlider({
+    required this.value,
+    required this.accent,
+    required this.tokens,
+    required this.onChange,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final t = tokens;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Text('color intensity',
+                style: TextStyle(
+                    color: t.textSecondary,
+                    fontFamily: 'monospace',
+                    fontSize: 12)),
+            const Spacer(),
+            Text(
+              '${(value * 100).round()}%',
+              style: TextStyle(
+                  color: accent,
+                  fontFamily: 'monospace',
+                  fontSize: 12),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        SliderTheme(
+          data: SliderTheme.of(context).copyWith(
+            activeTrackColor:   accent,
+            inactiveTrackColor: t.divider,
+            thumbColor:         accent,
+            overlayColor:       accent.withValues(alpha: 0.12),
+            trackHeight:        2,
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+          ),
+          child: Slider(
+            value: value.clamp(0.0, 1.0),
+            min: 0.0,
+            max: 1.0,
+            divisions: 20,
+            onChanged: onChange,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class _GlassSlider extends StatelessWidget {
   final String label;
   final double value;
@@ -2497,6 +2583,296 @@ class _GlassSlider extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+// ── Image viewer ──────────────────────────────────────────────────────────────
+
+class _ImageViewer extends StatelessWidget {
+  final Uint8List   imageBytes;
+  final PhantomTokens tokens;
+  final PhantomCore?  core;
+  final String        contactId;
+  final String        contactName;
+
+  const _ImageViewer({
+    required this.imageBytes,
+    required this.tokens,
+    required this.contactId,
+    required this.contactName,
+    this.core,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      extendBodyBehindAppBar: true,
+      appBar: AppBar(
+        backgroundColor: Colors.black45,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.close, color: Colors.white, size: 22),
+          onPressed: () => Navigator.pop(context),
+        ),
+      ),
+      body: Stack(
+        children: [
+          // Zoomable image
+          Positioned.fill(
+            child: InteractiveViewer(
+              minScale: 0.5,
+              maxScale: 6.0,
+              child: Center(
+                child: Image.memory(imageBytes, fit: BoxFit.contain),
+              ),
+            ),
+          ),
+          // Bottom action bar
+          Positioned(
+            left: 0, right: 0, bottom: 0,
+            child: SafeArea(
+              top: false,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 14),
+                color: Colors.black54,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    _ViewerAction(
+                      icon: Icons.download_outlined,
+                      label: 'save',
+                      onTap: () => _save(context),
+                    ),
+                    _ViewerAction(
+                      icon: Icons.forward_outlined,
+                      label: 'forward',
+                      onTap: () => _showForwardSheet(context),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _save(BuildContext context) async {
+    try {
+      await Gal.putImageBytes(imageBytes, album: 'Phantom');
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          backgroundColor: const Color(0xFF1E1E1E),
+          content: Text('saved to gallery',
+              style: TextStyle(color: tokens.textPrimary,
+                  fontFamily: 'monospace', fontSize: 13)),
+          duration: const Duration(seconds: 2),
+        ));
+      }
+    } catch (_) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          backgroundColor: Color(0xFF1E1E1E),
+          content: Text('failed to save',
+              style: TextStyle(color: Color(0xFFCF6679),
+                  fontFamily: 'monospace', fontSize: 13)),
+          duration: Duration(seconds: 2),
+        ));
+      }
+    }
+  }
+
+  void _showForwardSheet(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: tokens.bgSurface,
+      shape: RoundedRectangleBorder(
+          borderRadius:
+              BorderRadius.vertical(top: Radius.circular(tokens.radiusCard))),
+      builder: (_) => _ForwardSheet(
+        imageBytes:         imageBytes,
+        tokens:             tokens,
+        core:               core,
+        currentContactId:   contactId,
+        currentContactName: contactName,
+      ),
+    );
+  }
+}
+
+// ── Forward sheet ─────────────────────────────────────────────────────────────
+
+class _ForwardSheet extends StatefulWidget {
+  final Uint8List     imageBytes;
+  final PhantomTokens tokens;
+  final PhantomCore?  core;
+  final String        currentContactId;
+  final String        currentContactName;
+
+  const _ForwardSheet({
+    required this.imageBytes,
+    required this.tokens,
+    required this.core,
+    required this.currentContactId,
+    required this.currentContactName,
+  });
+
+  @override
+  State<_ForwardSheet> createState() => _ForwardSheetState();
+}
+
+class _ForwardSheetState extends State<_ForwardSheet> {
+  List<ContactRecord>? _contacts;
+  final _sending = <String>{};
+
+  @override
+  void initState() {
+    super.initState();
+    widget.core?.getContacts().then((list) {
+      if (mounted) setState(() => _contacts = list);
+    });
+  }
+
+  Future<void> _forward(String contactId) async {
+    if (_sending.contains(contactId) || widget.core == null) return;
+    setState(() => _sending.add(contactId));
+    try {
+      await widget.core!.sendFile(
+        recipientId: contactId,
+        bytes:       widget.imageBytes,
+        fileName:    'shared_${DateTime.now().millisecondsSinceEpoch}.jpg',
+      );
+    } finally {
+      if (mounted) setState(() => _sending.remove(contactId));
+    }
+    if (mounted) Navigator.pop(context);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = widget.tokens;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const SizedBox(height: 8),
+        Container(
+          width: 36, height: 3,
+          decoration: BoxDecoration(
+              color: t.divider, borderRadius: BorderRadius.circular(2)),
+        ),
+        const SizedBox(height: 12),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Text('forward to',
+              style: TextStyle(
+                  color: t.textSecondary,
+                  fontFamily: 'monospace',
+                  fontSize: 12)),
+        ),
+        const SizedBox(height: 8),
+        if (_contacts == null)
+          Padding(
+            padding: const EdgeInsets.all(24),
+            child: CircularProgressIndicator(
+                color: t.accentLight, strokeWidth: 1),
+          )
+        else if (_contacts!.isEmpty)
+          Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text('no contacts',
+                style: TextStyle(
+                    color: t.textDisabled,
+                    fontFamily: 'monospace',
+                    fontSize: 13)),
+          )
+        else
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 320),
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: _contacts!.length,
+              itemBuilder: (_, i) {
+                final c       = _contacts![i];
+                final name    = c.nickname?.isNotEmpty == true
+                    ? c.nickname!
+                    : c.phantomId.substring(0, 8);
+                final sending = _sending.contains(c.phantomId);
+                return ListTile(
+                  dense: true,
+                  leading: Icon(Icons.account_circle_outlined,
+                      color: t.iconDefault, size: 22),
+                  title: Text(name,
+                      style: TextStyle(
+                          color: t.textPrimary,
+                          fontFamily: 'monospace',
+                          fontSize: 14)),
+                  subtitle: Text(
+                      c.phantomId.length > 16
+                          ? '${c.phantomId.substring(0, 8)}…'
+                          : c.phantomId,
+                      style: TextStyle(
+                          color: t.textDisabled,
+                          fontFamily: 'monospace',
+                          fontSize: 10)),
+                  trailing: sending
+                      ? SizedBox(
+                          width: 18, height: 18,
+                          child: CircularProgressIndicator(
+                              color: t.accentLight,
+                              strokeWidth: 1.5))
+                      : Icon(Icons.send_outlined,
+                          color: t.accentLight, size: 18),
+                  onTap: sending ? null : () => _forward(c.phantomId),
+                );
+              },
+            ),
+          ),
+        const SizedBox(height: 16),
+      ],
+    );
+  }
+}
+
+// ── Viewer action button ──────────────────────────────────────────────────────
+
+class _ViewerAction extends StatelessWidget {
+  final IconData   icon;
+  final String     label;
+  final VoidCallback onTap;
+
+  const _ViewerAction({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 48, height: 48,
+            decoration: BoxDecoration(
+              color: Colors.white12,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.white24, width: 0.5),
+            ),
+            child: Icon(icon, color: Colors.white, size: 22),
+          ),
+          const SizedBox(height: 6),
+          Text(label,
+              style: const TextStyle(
+                  color: Colors.white70,
+                  fontFamily: 'monospace',
+                  fontSize: 11)),
+        ],
+      ),
     );
   }
 }

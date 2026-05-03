@@ -6,14 +6,14 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 // En el futuro esto se expande a ThemeManifest completo.
 
 enum PhantomAccent {
-  ghost(   'Ghost',    Color(0xFFE0E0E0), Color(0xFF9E9E9E)),
-  cyan(    'Cyan',     Color(0xFF00E5FF), Color(0xFF00838F)),
-  violet(  'Violet',  Color(0xFFCE93D8), Color(0xFF7B1FA2)),
-  amber(   'Amber',   Color(0xFFFFD54F), Color(0xFFF57F17)),
-  red(     'Red',     Color(0xFFEF9A9A), Color(0xFFC62828)),
-  green(   'Green',   Color(0xFFA5D6A7), Color(0xFF2E7D32)),
-  rose(    'Rose',    Color(0xFFF48FB1), Color(0xFFAD1457)),
-  ice(     'Ice',     Color(0xFFB3E5FC), Color(0xFF0277BD));
+  ghost(   'Ghost',    Color(0xFFE8E8E8), Color(0xFFAAAAAA)),
+  cyan(    'Cyan',     Color(0xFF18FFFF), Color(0xFF00ACC1)),
+  violet(  'Violet',  Color(0xFFD9A8E8), Color(0xFF9C27B0)),
+  amber(   'Amber',   Color(0xFFFFE082), Color(0xFFF9A825)),
+  red(     'Red',     Color(0xFFFF8A80), Color(0xFFD32F2F)),
+  green(   'Green',   Color(0xFFB9F6CA), Color(0xFF388E3C)),
+  rose(    'Rose',    Color(0xFFFF80AB), Color(0xFFC2185B)),
+  ice(     'Ice',     Color(0xFFE1F5FE), Color(0xFF0288D1));
 
   final String label;
   final Color light;  // burbuja outgoing, botones activos
@@ -81,7 +81,9 @@ class PhantomTokens {
     required this.radiusInput,
   });
 
-  factory PhantomTokens.dark(PhantomAccent accent) {
+  factory PhantomTokens.dark(PhantomAccent accent, {double intensity = 1.0}) {
+    final al = _scaled(accent.light, intensity, isDark: true);
+    final ad = _scaled(accent.dark,  intensity, isDark: true);
     return PhantomTokens(
       bgBase:          const Color(0xFF0A0A0A),
       bgSurface:       const Color(0xFF141414),
@@ -89,23 +91,25 @@ class PhantomTokens {
       textPrimary:     const Color(0xFFF0F0F0),
       textSecondary:   const Color(0xFF888888),
       textDisabled:    const Color(0xFF444444),
-      accentLight:     accent.light,
-      accentDark:      accent.dark,
-      bubbleOut:       accent.light.withValues(alpha: 0.15),
-      bubbleOutText:   accent.light,
+      accentLight:     al,
+      accentDark:      ad,
+      bubbleOut:       al.withValues(alpha: 0.10 + 0.20 * intensity),
+      bubbleOutText:   al,
       bubbleIn:        const Color(0xFF1E1E1E),
       bubbleInText:    const Color(0xFFE0E0E0),
       divider:         const Color(0xFF222222),
       inputBorder:     const Color(0xFF2A2A2A),
-      iconDefault:     const Color(0xFF555555),
-      iconActive:      accent.light,
+      iconDefault:     const Color(0xFF8A8A8A),
+      iconActive:      al,
       radiusBubble:    14,
       radiusCard:      12,
       radiusInput:     10,
     );
   }
 
-  factory PhantomTokens.light(PhantomAccent accent) {
+  factory PhantomTokens.light(PhantomAccent accent, {double intensity = 1.0}) {
+    final al = _scaled(accent.dark,  intensity, isDark: false);
+    final ad = _scaled(accent.light, intensity, isDark: false);
     return PhantomTokens(
       bgBase:          const Color(0xFFFAFAFA),
       bgSurface:       const Color(0xFFFFFFFF),
@@ -113,20 +117,26 @@ class PhantomTokens {
       textPrimary:     const Color(0xFF0A0A0A),
       textSecondary:   const Color(0xFF666666),
       textDisabled:    const Color(0xFFBBBBBB),
-      accentLight:     accent.dark,
-      accentDark:      accent.light,
-      bubbleOut:       accent.dark.withValues(alpha: 0.12),
-      bubbleOutText:   accent.dark,
+      accentLight:     al,
+      accentDark:      ad,
+      bubbleOut:       al.withValues(alpha: 0.10 + 0.18 * intensity),
+      bubbleOutText:   al,
       bubbleIn:        const Color(0xFFEEEEEE),
       bubbleInText:    const Color(0xFF1A1A1A),
       divider:         const Color(0xFFE8E8E8),
       inputBorder:     const Color(0xFFDDDDDD),
-      iconDefault:     const Color(0xFFAAAAAA),
-      iconActive:      accent.dark,
+      iconDefault:     const Color(0xFF777777),
+      iconActive:      al,
       radiusBubble:    14,
       radiusCard:      12,
       radiusInput:     10,
     );
+  }
+
+  // Blend accent toward a neutral grey based on intensity [0..1].
+  static Color _scaled(Color c, double intensity, {required bool isDark}) {
+    final neutral = isDark ? const Color(0xFF828282) : const Color(0xFF909090);
+    return Color.lerp(neutral, c, intensity.clamp(0.0, 1.0))!;
   }
 }
 
@@ -161,43 +171,58 @@ class PhantomTheme extends InheritedWidget {
 // ── ThemeController — gestiona el estado global del tema ─────────────────────
 
 class ThemeController extends ChangeNotifier {
-  static const _store    = FlutterSecureStorage();
-  static const _keyAccent = 'theme_accent';
-  static const _keyDark   = 'theme_dark';
+  static const _store         = FlutterSecureStorage();
+  static const _keyAccent     = 'theme_accent';
+  static const _keyDark       = 'theme_dark';
+  static const _keyIntensity  = 'theme_intensity';
 
   PhantomAccent _accent;
-  bool _isDark;
+  bool   _isDark;
+  double _intensity;
 
   ThemeController({
-    PhantomAccent accent = PhantomAccent.cyan,
-    bool isDark = true,
-  })  : _accent = accent,
-        _isDark = isDark;
+    PhantomAccent accent    = PhantomAccent.cyan,
+    bool          isDark    = true,
+    double        intensity = 1.0,
+  })  : _accent    = accent,
+        _isDark    = isDark,
+        _intensity = intensity;
 
   /// Loads persisted theme from secure storage; falls back to defaults.
   static Future<ThemeController> load() async {
-    final accentStr = await _store.read(key: _keyAccent);
-    final darkStr   = await _store.read(key: _keyDark);
+    final accentStr    = await _store.read(key: _keyAccent);
+    final darkStr      = await _store.read(key: _keyDark);
+    final intensityStr = await _store.read(key: _keyIntensity);
     final accent = PhantomAccent.values.firstWhere(
       (a) => a.name == accentStr,
       orElse: () => PhantomAccent.cyan,
     );
-    return ThemeController(accent: accent, isDark: darkStr != 'false');
+    final intensity = double.tryParse(intensityStr ?? '') ?? 1.0;
+    return ThemeController(accent: accent, isDark: darkStr != 'false', intensity: intensity);
   }
 
   Future<void> _persist() async {
-    await _store.write(key: _keyAccent, value: _accent.name);
-    await _store.write(key: _keyDark,   value: _isDark.toString());
+    await _store.write(key: _keyAccent,    value: _accent.name);
+    await _store.write(key: _keyDark,      value: _isDark.toString());
+    await _store.write(key: _keyIntensity, value: _intensity.toString());
   }
 
-  PhantomAccent get accent => _accent;
-  bool get isDark => _isDark;
+  PhantomAccent get accent    => _accent;
+  bool          get isDark    => _isDark;
+  double        get intensity => _intensity;
 
-  PhantomTokens get tokens =>
-      _isDark ? PhantomTokens.dark(_accent) : PhantomTokens.light(_accent);
+  PhantomTokens get tokens => _isDark
+      ? PhantomTokens.dark(_accent,  intensity: _intensity)
+      : PhantomTokens.light(_accent, intensity: _intensity);
 
   void setAccent(PhantomAccent accent) {
     _accent = accent;
+    notifyListeners();
+    _persist();
+  }
+
+  void setIntensity(double v) {
+    _intensity = v.clamp(0.0, 1.0);
     notifyListeners();
     _persist();
   }
