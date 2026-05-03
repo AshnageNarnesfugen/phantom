@@ -82,9 +82,10 @@ class _PhantomAppState extends State<PhantomApp> {
       themeCtrl: _themeCtrl,
       onAccountReady: _onAccountReady,
       child: PhantomTheme(
-        tokens: _themeCtrl.tokens,
-        accent: _themeCtrl.accent,
-        isDark: _themeCtrl.isDark,
+        tokens:    _themeCtrl.tokens,
+        accent:    _themeCtrl.accent,
+        isDark:    _themeCtrl.isDark,
+        intensity: _themeCtrl.intensity,
         child: MaterialApp(
           title: 'Phantom',
           debugShowCheckedModeBanner: false,

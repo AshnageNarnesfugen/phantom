@@ -145,13 +145,15 @@ class PhantomTokens {
 class PhantomTheme extends InheritedWidget {
   final PhantomTokens tokens;
   final PhantomAccent accent;
-  final bool isDark;
+  final bool   isDark;
+  final double intensity;
 
   const PhantomTheme({
     super.key,
     required this.tokens,
     required this.accent,
     required this.isDark,
+    required this.intensity,
     required super.child,
   });
 
@@ -165,7 +167,7 @@ class PhantomTheme extends InheritedWidget {
 
   @override
   bool updateShouldNotify(PhantomTheme old) =>
-      old.accent != accent || old.isDark != isDark;
+      old.accent != accent || old.isDark != isDark || old.intensity != intensity;
 }
 
 // ── ThemeController — gestiona el estado global del tema ─────────────────────

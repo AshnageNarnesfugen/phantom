@@ -2462,8 +2462,9 @@ class _GlassFallback extends StatelessWidget {
   }
 }
 
-// Inline intensity slider used directly inside the appearance section.
-class _IntensitySlider extends StatelessWidget {
+// Inline intensity slider — StatefulWidget so the thumb animates smoothly
+// during drag without waiting for the global theme rebuild.
+class _IntensitySlider extends StatefulWidget {
   final double value;
   final Color accent;
   final PhantomTokens tokens;
@@ -2477,8 +2478,31 @@ class _IntensitySlider extends StatelessWidget {
   });
 
   @override
+  State<_IntensitySlider> createState() => _IntensitySliderState();
+}
+
+class _IntensitySliderState extends State<_IntensitySlider> {
+  late double _local;
+
+  @override
+  void initState() {
+    super.initState();
+    _local = widget.value;
+  }
+
+  @override
+  void didUpdateWidget(_IntensitySlider old) {
+    super.didUpdateWidget(old);
+    // Sync local value when the external source changes (e.g. accent switch).
+    if ((old.value - widget.value).abs() > 0.001) {
+      _local = widget.value;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final t = tokens;
+    final t = widget.tokens;
+    final accent = widget.accent;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -2491,7 +2515,7 @@ class _IntensitySlider extends StatelessWidget {
                     fontSize: 12)),
             const Spacer(),
             Text(
-              '${(value * 100).round()}%',
+              '${(_local * 100).round()}%',
               style: TextStyle(
                   color: accent,
                   fontFamily: 'monospace',
@@ -2510,11 +2534,14 @@ class _IntensitySlider extends StatelessWidget {
             thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
           ),
           child: Slider(
-            value: value.clamp(0.0, 1.0),
+            value: _local.clamp(0.0, 1.0),
             min: 0.0,
             max: 1.0,
             divisions: 20,
-            onChanged: onChange,
+            onChanged: (v) {
+              setState(() => _local = v);
+              widget.onChange(v);
+            },
           ),
         ),
       ],
