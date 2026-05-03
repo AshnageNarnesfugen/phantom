@@ -287,6 +287,16 @@ class PhantomStorage {
 
   Future<String?> getOwnAvatarPath() => getSetting<String>('own_avatar_path');
 
+  // ── Glass effect settings ────────────────────────────────────────────────────
+
+  Future<bool>   getGlassEnabled() async  => (await getSetting<bool>('glass_enabled'))   ?? false;
+  Future<double> getGlassOpacity() async  => (await getSetting<double>('glass_opacity')) ?? 0.12;
+  Future<double> getGlassBlur()    async  => (await getSetting<double>('glass_blur'))    ?? 10.0;
+
+  Future<void> setGlassEnabled(bool v)   => setSetting('glass_enabled', v);
+  Future<void> setGlassOpacity(double v) => setSetting('glass_opacity', v);
+  Future<void> setGlassBlur(double v)    => setSetting('glass_blur', v);
+
   // ── Internals ─────────────────────────────────────────────────────────────────
 
   Future<Box> _openBox(String name) async {

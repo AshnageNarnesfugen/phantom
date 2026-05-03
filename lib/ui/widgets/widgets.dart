@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -22,6 +23,9 @@ class ChatBubble extends StatelessWidget {
   final String? replyPreview;
   final Uint8List? mediaContent;
   final MessageType messageType;
+  final bool glassEnabled;
+  final double glassOpacity;
+  final double glassBlur;
 
   const ChatBubble({
     super.key,
@@ -33,20 +37,68 @@ class ChatBubble extends StatelessWidget {
     this.replyPreview,
     this.mediaContent,
     this.messageType = MessageType.text,
+    this.glassEnabled = false,
+    this.glassOpacity = 0.12,
+    this.glassBlur = 10.0,
   });
 
   @override
   Widget build(BuildContext context) {
     final t = PhantomTheme.tokensOf(context);
 
-    final bgColor    = isOutgoing ? t.bubbleOut : t.bubbleIn;
-    final textColor  = isOutgoing ? t.bubbleOutText : t.bubbleInText;
+    final bgColor     = isOutgoing ? t.bubbleOut : t.bubbleIn;
+    final textColor   = isOutgoing ? t.bubbleOutText : t.bubbleInText;
     final borderColor = isOutgoing
         ? t.accentLight.withValues(alpha: 0.25)
         : Colors.transparent;
 
-    final isMedia = messageType == MessageType.image ||
-        messageType == MessageType.file;
+    final isImage = messageType == MessageType.image;
+    final isMedia = isImage || messageType == MessageType.file;
+
+    final br = BorderRadius.only(
+      topLeft:     const Radius.circular(14),
+      topRight:    const Radius.circular(14),
+      bottomLeft:  Radius.circular(isOutgoing ? 14 : (showTail ? 4 : 14)),
+      bottomRight: Radius.circular(isOutgoing ? (showTail ? 4 : 14) : 14),
+    );
+
+    final pad = EdgeInsets.fromLTRB(
+      isImage ? 4 : 14,
+      isImage ? 4 : 9,
+      isImage ? 4 : 14,
+      isImage ? 4 : 9,
+    );
+
+    final inner = _buildInner(t, textColor, isImage);
+
+    final Widget bubble = glassEnabled
+        ? ClipRRect(
+            borderRadius: br,
+            child: BackdropFilter(
+              filter: ui.ImageFilter.blur(sigmaX: glassBlur, sigmaY: glassBlur),
+              child: Container(
+                padding: pad,
+                decoration: BoxDecoration(
+                  color: (isOutgoing ? t.accentLight : t.bgSurface)
+                      .withValues(alpha: isOutgoing
+                          ? glassOpacity
+                          : (glassOpacity * 1.6).clamp(0.0, 1.0)),
+                  border: Border.all(
+                      color: textColor.withValues(alpha: 0.18), width: 0.5),
+                ),
+                child: inner,
+              ),
+            ),
+          )
+        : Container(
+            padding: pad,
+            decoration: BoxDecoration(
+              color: bgColor,
+              border: Border.all(color: borderColor, width: 0.5),
+              borderRadius: br,
+            ),
+            child: inner,
+          );
 
     return Align(
       alignment: isOutgoing ? Alignment.centerRight : Alignment.centerLeft,
@@ -59,92 +111,83 @@ class ChatBubble extends StatelessWidget {
         constraints: isMedia
             ? BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.7)
             : null,
-        padding: EdgeInsets.fromLTRB(
-          messageType == MessageType.image ? 4 : 14,
-          messageType == MessageType.image ? 4 : 9,
-          messageType == MessageType.image ? 4 : 14,
-          messageType == MessageType.image ? 4 : 9,
-        ),
-        decoration: BoxDecoration(
-          color: bgColor,
-          border: Border.all(color: borderColor, width: 0.5),
-          borderRadius: BorderRadius.only(
-            topLeft:     const Radius.circular(14),
-            topRight:    const Radius.circular(14),
-            bottomLeft:  Radius.circular(isOutgoing ? 14 : (showTail ? 4 : 14)),
-            bottomRight: Radius.circular(isOutgoing ? (showTail ? 4 : 14) : 14),
-          ),
-        ),
-        child: Column(
-          crossAxisAlignment:
-              isOutgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (replyPreview != null) ...[
-              Container(
-                padding: const EdgeInsets.fromLTRB(8, 5, 8, 5),
-                margin: const EdgeInsets.only(bottom: 6),
-                decoration: BoxDecoration(
-                  color: textColor.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border(
-                    left: BorderSide(color: textColor.withValues(alpha: 0.4), width: 2),
-                  ),
-                ),
-                child: Text(
-                  replyPreview!,
-                  style: TextStyle(
-                    color: textColor.withValues(alpha: 0.6),
-                    fontSize: 12,
-                    fontFamily: 'monospace',
-                    height: 1.3,
-                  ),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ],
-            _buildContent(textColor),
-            if (messageType == MessageType.image)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(4, 4, 4, 0),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(timeLabel,
-                        style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.8),
-                            fontSize: 10,
-                            fontFamily: 'monospace')),
-                    if (isOutgoing) ...[
-                      const SizedBox(width: 4),
-                      _StatusIcon(status: status,
-                          color: Colors.white.withValues(alpha: 0.8)),
-                    ],
-                  ],
-                ),
-              )
-            else ...[
-              const SizedBox(height: 4),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(timeLabel,
-                      style: TextStyle(
-                          color: textColor.withValues(alpha: 0.45),
-                          fontSize: 11,
-                          fontFamily: 'monospace')),
-                  if (isOutgoing) ...[
-                    const SizedBox(width: 4),
-                    _StatusIcon(status: status,
-                        color: textColor.withValues(alpha: 0.55)),
-                  ],
-                ],
-              ),
-            ],
-          ],
-        ),
+        child: bubble,
       ),
+    );
+  }
+
+  Widget _buildInner(PhantomTokens t, Color textColor, bool isImage) {
+    return Column(
+      crossAxisAlignment:
+          isOutgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (replyPreview != null) ...[
+          Container(
+            padding: const EdgeInsets.fromLTRB(8, 5, 8, 5),
+            margin: const EdgeInsets.only(bottom: 6),
+            decoration: BoxDecoration(
+              color: textColor.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(6),
+              border: Border(
+                left: BorderSide(
+                    color: textColor.withValues(alpha: 0.4), width: 2),
+              ),
+            ),
+            child: Text(
+              replyPreview!,
+              style: TextStyle(
+                color: textColor.withValues(alpha: 0.6),
+                fontSize: 12,
+                fontFamily: 'monospace',
+                height: 1.3,
+              ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+        _buildContent(textColor),
+        if (isImage)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(4, 4, 4, 0),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(timeLabel,
+                    style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.8),
+                        fontSize: 10,
+                        fontFamily: 'monospace')),
+                if (isOutgoing) ...[
+                  const SizedBox(width: 4),
+                  _StatusIcon(
+                      status: status,
+                      color: Colors.white.withValues(alpha: 0.8)),
+                ],
+              ],
+            ),
+          )
+        else ...[
+          const SizedBox(height: 4),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(timeLabel,
+                  style: TextStyle(
+                      color: textColor.withValues(alpha: 0.45),
+                      fontSize: 11,
+                      fontFamily: 'monospace')),
+              if (isOutgoing) ...[
+                const SizedBox(width: 4),
+                _StatusIcon(
+                    status: status,
+                    color: textColor.withValues(alpha: 0.55)),
+              ],
+            ],
+          ),
+        ],
+      ],
     );
   }
 
@@ -371,6 +414,9 @@ class MessageInput extends StatefulWidget {
   final void Function(Uint8List bytes, String fileName)? onSendFile;
   final String? replyPreview;
   final VoidCallback? onCancelReply;
+  final bool glassEnabled;
+  final double glassOpacity;
+  final double glassBlur;
 
   const MessageInput({
     super.key,
@@ -378,6 +424,9 @@ class MessageInput extends StatefulWidget {
     this.onSendFile,
     this.replyPreview,
     this.onCancelReply,
+    this.glassEnabled = false,
+    this.glassOpacity = 0.12,
+    this.glassBlur = 10.0,
   });
 
   @override
@@ -532,12 +581,12 @@ class _MessageInputState extends State<MessageInput> {
               ],
             ),
           ),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          decoration: BoxDecoration(
-            color: t.bgSurface,
-            border: Border(top: BorderSide(color: t.divider, width: 0.5)),
-          ),
+        _GlassBar(
+          enabled: widget.glassEnabled,
+          opacity: widget.glassOpacity,
+          blur: widget.glassBlur,
+          bgColor: t.bgSurface,
+          divider: t.divider,
           child: SafeArea(
             top: false,
             child: Row(
@@ -665,6 +714,57 @@ class _AttachItem extends StatelessWidget {
               color: t.textPrimary, fontFamily: 'monospace', fontSize: 14)),
       dense: true,
       onTap: onTap,
+    );
+  }
+}
+
+// ── GlassBar ──────────────────────────────────────────────────────────────────
+// Wraps a bar widget with BackdropFilter blur when glass mode is active,
+// otherwise falls back to a plain coloured container with a top border.
+
+class _GlassBar extends StatelessWidget {
+  final bool enabled;
+  final double opacity;
+  final double blur;
+  final Color bgColor;
+  final Color divider;
+  final Widget child;
+
+  const _GlassBar({
+    required this.enabled,
+    required this.opacity,
+    required this.blur,
+    required this.bgColor,
+    required this.divider,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (!enabled) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: bgColor,
+          border: Border(top: BorderSide(color: divider, width: 0.5)),
+        ),
+        child: child,
+      );
+    }
+    return ClipRect(
+      child: BackdropFilter(
+        filter: ui.ImageFilter.blur(sigmaX: blur, sigmaY: blur),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: bgColor.withValues(alpha: (opacity * 1.8).clamp(0.0, 1.0)),
+            border: Border(
+                top: BorderSide(
+                    color: divider.withValues(alpha: 0.3), width: 0.5)),
+          ),
+          child: child,
+        ),
+      ),
     );
   }
 }

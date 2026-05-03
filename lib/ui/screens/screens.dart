@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -8,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import '../../core_provider.dart';
 import '../../core/phantom_core.dart';
 import '../../core/update_service.dart';
+import '../../core/device_wallpaper_service.dart';
 import '../theme/phantom_theme.dart';
 import '../widgets/widgets.dart';
 
@@ -966,6 +968,12 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _wallpaperPath;
   PhantomCore? _core; // cached — safe to use in dispose()
 
+  // Glass effect state
+  bool   _glassEnabled = false;
+  double _glassOpacity = 0.12;
+  double _glassBlur    = 10.0;
+  String? _deviceWallpaperPath;
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
@@ -981,6 +989,7 @@ class _ChatScreenState extends State<ChatScreen> {
       });
       _loadMessages(core);
       _loadWallpaper(core);
+      _loadGlass(core);
     }
   }
 
@@ -991,6 +1000,24 @@ class _ChatScreenState extends State<ChatScreen> {
       final f = File(path);
       if (await f.exists()) setState(() => _wallpaperPath = path);
     }
+  }
+
+  Future<void> _loadGlass(PhantomCore core) async {
+    final enabled = await core.storage.getGlassEnabled();
+    final opacity = await core.storage.getGlassOpacity();
+    final blur    = await core.storage.getGlassBlur();
+    if (!mounted) return;
+    setState(() {
+      _glassEnabled = enabled;
+      _glassOpacity = opacity;
+      _glassBlur    = blur;
+    });
+    if (enabled) await _fetchDeviceWallpaper();
+  }
+
+  Future<void> _fetchDeviceWallpaper() async {
+    final path = await DeviceWallpaperService.getWallpaperPath();
+    if (mounted && path != null) setState(() => _deviceWallpaperPath = path);
   }
 
   Future<void> _loadMessages(PhantomCore core) async {
@@ -1103,116 +1130,191 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget build(BuildContext context) {
     final t    = PhantomTheme.tokensOf(context);
     final core = CoreProvider.of(context).core;
+    final g    = _glassEnabled;
 
-    return Scaffold(
-      backgroundColor: t.bgBase,
-      appBar: AppBar(
-        backgroundColor: t.bgSurface,
-        elevation: 0,
-        leading: IconButton(
-          icon: Icon(Icons.arrow_back, color: t.textSecondary, size: 20),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: Row(
-          children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(widget.contactName,
-                      style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 15)),
-                  PhantomIdDisplay(phantomId: widget.contactId, compact: true),
-                ],
-              ),
-            ),
-            if (core?.isContactOnline(widget.contactId) == true)
-              Container(
-                width: 9, height: 9,
-                margin: const EdgeInsets.only(right: 4),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF4CAF50),
-                  shape: BoxShape.circle,
-                  border: Border.all(color: t.bgSurface, width: 1.5),
+    // Background image for glass mode: device wallpaper > chat wallpaper > gradient.
+    final bgPath = g ? (_deviceWallpaperPath ?? _wallpaperPath) : null;
+
+    final appBar = AppBar(
+      backgroundColor: g ? Colors.transparent : t.bgSurface,
+      elevation: 0,
+      flexibleSpace: g
+          ? ClipRect(
+              child: BackdropFilter(
+                filter: ui.ImageFilter.blur(
+                    sigmaX: _glassBlur, sigmaY: _glassBlur),
+                child: Container(
+                  color: t.bgSurface.withValues(
+                      alpha: (_glassOpacity * 2.0).clamp(0.0, 1.0)),
                 ),
               ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            icon: Icon(Icons.more_vert, color: t.iconDefault, size: 20),
-            onPressed: () => _showContactMenu(context, t, core),
-          ),
-        ],
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(0.5),
-          child: Divider(height: 0.5, color: t.divider),
-        ),
+            )
+          : null,
+      leading: IconButton(
+        icon: Icon(Icons.arrow_back, color: t.textSecondary, size: 20),
+        onPressed: () => Navigator.pop(context),
       ),
-      body: Column(
+      title: Row(
         children: [
           Expanded(
-            child: _messages == null
-                ? Center(child: CircularProgressIndicator(color: t.accentLight, strokeWidth: 1))
-                : _messages!.isEmpty
-                    ? Center(
-                        child: Text('no messages yet',
-                            style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 13)),
-                      )
-                    : Container(
-                        decoration: _wallpaperPath != null
-                            ? BoxDecoration(
-                                image: DecorationImage(
-                                  image: FileImage(File(_wallpaperPath!)),
-                                  fit: BoxFit.cover,
-                                  opacity: 0.25,
-                                ),
-                              )
-                            : null,
-                        child: ListView.builder(
-                          controller: _scrollCtrl,
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 16),
-                          itemCount: _messages!.length,
-                          itemBuilder: (context, i) {
-                            final msg      = _messages![i];
-                            final isOut    = msg.direction == MessageDirection.outgoing;
-                            final nextSame = i < _messages!.length - 1 &&
-                                (_messages![i + 1].direction == MessageDirection.outgoing) == isOut;
-
-                            return Padding(
-                              padding: EdgeInsets.only(bottom: nextSame ? 2 : 10),
-                              child: GestureDetector(
-                                onLongPress: () => _showMsgMenu(context, t, core, msg),
-                                child: ChatBubble(
-                                  text:         msg.type == MessageType.text ? msg.textContent : '[${msg.type.name}]',
-                                  isOutgoing:   isOut,
-                                  timeLabel:    _formatTime(msg.timestamp),
-                                  showTail:     !nextSame,
-                                  status:       msg.status,
-                                  replyPreview: _replyPreviewFor(msg),
-                                  mediaContent: msg.type != MessageType.text ? msg.content : null,
-                                  messageType:  msg.type,
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                      ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(widget.contactName,
+                    style: TextStyle(
+                        color: t.textPrimary,
+                        fontFamily: 'monospace',
+                        fontSize: 15)),
+                PhantomIdDisplay(phantomId: widget.contactId, compact: true),
+              ],
+            ),
           ),
-          MessageInput(
-            onSend:      _send,
-            onSendFile:  _sendFile,
-            replyPreview: _replyTo != null
-                ? (_replyTo!.type == MessageType.text
-                    ? _replyTo!.textContent
-                    : '[${_replyTo!.type.name}]')
-                : null,
-            onCancelReply: _replyTo != null
-                ? () { if (mounted) setState(() => _replyTo = null); }
-                : null,
-          ),
+          if (core?.isContactOnline(widget.contactId) == true)
+            Container(
+              width: 9, height: 9,
+              margin: const EdgeInsets.only(right: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFF4CAF50),
+                shape: BoxShape.circle,
+                border: Border.all(color: t.bgSurface, width: 1.5),
+              ),
+            ),
         ],
       ),
+      actions: [
+        IconButton(
+          icon: Icon(Icons.more_vert, color: t.iconDefault, size: 20),
+          onPressed: () => _showContactMenu(context, t, core),
+        ),
+      ],
+      bottom: g
+          ? null
+          : PreferredSize(
+              preferredSize: const Size.fromHeight(0.5),
+              child: Divider(height: 0.5, color: t.divider),
+            ),
     );
+
+    final messageList = _buildMessageList(context, t, core);
+    final inputBar = MessageInput(
+      onSend:        _send,
+      onSendFile:    _sendFile,
+      glassEnabled:  g,
+      glassOpacity:  _glassOpacity,
+      glassBlur:     _glassBlur,
+      replyPreview: _replyTo != null
+          ? (_replyTo!.type == MessageType.text
+              ? _replyTo!.textContent
+              : '[${_replyTo!.type.name}]')
+          : null,
+      onCancelReply: _replyTo != null
+          ? () { if (mounted) setState(() => _replyTo = null); }
+          : null,
+    );
+
+    Widget body;
+    if (g) {
+      body = Stack(
+        children: [
+          // Full-screen background layer
+          Positioned.fill(
+            child: bgPath != null
+                ? Image.file(File(bgPath), fit: BoxFit.cover)
+                : _GlassFallback(accent: t.accentLight),
+          ),
+          // Content (offset for AppBar via extendBodyBehindAppBar)
+          Column(
+            children: [
+              SizedBox(
+                height: MediaQuery.of(context).padding.top + kToolbarHeight,
+              ),
+              Expanded(child: messageList),
+              inputBar,
+            ],
+          ),
+        ],
+      );
+    } else {
+      body = Column(
+        children: [
+          Expanded(child: messageList),
+          inputBar,
+        ],
+      );
+    }
+
+    return Scaffold(
+      extendBodyBehindAppBar: g,
+      backgroundColor: t.bgBase,
+      appBar: appBar,
+      body: body,
+    );
+  }
+
+  Widget _buildMessageList(
+      BuildContext context, PhantomTokens t, PhantomCore? core) {
+    if (_messages == null) {
+      return Center(
+          child: CircularProgressIndicator(
+              color: t.accentLight, strokeWidth: 1));
+    }
+    if (_messages!.isEmpty) {
+      return Center(
+        child: Text('no messages yet',
+            style: TextStyle(
+                color: t.textDisabled,
+                fontFamily: 'monospace',
+                fontSize: 13)),
+      );
+    }
+    // Non-glass: wrap list in dimmed wallpaper decoration.
+    Widget list = ListView.builder(
+      controller: _scrollCtrl,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 16),
+      itemCount: _messages!.length,
+      itemBuilder: (ctx, i) {
+        final msg     = _messages![i];
+        final isOut   = msg.direction == MessageDirection.outgoing;
+        final nextSame = i < _messages!.length - 1 &&
+            (_messages![i + 1].direction == MessageDirection.outgoing) ==
+                isOut;
+        return Padding(
+          padding: EdgeInsets.only(bottom: nextSame ? 2 : 10),
+          child: GestureDetector(
+            onLongPress: () => _showMsgMenu(context, t, core, msg),
+            child: ChatBubble(
+              text:         msg.type == MessageType.text
+                  ? msg.textContent
+                  : '[${msg.type.name}]',
+              isOutgoing:   isOut,
+              timeLabel:    _formatTime(msg.timestamp),
+              showTail:     !nextSame,
+              status:       msg.status,
+              replyPreview: _replyPreviewFor(msg),
+              mediaContent: msg.type != MessageType.text ? msg.content : null,
+              messageType:  msg.type,
+              glassEnabled: _glassEnabled,
+              glassOpacity: _glassOpacity,
+              glassBlur:    _glassBlur,
+            ),
+          ),
+        );
+      },
+    );
+
+    if (!_glassEnabled && _wallpaperPath != null) {
+      list = Container(
+        decoration: BoxDecoration(
+          image: DecorationImage(
+            image: FileImage(File(_wallpaperPath!)),
+            fit: BoxFit.cover,
+            opacity: 0.25,
+          ),
+        ),
+        child: list,
+      );
+    }
+    return list;
   }
 
   void _showContactMenu(BuildContext context, PhantomTokens t, PhantomCore? core) {
@@ -1268,6 +1370,11 @@ class _ChatScreenState extends State<ChatScreen> {
               Navigator.pop(context);
               await core?.sendAvatarToContact(widget.contactId);
             }),
+          _MenuItem(icon: Icons.blur_on_outlined, label: 'glass effect', tokens: t,
+            onTap: () {
+              Navigator.pop(context);
+              _showGlassSettings(context, t, core);
+            }),
           _MenuItem(icon: Icons.delete_outline, label: 'clear history', tokens: t,
             onTap: () async {
               Navigator.pop(context);
@@ -1280,6 +1387,101 @@ class _ChatScreenState extends State<ChatScreen> {
             onTap: () => Navigator.pop(context)),
           const SizedBox(height: 16),
         ],
+      ),
+    );
+  }
+
+  void _showGlassSettings(
+      BuildContext context, PhantomTokens t, PhantomCore? core) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: t.bgSurface,
+      isScrollControlled: true,
+      shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(t.radiusCard))),
+      builder: (_) => StatefulBuilder(
+        builder: (ctx, setS) => Padding(
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 36, height: 3,
+                  decoration: BoxDecoration(
+                      color: t.divider,
+                      borderRadius: BorderRadius.circular(2)),
+                ),
+              ),
+              const SizedBox(height: 20),
+              Text('// glass effect',
+                  style: TextStyle(
+                      color: t.accentLight.withValues(alpha: 0.7),
+                      fontFamily: 'monospace',
+                      fontSize: 12)),
+              const SizedBox(height: 4),
+              Text(
+                'blurs the background through bubbles, bars, and app bar.\n'
+                'uses device wallpaper when available, otherwise the chat wallpaper.',
+                style: TextStyle(
+                    color: t.textDisabled,
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    height: 1.6),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text('enabled',
+                      style: TextStyle(
+                          color: t.textPrimary,
+                          fontFamily: 'monospace',
+                          fontSize: 14)),
+                  Switch(
+                    value: _glassEnabled,
+                    activeThumbColor: t.accentLight,
+                    onChanged: (val) async {
+                      setS(() {});
+                      if (mounted) setState(() => _glassEnabled = val);
+                      await core?.storage.setGlassEnabled(val);
+                      if (val) await _fetchDeviceWallpaper();
+                    },
+                  ),
+                ],
+              ),
+              if (_glassEnabled) ...[
+                const SizedBox(height: 8),
+                _GlassSlider(
+                  label: 'opacity',
+                  value: _glassOpacity,
+                  min: 0.05,
+                  max: 0.40,
+                  tokens: t,
+                  onChanged: (v) {
+                    setS(() {});
+                    if (mounted) setState(() => _glassOpacity = v);
+                    core?.storage.setGlassOpacity(v);
+                  },
+                ),
+                const SizedBox(height: 4),
+                _GlassSlider(
+                  label: 'blur',
+                  value: _glassBlur,
+                  min: 2.0,
+                  max: 25.0,
+                  tokens: t,
+                  onChanged: (v) {
+                    setS(() {});
+                    if (mounted) setState(() => _glassBlur = v);
+                    core?.storage.setGlassBlur(v);
+                  },
+                ),
+              ],
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -2205,6 +2407,96 @@ class _TransportRow extends StatelessWidget {
           Text(value,  style: TextStyle(color: tokens.textPrimary,   fontFamily: 'monospace', fontSize: 13)),
         ],
       ),
+    );
+  }
+}
+
+// ── Glass helper widgets ──────────────────────────────────────────────────────
+
+class _GlassFallback extends StatelessWidget {
+  final Color accent;
+  const _GlassFallback({required this.accent});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            accent.withValues(alpha: 0.55),
+            accent.withValues(alpha: 0.15),
+            Colors.black87,
+          ],
+          stops: const [0.0, 0.5, 1.0],
+        ),
+      ),
+    );
+  }
+}
+
+class _GlassSlider extends StatelessWidget {
+  final String label;
+  final double value;
+  final double min;
+  final double max;
+  final PhantomTokens tokens;
+  final ValueChanged<double> onChanged;
+
+  const _GlassSlider({
+    required this.label,
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.tokens,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final t = tokens;
+    return Row(
+      children: [
+        SizedBox(
+          width: 56,
+          child: Text(label,
+              style: TextStyle(
+                  color: t.textSecondary,
+                  fontFamily: 'monospace',
+                  fontSize: 12)),
+        ),
+        Expanded(
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              activeTrackColor: t.accentLight,
+              inactiveTrackColor: t.divider,
+              thumbColor: t.accentLight,
+              overlayColor: t.accentLight.withValues(alpha: 0.12),
+              trackHeight: 2,
+              thumbShape:
+                  const RoundSliderThumbShape(enabledThumbRadius: 6),
+            ),
+            child: Slider(
+              value: value.clamp(min, max),
+              min: min,
+              max: max,
+              onChanged: onChanged,
+            ),
+          ),
+        ),
+        SizedBox(
+          width: 36,
+          child: Text(
+            value.toStringAsFixed(2),
+            style: TextStyle(
+                color: t.textDisabled,
+                fontFamily: 'monospace',
+                fontSize: 10),
+            textAlign: TextAlign.right,
+          ),
+        ),
+      ],
     );
   }
 }
