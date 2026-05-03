@@ -351,6 +351,7 @@ class ConversationTile extends StatelessWidget {
   final bool isOnline;
   final VoidCallback onTap;
   final VoidCallback? onLongPress;
+  final Uint8List? avatarBytes;
 
   const ConversationTile({
     super.key,
@@ -362,6 +363,7 @@ class ConversationTile extends StatelessWidget {
     this.isOnline = false,
     required this.onTap,
     this.onLongPress,
+    this.avatarBytes,
   });
 
   @override
@@ -382,10 +384,11 @@ class ConversationTile extends StatelessWidget {
           children: [
             // Avatar — initial letter + accent ring + online dot
             _Avatar(
-              name: displayName,
-              hasUnread: unreadCount > 0,
-              isOnline: isOnline,
-              tokens: t,
+              name:        displayName,
+              hasUnread:   unreadCount > 0,
+              isOnline:    isOnline,
+              tokens:      t,
+              avatarBytes: avatarBytes,
             ),
             const SizedBox(width: 12),
 
@@ -478,12 +481,14 @@ class _Avatar extends StatelessWidget {
   final bool hasUnread;
   final bool isOnline;
   final PhantomTokens tokens;
+  final Uint8List? avatarBytes;
 
   const _Avatar({
     required this.name,
     required this.hasUnread,
     required this.isOnline,
     required this.tokens,
+    this.avatarBytes,
   });
 
   @override
@@ -503,18 +508,26 @@ class _Avatar extends StatelessWidget {
                   : tokens.divider,
               width: hasUnread ? 1.5 : 0.5,
             ),
+            image: avatarBytes != null
+                ? DecorationImage(
+                    image: MemoryImage(avatarBytes!),
+                    fit: BoxFit.cover,
+                  )
+                : null,
           ),
-          child: Center(
-            child: Text(
-              letter,
-              style: TextStyle(
-                color: hasUnread ? tokens.accentLight : tokens.textSecondary,
-                fontSize: 17,
-                fontFamily: 'monospace',
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ),
+          child: avatarBytes == null
+              ? Center(
+                  child: Text(
+                    letter,
+                    style: TextStyle(
+                      color: hasUnread ? tokens.accentLight : tokens.textSecondary,
+                      fontSize: 17,
+                      fontFamily: 'monospace',
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                )
+              : null,
         ),
         if (isOnline)
           Positioned(

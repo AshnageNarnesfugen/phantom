@@ -3,9 +3,11 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import '../../core_provider.dart';
 import '../../core/phantom_core.dart';
+import '../../core/update_service.dart';
 import '../theme/phantom_theme.dart';
 import '../widgets/widgets.dart';
 
@@ -629,9 +631,12 @@ class ConversationsScreen extends StatefulWidget {
 class _ConversationsScreenState extends State<ConversationsScreen> {
   List<ContactRecord>? _contacts;
   final Map<String, StoredMessage?> _lastMessages = {};
+  final Map<String, Uint8List?> _avatars = {};
   StreamSubscription<StoredMessage>? _msgSub;
   StreamSubscription<String>? _presenceSub;
   bool _showArchived = false;
+  UpdateInfo? _updateInfo;
+  bool _updateChecked = false;
 
   @override
   void didChangeDependencies() {
@@ -642,15 +647,29 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
       _presenceSub = core.presenceChanges.listen((_) { if (mounted) setState(() {}); });
       _loadData(core);
     }
+    if (!_updateChecked) {
+      _updateChecked = true;
+      UpdateService.checkForUpdate().then((info) {
+        if (info != null && mounted) { setState(() => _updateInfo = info); }
+      });
+    }
   }
 
   Future<void> _loadData(PhantomCore core) async {
     final contacts = await core.getContacts();
     final lastMsgs = <String, StoredMessage?>{};
+    final avatars  = <String, Uint8List?>{};
     for (final c in contacts) {
       lastMsgs[c.phantomId] = await core.getLastMessage(c.phantomId);
+      avatars[c.phantomId]  = await core.getContactAvatar(c.phantomId);
     }
-    if (mounted) setState(() { _contacts = contacts; _lastMessages.addAll(lastMsgs); });
+    if (mounted) {
+      setState(() {
+        _contacts = contacts;
+        _lastMessages.addAll(lastMsgs);
+        _avatars.addAll(avatars);
+      });
+    }
   }
 
   List<ContactRecord> get _visible {
@@ -746,29 +765,42 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
         bottom: PreferredSize(preferredSize: const Size.fromHeight(0.5),
             child: Divider(height: 0.5, color: t.divider)),
       ),
-      body: _contacts == null
-          ? Center(child: CircularProgressIndicator(color: t.accentLight, strokeWidth: 1))
-          : visible.isEmpty
-              ? _EmptyContacts(tokens: t, archived: _showArchived)
-              : ListView.builder(
-                  itemCount: visible.length,
-                  itemBuilder: (context, i) {
-                    final c    = visible[i];
-                    final last = _lastMessages[c.phantomId];
-                    return ConversationTile(
-                      displayName: c.displayName,
-                      phantomId:   c.phantomId,
-                      lastMessage: last?.type == MessageType.text ? last?.textContent : null,
-                      timeLabel:   last != null ? _formatTime(last.timestamp) : null,
-                      unreadCount: 0,
-                      isOnline:    core.isContactOnline(c.phantomId),
-                      onTap: () => Navigator.push(context,
-                        MaterialPageRoute(builder: (_) => ChatScreen(
-                          contactName: c.displayName, contactId: c.phantomId))).then((_) => _loadData(core)),
-                      onLongPress: () => _showConvMenu(context, t, core, c),
-                    );
-                  },
-                ),
+      body: Column(
+        children: [
+          if (_updateInfo != null)
+            _UpdateBanner(
+              info: _updateInfo!,
+              tokens: t,
+              onDismiss: () => setState(() => _updateInfo = null),
+            ),
+          Expanded(
+            child: _contacts == null
+                ? Center(child: CircularProgressIndicator(color: t.accentLight, strokeWidth: 1))
+                : visible.isEmpty
+                    ? _EmptyContacts(tokens: t, archived: _showArchived)
+                    : ListView.builder(
+                        itemCount: visible.length,
+                        itemBuilder: (context, i) {
+                          final c    = visible[i];
+                          final last = _lastMessages[c.phantomId];
+                          return ConversationTile(
+                            displayName: c.displayName,
+                            phantomId:   c.phantomId,
+                            lastMessage: last?.type == MessageType.text ? last?.textContent : null,
+                            timeLabel:   last != null ? _formatTime(last.timestamp) : null,
+                            unreadCount: 0,
+                            isOnline:    core.isContactOnline(c.phantomId),
+                            avatarBytes: _avatars[c.phantomId],
+                            onTap: () => Navigator.push(context,
+                              MaterialPageRoute(builder: (_) => ChatScreen(
+                                contactName: c.displayName, contactId: c.phantomId))).then((_) => _loadData(core)),
+                            onLongPress: () => _showConvMenu(context, t, core, c),
+                          );
+                        },
+                      ),
+          ),
+        ],
+      ),
       floatingActionButton: _showArchived ? null : FloatingActionButton(
         backgroundColor: t.bgSurface,
         elevation: 0,
@@ -789,6 +821,99 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
       return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
     }
     return '${dt.day}/${dt.month}';
+  }
+}
+
+// ── Update banner ─────────────────────────────────────────────────────────────
+
+class _UpdateBanner extends StatefulWidget {
+  final UpdateInfo info;
+  final PhantomTokens tokens;
+  final VoidCallback onDismiss;
+  const _UpdateBanner({required this.info, required this.tokens, required this.onDismiss});
+
+  @override
+  State<_UpdateBanner> createState() => _UpdateBannerState();
+}
+
+class _UpdateBannerState extends State<_UpdateBanner> {
+  double _progress = 0;
+  bool _downloading = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = widget.tokens;
+    return Container(
+      margin: const EdgeInsets.all(12),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: t.bgSurface,
+        borderRadius: BorderRadius.circular(t.radiusCard),
+        border: Border.all(color: t.accentLight.withValues(alpha: 0.4), width: 0.8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.system_update_outlined, size: 16, color: t.accentLight),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text('update available — v${widget.info.version}',
+                    style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 13)),
+              ),
+              GestureDetector(
+                onTap: widget.onDismiss,
+                child: Icon(Icons.close, size: 16, color: t.textDisabled),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (_downloading)
+            Column(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(2),
+                  child: LinearProgressIndicator(
+                    value: _progress,
+                    backgroundColor: t.divider,
+                    color: t.accentLight,
+                    minHeight: 3,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text('${(_progress * 100).toInt()}%',
+                    style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
+              ],
+            )
+          else
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                GestureDetector(
+                  onTap: () async {
+                    setState(() { _downloading = true; _progress = 0; });
+                    await UpdateService.downloadAndInstall(
+                      widget.info.downloadUrl,
+                      (p) { if (mounted) setState(() => _progress = p); },
+                    );
+                    if (mounted) setState(() => _downloading = false);
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                    decoration: BoxDecoration(
+                      color: t.accentLight.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(t.radiusCard),
+                    ),
+                    child: Text('download & install',
+                        style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 12)),
+                  ),
+                ),
+              ],
+            ),
+        ],
+      ),
+    );
   }
 }
 
@@ -838,12 +963,14 @@ class _ChatScreenState extends State<ChatScreen> {
   StreamSubscription<StoredMessage>? _sub;
   StreamSubscription<String>? _presenceSub;
   StoredMessage? _replyTo;
+  String? _wallpaperPath;
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     final core = CoreProvider.of(context).core;
     if (core != null && _sub == null) {
+      core.setActiveChat(widget.contactId);
       _sub = core.incomingMessages.listen((msg) {
         if (msg.conversationId == widget.contactId) _loadMessages(core);
       });
@@ -851,6 +978,16 @@ class _ChatScreenState extends State<ChatScreen> {
         if (id == widget.contactId && mounted) setState(() {});
       });
       _loadMessages(core);
+      _loadWallpaper(core);
+    }
+  }
+
+  Future<void> _loadWallpaper(PhantomCore core) async {
+    final path = await core.storage.getWallpaper(widget.contactId)
+              ?? await core.storage.getWallpaper(null);
+    if (path != null && mounted) {
+      final f = File(path);
+      if (await f.exists()) setState(() => _wallpaperPath = path);
     }
   }
 
@@ -939,6 +1076,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    CoreProvider.of(context).core?.setActiveChat(null);
     _sub?.cancel();
     _presenceSub?.cancel();
     _scrollCtrl.dispose();
@@ -1004,31 +1142,42 @@ class _ChatScreenState extends State<ChatScreen> {
                         child: Text('no messages yet',
                             style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 13)),
                       )
-                    : ListView.builder(
-                        controller: _scrollCtrl,
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 16),
-                        itemCount: _messages!.length,
-                        itemBuilder: (context, i) {
-                          final msg      = _messages![i];
-                          final isOut    = msg.direction == MessageDirection.outgoing;
-                          final nextSame = i < _messages!.length - 1 &&
-                              (_messages![i + 1].direction == MessageDirection.outgoing) == isOut;
+                    : Container(
+                        decoration: _wallpaperPath != null
+                            ? BoxDecoration(
+                                image: DecorationImage(
+                                  image: FileImage(File(_wallpaperPath!)),
+                                  fit: BoxFit.cover,
+                                  opacity: 0.25,
+                                ),
+                              )
+                            : null,
+                        child: ListView.builder(
+                          controller: _scrollCtrl,
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 16),
+                          itemCount: _messages!.length,
+                          itemBuilder: (context, i) {
+                            final msg      = _messages![i];
+                            final isOut    = msg.direction == MessageDirection.outgoing;
+                            final nextSame = i < _messages!.length - 1 &&
+                                (_messages![i + 1].direction == MessageDirection.outgoing) == isOut;
 
-                          return Padding(
-                            padding: EdgeInsets.only(bottom: nextSame ? 2 : 10),
-                            child: GestureDetector(
-                              onLongPress: () => _showMsgMenu(context, t, core, msg),
-                              child: ChatBubble(
-                                text:         msg.type == MessageType.text ? msg.textContent : '[file]',
-                                isOutgoing:   isOut,
-                                timeLabel:    _formatTime(msg.timestamp),
-                                showTail:     !nextSame,
-                                status:       msg.status,
-                                replyPreview: _replyPreviewFor(msg),
+                            return Padding(
+                              padding: EdgeInsets.only(bottom: nextSame ? 2 : 10),
+                              child: GestureDetector(
+                                onLongPress: () => _showMsgMenu(context, t, core, msg),
+                                child: ChatBubble(
+                                  text:         msg.type == MessageType.text ? msg.textContent : '[file]',
+                                  isOutgoing:   isOut,
+                                  timeLabel:    _formatTime(msg.timestamp),
+                                  showTail:     !nextSame,
+                                  status:       msg.status,
+                                  replyPreview: _replyPreviewFor(msg),
+                                ),
                               ),
-                            ),
-                          );
-                        },
+                            );
+                          },
+                        ),
                       ),
           ),
           MessageInput(
@@ -1063,6 +1212,40 @@ class _ChatScreenState extends State<ChatScreen> {
             onTap: () {
               Navigator.pop(context);
               if (core != null) _showSafetyNumber(t, core);
+            }),
+          _MenuItem(icon: Icons.wallpaper_outlined, label: 'set chat wallpaper', tokens: t,
+            onTap: () async {
+              Navigator.pop(context);
+              final picked = await ImagePicker().pickImage(
+                  source: ImageSource.gallery, imageQuality: 80);
+              if (picked != null && core != null && mounted) {
+                await core.storage.setWallpaper(widget.contactId, picked.path);
+                setState(() => _wallpaperPath = picked.path);
+              }
+            }),
+          _MenuItem(icon: Icons.wallpaper_outlined, label: 'set global wallpaper', tokens: t,
+            onTap: () async {
+              Navigator.pop(context);
+              final picked = await ImagePicker().pickImage(
+                  source: ImageSource.gallery, imageQuality: 80);
+              if (picked != null && core != null && mounted) {
+                await core.storage.setWallpaper(null, picked.path);
+                if (_wallpaperPath == null) setState(() => _wallpaperPath = picked.path);
+              }
+            }),
+          if (_wallpaperPath != null)
+            _MenuItem(icon: Icons.hide_image_outlined, label: 'remove wallpaper', tokens: t,
+              onTap: () async {
+                Navigator.pop(context);
+                if (core != null) {
+                  await core.storage.clearWallpaper(widget.contactId);
+                  if (mounted) setState(() => _wallpaperPath = null);
+                }
+              }),
+          _MenuItem(icon: Icons.account_circle_outlined, label: 'share my avatar', tokens: t,
+            onTap: () async {
+              Navigator.pop(context);
+              await core?.sendAvatarToContact(widget.contactId);
             }),
           _MenuItem(icon: Icons.delete_outline, label: 'clear history', tokens: t,
             onTap: () async {
@@ -1262,6 +1445,7 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   String? _contactAddress;
+  String? _ownAvatarPath;
   static const _secure = FlutterSecureStorage(
     aOptions: AndroidOptions(),
   );
@@ -1273,6 +1457,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (core != null && _contactAddress == null) {
       core.getMyContactAddress().then((addr) {
         if (mounted) setState(() => _contactAddress = addr);
+      });
+      core.storage.getOwnAvatarPath().then((p) {
+        if (mounted) setState(() => _ownAvatarPath = p);
       });
     }
   }
@@ -1302,6 +1489,70 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
       body: ListView(
         children: [
+          // ── Profile ───────────────────────────────────────────
+          _SectionHeader('profile', t),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: Row(
+              children: [
+                GestureDetector(
+                  onTap: () async {
+                    final picked = await ImagePicker().pickImage(
+                        source: ImageSource.gallery, imageQuality: 85, maxWidth: 512, maxHeight: 512);
+                    if (picked != null && core != null) {
+                      await core.storage.setOwnAvatarPath(picked.path);
+                      if (mounted) setState(() => _ownAvatarPath = picked.path);
+                    }
+                  },
+                  child: Container(
+                    width: 64, height: 64,
+                    decoration: BoxDecoration(
+                      color: t.bgSubtle,
+                      borderRadius: BorderRadius.circular(t.radiusCard),
+                      border: Border.all(color: t.inputBorder, width: 0.8),
+                      image: _ownAvatarPath != null && File(_ownAvatarPath!).existsSync()
+                          ? DecorationImage(
+                              image: FileImage(File(_ownAvatarPath!)),
+                              fit: BoxFit.cover,
+                            )
+                          : null,
+                    ),
+                    child: _ownAvatarPath == null
+                        ? Icon(Icons.add_a_photo_outlined, color: t.textDisabled, size: 24)
+                        : null,
+                  ),
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('profile picture',
+                          style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 13)),
+                      const SizedBox(height: 4),
+                      Text('tap to change · shared only when you choose',
+                          style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
+                      if (_ownAvatarPath != null) ...[
+                        const SizedBox(height: 8),
+                        GestureDetector(
+                          onTap: () async {
+                            if (core != null) {
+                              await core.storage.setOwnAvatarPath(null);
+                              if (mounted) setState(() => _ownAvatarPath = null);
+                            }
+                          },
+                          child: Text('remove',
+                              style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11,
+                                  decoration: TextDecoration.underline)),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+
           // ── Identity ─────────────────────────────────────────
           _SectionHeader('identity', t),
           if (core != null) ...[

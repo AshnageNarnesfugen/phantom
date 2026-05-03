@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 import 'dart:convert';
 import 'package:cryptography/cryptography.dart';
@@ -13,6 +14,7 @@ import 'protocol/frame.dart';
 import 'storage/phantom_storage.dart';
 import 'storage/backup_manager.dart';
 import 'presence_service.dart';
+import 'notification_service.dart';
 import '../transport/transport.dart';
 import '../transport/transport_manager_v2.dart' hide IncomingEnvelope;
 import '../transport/bluetooth/bluetooth_mesh_transport.dart';
@@ -57,6 +59,9 @@ class PhantomCore {
   PresenceService? _presence;
   bool isContactOnline(String contactId) => _presence?.isOnline(contactId) ?? false;
   Stream<String> get presenceChanges => _presence?.changes ?? const Stream.empty();
+
+  String? _activeChatId;
+  void setActiveChat(String? contactId) => _activeChatId = contactId;
 
   TransportStatus? get transportStatus => _transportV2?.status;
   Stream<TransportMode> get transportModeChanges =>
@@ -704,6 +709,15 @@ class PhantomCore {
 
         await _saveSession(entry.key, entry.value);
 
+        if (message.type == MessageType.avatarData) {
+          await storage.saveContactAvatar(entry.key, message.content);
+          _incomingController.add(StoredMessage.fromPhantomMessage(
+            msg: message, conversationId: entry.key,
+            direction: MessageDirection.incoming, status: MessageStatus.delivered,
+          ));
+          return;
+        }
+
         final stored = StoredMessage.fromPhantomMessage(
           msg:            message,
           conversationId: entry.key,
@@ -712,14 +726,45 @@ class PhantomCore {
         );
         await storage.saveMessage(stored);
         _incomingController.add(stored);
+
+        if (_activeChatId != entry.key) {
+          final contact = await storage.getContact(entry.key);
+          final name    = contact?.displayName ?? entry.key.substring(0, 6);
+          final preview = message.type == MessageType.text
+              ? message.textContent
+              : '[file]';
+          NotificationService.showMessage(
+            contactName: name,
+            preview:     preview,
+            contactId:   entry.key,
+          );
+        }
         return;
       } catch (_) {
-        // Restore session to pre-attempt state before trying the next one.
         _sessions[entry.key] = await RatchetSession.fromJson(snapshot);
         continue;
       }
     }
-    // Unknown session — could be a resumed session from a previous install; discard.
+  }
+
+  // ── Avatar ─────────────────────────────────────────────────────────────────
+
+  Future<Uint8List?> getContactAvatar(String contactId) =>
+      storage.getContactAvatar(contactId);
+
+  Future<void> sendAvatarToContact(String contactId) async {
+    final path = await storage.getOwnAvatarPath();
+    if (path == null) return;
+    final file = File(path);
+    if (!await file.exists()) return;
+    final bytes = await file.readAsBytes();
+    await _sendPhantomMessage(
+      recipientId: contactId,
+      message: PhantomMessage(
+        type:    MessageType.avatarData,
+        content: Uint8List.fromList(bytes),
+      ),
+    );
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────

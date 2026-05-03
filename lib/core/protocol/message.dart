@@ -27,7 +27,8 @@ enum MessageType {
   typingIndicator(0x10),
   readReceipt(0x11),
   keyExchange(0x20),
-  bundleUpdate(0x21);
+  bundleUpdate(0x21),
+  avatarData(0x30);
 
   final int code;
   const MessageType(this.code);

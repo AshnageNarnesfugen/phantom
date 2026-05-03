@@ -238,6 +238,55 @@ class PhantomStorage {
     return Map<String, dynamic>.from(data as Map);
   }
 
+  // ── Wallpapers ────────────────────────────────────────────────────────────────
+
+  static const _boxAvatars = 'avatars';
+
+  Future<void> setWallpaper(String? contactId, String path) async {
+    final key = contactId == null ? 'wallpaper_global' : 'wallpaper_$contactId';
+    await setSetting(key, path);
+  }
+
+  Future<String?> getWallpaper(String? contactId) async {
+    final key = contactId == null ? 'wallpaper_global' : 'wallpaper_$contactId';
+    return getSetting<String>(key);
+  }
+
+  Future<void> clearWallpaper(String? contactId) async {
+    _assertInitialized();
+    final key = contactId == null ? 'wallpaper_global' : 'wallpaper_$contactId';
+    final box = await _openBox(_boxSettings);
+    await box.delete(key);
+  }
+
+  // ── Avatars ───────────────────────────────────────────────────────────────────
+
+  Future<void> saveContactAvatar(String contactId, Uint8List bytes) async {
+    _assertInitialized();
+    final box = await _openBox(_boxAvatars);
+    await box.put(contactId, base64.encode(bytes));
+  }
+
+  Future<Uint8List?> getContactAvatar(String contactId) async {
+    _assertInitialized();
+    final box  = await _openBox(_boxAvatars);
+    final data = box.get(contactId) as String?;
+    if (data == null) return null;
+    return base64.decode(data);
+  }
+
+  Future<void> setOwnAvatarPath(String? path) async {
+    if (path == null) {
+      _assertInitialized();
+      final box = await _openBox(_boxSettings);
+      await box.delete('own_avatar_path');
+    } else {
+      await setSetting('own_avatar_path', path);
+    }
+  }
+
+  Future<String?> getOwnAvatarPath() => getSetting<String>('own_avatar_path');
+
   // ── Internals ─────────────────────────────────────────────────────────────────
 
   Future<Box> _openBox(String name) async {

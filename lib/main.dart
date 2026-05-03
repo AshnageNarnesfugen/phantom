@@ -3,14 +3,16 @@ import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
 import 'core/phantom_core.dart';
+import 'core/notification_service.dart';
 import 'core_provider.dart';
 import 'ui/theme/phantom_theme.dart';
 import 'ui/screens/screens.dart';
 
 const _seedKey = 'phantom_seed_v1';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await NotificationService.initialize();
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
     statusBarIconBrightness: Brightness.light,
@@ -58,6 +60,7 @@ class _PhantomAppState extends State<PhantomApp> {
           storagePath: dir.path,
         );
         if (mounted) setState(() => _core = core);
+        NotificationService.requestPermission();
       }
     } catch (_) {
       // Seed corrupted or storage error — fall through to onboarding.
