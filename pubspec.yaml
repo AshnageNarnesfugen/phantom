@@ -62,7 +62,7 @@ dependencies:
 
   # ── Media / file / audio ───────────────────────────────────────────────────
   file_picker: ^8.1.6
-  record: ^5.2.0
+  record: ^6.2.0
   audioplayers: ^6.1.0
 
 dependency_overrides:
