@@ -964,11 +964,13 @@ class _ChatScreenState extends State<ChatScreen> {
   StreamSubscription<String>? _presenceSub;
   StoredMessage? _replyTo;
   String? _wallpaperPath;
+  PhantomCore? _core; // cached — safe to use in dispose()
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     final core = CoreProvider.of(context).core;
+    _core = core;
     if (core != null && _sub == null) {
       core.setActiveChat(widget.contactId);
       _sub = core.incomingMessages.listen((msg) {
@@ -1076,7 +1078,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
-    CoreProvider.of(context).core?.setActiveChat(null);
+    _core?.setActiveChat(null);
     _sub?.cancel();
     _presenceSub?.cancel();
     _scrollCtrl.dispose();

@@ -10,9 +10,8 @@ import 'ui/screens/screens.dart';
 
 const _seedKey = 'phantom_seed_v1';
 
-void main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  await NotificationService.initialize();
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
     statusBarIconBrightness: Brightness.light,
@@ -43,6 +42,8 @@ class _PhantomAppState extends State<PhantomApp> {
   }
 
   Future<void> _init() async {
+    // Init notifications after Flutter engine is fully running.
+    NotificationService.initialize().catchError((_) {});
     final persisted = await ThemeController.load();
     persisted.addListener(() { if (mounted) setState(() {}); });
     if (mounted) setState(() => _themeCtrl = persisted);
