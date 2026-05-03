@@ -1027,6 +1027,20 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  Future<void> _sendFile(Uint8List bytes, String fileName) async {
+    final core = CoreProvider.of(context).core;
+    if (core == null) return;
+    final stored = await core.sendFile(
+      recipientId: widget.contactId,
+      bytes: bytes,
+      fileName: fileName,
+    );
+    if (mounted) {
+      setState(() => _messages = [...(_messages ?? []), stored]);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    }
+  }
+
   void _showMsgMenu(BuildContext ctx, PhantomTokens t, PhantomCore? core, StoredMessage msg) {
     final isOut = msg.direction == MessageDirection.outgoing;
     showModalBottomSheet(
@@ -1169,12 +1183,14 @@ class _ChatScreenState extends State<ChatScreen> {
                               child: GestureDetector(
                                 onLongPress: () => _showMsgMenu(context, t, core, msg),
                                 child: ChatBubble(
-                                  text:         msg.type == MessageType.text ? msg.textContent : '[file]',
+                                  text:         msg.type == MessageType.text ? msg.textContent : '[${msg.type.name}]',
                                   isOutgoing:   isOut,
                                   timeLabel:    _formatTime(msg.timestamp),
                                   showTail:     !nextSame,
                                   status:       msg.status,
                                   replyPreview: _replyPreviewFor(msg),
+                                  mediaContent: msg.type != MessageType.text ? msg.content : null,
+                                  messageType:  msg.type,
                                 ),
                               ),
                             );
@@ -1183,9 +1199,12 @@ class _ChatScreenState extends State<ChatScreen> {
                       ),
           ),
           MessageInput(
-            onSend: _send,
+            onSend:      _send,
+            onSendFile:  _sendFile,
             replyPreview: _replyTo != null
-                ? (_replyTo!.type == MessageType.text ? _replyTo!.textContent : '[file]')
+                ? (_replyTo!.type == MessageType.text
+                    ? _replyTo!.textContent
+                    : '[${_replyTo!.type.name}]')
                 : null,
             onCancelReply: _replyTo != null
                 ? () { if (mounted) setState(() => _replyTo = null); }

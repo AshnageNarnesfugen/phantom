@@ -215,6 +215,35 @@ class PhantomCore {
     );
   }
 
+  Future<StoredMessage> sendFile({
+    required String recipientId,
+    required Uint8List bytes,
+    required String fileName,
+  }) async {
+    final lower = fileName.toLowerCase();
+    final isImage = lower.endsWith('.jpg') || lower.endsWith('.jpeg') ||
+        lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp');
+
+    final Uint8List content;
+    MessageType type;
+    if (isImage) {
+      type    = MessageType.image;
+      content = bytes;
+    } else {
+      type = MessageType.file;
+      final nameBytes = utf8.encode(fileName);
+      content = Uint8List(nameBytes.length + 1 + bytes.length)
+        ..setAll(0, nameBytes)
+        ..[nameBytes.length] = 0
+        ..setAll(nameBytes.length + 1, bytes);
+    }
+
+    return _sendPhantomMessage(
+      recipientId: recipientId,
+      message: PhantomMessage(type: type, content: content),
+    );
+  }
+
   Future<StoredMessage> _sendPhantomMessage({
     required String recipientId,
     required PhantomMessage message,

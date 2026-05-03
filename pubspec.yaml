@@ -60,6 +60,11 @@ dependencies:
   # ── Image picker (wallpaper + avatar) ──────────────────────────────────────
   image_picker: ^1.1.2
 
+  # ── Media / file / audio ───────────────────────────────────────────────────
+  file_picker: ^8.1.6
+  record: ^5.2.0
+  audioplayers: ^6.1.0
+
 dependency_overrides:
   post_quantum:
     path: local_packages/post_quantum
