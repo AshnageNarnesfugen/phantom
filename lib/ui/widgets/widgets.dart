@@ -627,7 +627,7 @@ class _MessageInputState extends State<MessageInput> {
             top: false,
             child: Row(
               children: [
-                _recState == _RecordState.locked
+                _isRecording
                     ? _IconBtn(
                         icon: Icons.close,
                         color: const Color(0xFFFF6B6B),
@@ -638,9 +638,7 @@ class _MessageInputState extends State<MessageInput> {
                         color: widget.glassEnabled
                             ? Colors.white.withValues(alpha: 0.80)
                             : t.iconDefault,
-                        onTap: _recState == _RecordState.idle
-                            ? () => _showAttachSheet(context, t)
-                            : null,
+                        onTap: () => _showAttachSheet(context, t),
                       ),
                 const SizedBox(width: 8),
                 Expanded(
@@ -678,13 +676,22 @@ class _MessageInputState extends State<MessageInput> {
                                 const Spacer(),
                                 if (_recState == _RecordState.holding)
                                   Row(children: [
+                                    Icon(Icons.keyboard_arrow_left,
+                                        color: const Color(0xFFCF6679).withValues(alpha: 0.5),
+                                        size: 14),
+                                    Text('cancel',
+                                        style: TextStyle(
+                                            color: const Color(0xFFCF6679).withValues(alpha: 0.5),
+                                            fontSize: 10,
+                                            fontFamily: 'monospace')),
+                                    const SizedBox(width: 8),
                                     Icon(Icons.keyboard_arrow_up,
                                         color: const Color(0xFFCF6679).withValues(alpha: 0.6),
-                                        size: 16),
+                                        size: 14),
                                     Text('lock',
                                         style: TextStyle(
                                             color: const Color(0xFFCF6679).withValues(alpha: 0.6),
-                                            fontSize: 11,
+                                            fontSize: 10,
                                             fontFamily: 'monospace')),
                                   ]),
                                 if (_recState == _RecordState.locked)
@@ -743,6 +750,8 @@ class _MessageInputState extends State<MessageInput> {
                               onLongPressMoveUpdate: (d) {
                                 if (_recState != _RecordState.holding) return;
                                 final dy = -d.offsetFromOrigin.dy;
+                                final dx = -d.offsetFromOrigin.dx;
+                                if (dx >= 60.0) { _cancelRecord(); return; }
                                 setState(() => _lockProgress = (dy / 60.0).clamp(0.0, 1.0));
                                 if (dy >= 60.0) _lockRecord();
                               },
