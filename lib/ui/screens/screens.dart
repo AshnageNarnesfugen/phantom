@@ -773,6 +773,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
 
     Widget buildBody() => Column(
       children: [
+        if (g) SizedBox(height: MediaQuery.viewPaddingOf(context).top + kToolbarHeight),
         if (_updateInfo != null)
           _UpdateBanner(
             info: _updateInfo!,
@@ -810,11 +811,23 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
     );
 
     return Scaffold(
+      extendBodyBehindAppBar: g,
       backgroundColor: g ? Colors.transparent : t.bgBase,
       appBar: AppBar(
-        backgroundColor: g
-            ? t.bgSurface.withValues(alpha: (_glassOpacity * 2.2).clamp(0.12, 0.88))
-            : t.bgSurface,
+        backgroundColor: g ? Colors.transparent : t.bgSurface,
+        flexibleSpace: g
+            ? ClipRect(
+                child: BackdropFilter(
+                  filter: ui.ImageFilter.blur(
+                      sigmaX: _glassBlur, sigmaY: _glassBlur,
+                      tileMode: TileMode.clamp),
+                  child: Container(
+                    color: t.bgSurface
+                        .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
+                  ),
+                ),
+              )
+            : null,
         elevation: 0,
         title: Text(
           _showArchived ? 'archived' : 'phantom',
@@ -1867,6 +1880,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     Widget buildList() => ListView(
       children: [
+        if (g) SizedBox(height: MediaQuery.viewPaddingOf(context).top + kToolbarHeight),
         if (_updateFromCheck != null)
           _UpdateBanner(
             info: _updateFromCheck!,
@@ -2230,11 +2244,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
       );  // closes ListView / buildList
 
     return Scaffold(
+      extendBodyBehindAppBar: g,
       backgroundColor: g ? Colors.transparent : t.bgBase,
       appBar: AppBar(
-        backgroundColor: g
-            ? t.bgSurface.withValues(alpha: (_glassOpacity * 2.2).clamp(0.12, 0.88))
-            : t.bgSurface,
+        backgroundColor: g ? Colors.transparent : t.bgSurface,
+        flexibleSpace: g
+            ? ClipRect(
+                child: BackdropFilter(
+                  filter: ui.ImageFilter.blur(
+                      sigmaX: _glassBlur, sigmaY: _glassBlur,
+                      tileMode: TileMode.clamp),
+                  child: Container(
+                    color: t.bgSurface
+                        .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
+                  ),
+                ),
+              )
+            : null,
         elevation: 0,
         leading: IconButton(
           icon: Icon(Icons.arrow_back,
