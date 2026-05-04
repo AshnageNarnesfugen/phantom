@@ -1684,6 +1684,38 @@ class _AddContactScreenState extends State<AddContactScreen> {
   String? _error;
   bool _loading = false;
 
+  bool    _glassEnabled    = false;
+  double  _glassOpacity    = 0.15;
+  double  _glassBlur       = 10.0;
+  bool    _glassBgBlur     = false;
+  bool    _useWallpaper    = false;
+  String? _appWallpaperPath;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final core = CoreProvider.of(context).core;
+    if (core != null && !_glassEnabled) _loadGlass(core);
+  }
+
+  Future<void> _loadGlass(PhantomCore core) async {
+    final enabled = await core.storage.getAppGlassEnabled();
+    final opacity = await core.storage.getAppGlassOpacity();
+    final bgBlur  = await core.storage.getAppGlassBgBlur();
+    final blur    = await core.storage.getAppGlassBlur();
+    final useWp   = await core.storage.getAppGlassUseWallpaper();
+    final wp      = useWp ? await core.storage.getAppWallpaper() : null;
+    if (!mounted) return;
+    setState(() {
+      _glassEnabled    = enabled;
+      _glassOpacity    = opacity;
+      _glassBgBlur     = bgBlur;
+      _glassBlur       = blur;
+      _useWallpaper    = useWp;
+      _appWallpaperPath = wp;
+    });
+  }
+
   @override
   void dispose() {
     _addressCtrl.dispose();
@@ -1715,23 +1747,42 @@ class _AddContactScreenState extends State<AddContactScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final t = PhantomTheme.tokensOf(context);
+    final t      = PhantomTheme.tokensOf(context);
+    final g      = _glassEnabled;
+    final bgPath = g && _useWallpaper ? _appWallpaperPath : null;
 
-    return Scaffold(
-      backgroundColor: t.bgBase,
+    final scaffold = Scaffold(
+      backgroundColor: g ? Colors.transparent : t.bgBase,
       appBar: AppBar(
-        backgroundColor: t.bgSurface,
+        backgroundColor: g ? Colors.transparent : t.bgSurface,
+        flexibleSpace: g
+            ? ClipRect(
+                child: BackdropFilter(
+                  filter: ui.ImageFilter.blur(
+                      sigmaX: _glassBlur, sigmaY: _glassBlur,
+                      tileMode: TileMode.clamp),
+                  child: Container(
+                    color: t.bgSurface
+                        .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
+                  ),
+                ),
+              )
+            : null,
         elevation: 0,
         leading: IconButton(
-          icon: Icon(Icons.close, color: t.textSecondary, size: 20),
+          icon: Icon(Icons.close,
+              color: g ? Colors.white70 : t.textSecondary, size: 20),
           onPressed: () => Navigator.pop(context),
         ),
         title: Text('add contact',
-            style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 16)),
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(0.5),
-          child: Divider(height: 0.5, color: t.divider),
-        ),
+            style: TextStyle(
+                color: g ? Colors.white.withValues(alpha: 0.9) : t.textPrimary,
+                fontFamily: 'monospace', fontSize: 16)),
+        bottom: g
+            ? null
+            : PreferredSize(
+                preferredSize: const Size.fromHeight(0.5),
+                child: Divider(height: 0.5, color: t.divider)),
       ),
       body: Padding(
         padding: const EdgeInsets.all(24),
@@ -1765,6 +1816,32 @@ class _AddContactScreenState extends State<AddContactScreen> {
         ),
       ),
     );
+
+    if (!g) return scaffold;
+
+    return Stack(children: [
+      Positioned.fill(
+        child: RepaintBoundary(
+          child: bgPath != null
+              ? _glassBgBlur
+                  ? ImageFiltered(
+                      imageFilter: ui.ImageFilter.blur(
+                        sigmaX: _glassBlur, sigmaY: _glassBlur,
+                        tileMode: TileMode.clamp,
+                      ),
+                      child: Image.file(File(bgPath), fit: BoxFit.cover))
+                  : Image.file(File(bgPath), fit: BoxFit.cover)
+              : Container(color: t.bgBase),
+        ),
+      ),
+      Positioned.fill(
+        child: ColoredBox(
+          color: Color.lerp(t.bgBase, t.accentLight, 0.06)!
+              .withValues(alpha: (0.55 - _glassOpacity).clamp(0.22, 0.72)),
+        ),
+      ),
+      scaffold,
+    ]);
   }
 }
 

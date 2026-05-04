@@ -273,22 +273,28 @@ class _AudioPlayerBubble extends StatefulWidget {
 
 class _AudioPlayerBubbleState extends State<_AudioPlayerBubble> {
   final _player = AudioPlayer();
-  bool _playing = false;
+  PlayerState _playerState = PlayerState.stopped;
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
   final _subs = <StreamSubscription<dynamic>>[];
+
+  bool get _playing => _playerState == PlayerState.playing;
 
   @override
   void initState() {
     super.initState();
     _subs.add(_player.onPlayerStateChanged.listen((s) {
-      if (mounted) setState(() => _playing = s == PlayerState.playing);
+      if (mounted) setState(() => _playerState = s);
     }));
     _subs.add(_player.onPositionChanged.listen((p) {
       if (mounted) setState(() => _position = p);
     }));
     _subs.add(_player.onDurationChanged.listen((d) {
       if (mounted) setState(() => _duration = d);
+    }));
+    // Reset position to zero when playback finishes so next tap starts fresh.
+    _subs.add(_player.onPlayerComplete.listen((_) {
+      if (mounted) setState(() => _position = Duration.zero);
     }));
   }
 
@@ -300,13 +306,12 @@ class _AudioPlayerBubbleState extends State<_AudioPlayerBubble> {
   }
 
   Future<void> _toggle() async {
-    if (_playing) {
+    if (_playerState == PlayerState.playing) {
       await _player.pause();
+    } else if (_playerState == PlayerState.paused) {
+      await _player.resume();
     } else {
-      if (_duration > Duration.zero &&
-          _position.inMilliseconds >= _duration.inMilliseconds - 200) {
-        await _player.seek(Duration.zero);
-      }
+      // stopped or completed — play from beginning
       await _player.play(BytesSource(widget.bytes));
     }
   }
@@ -421,6 +426,8 @@ class _StatusIcon extends StatelessWidget {
 
 // ── MessageInput ──────────────────────────────────────────────────────────────
 
+enum _RecordState { idle, holding, locked }
+
 class MessageInput extends StatefulWidget {
   final void Function(String text) onSend;
   final void Function(Uint8List bytes, String fileName)? onSendFile;
@@ -449,10 +456,13 @@ class _MessageInputState extends State<MessageInput> {
   final _ctrl     = TextEditingController();
   final _focus    = FocusNode();
   final _recorder = AudioRecorder();
-  bool _hasText      = false;
-  bool _isRecording  = false;
-  int  _recordSecs   = 0;
-  Timer? _recordTimer;
+  bool         _hasText     = false;
+  _RecordState _recState    = _RecordState.idle;
+  double       _lockProgress = 0.0;
+  int          _recordSecs  = 0;
+  Timer?       _recordTimer;
+
+  bool get _isRecording => _recState != _RecordState.idle;
 
   @override
   void initState() {
@@ -471,27 +481,41 @@ class _MessageInputState extends State<MessageInput> {
     _focus.requestFocus();
   }
 
-  Future<void> _toggleRecord() async {
-    if (_isRecording) {
-      _recordTimer?.cancel();
-      final path = await _recorder.stop();
-      if (mounted) setState(() { _isRecording = false; _recordSecs = 0; });
-      if (path != null && widget.onSendFile != null) {
-        final bytes = await File(path).readAsBytes();
-        final ts    = DateTime.now().millisecondsSinceEpoch;
-        widget.onSendFile!(bytes, 'voice_$ts.m4a');
-      }
-    } else {
-      final hasPerms = await _recorder.hasPermission();
-      if (!hasPerms) return;
-      final dir  = await getTemporaryDirectory();
-      final path = '${dir.path}/ph_rec_${DateTime.now().millisecondsSinceEpoch}.m4a';
-      await _recorder.start(const RecordConfig(encoder: AudioEncoder.aacLc), path: path);
-      if (mounted) setState(() { _isRecording = true; _recordSecs = 0; });
-      _recordTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (mounted) setState(() => _recordSecs++);
-      });
+  Future<void> _startRecord() async {
+    final hasPerms = await _recorder.hasPermission();
+    if (!hasPerms) return;
+    final dir  = await getTemporaryDirectory();
+    final path = '${dir.path}/ph_rec_${DateTime.now().millisecondsSinceEpoch}.m4a';
+    await _recorder.start(const RecordConfig(encoder: AudioEncoder.aacLc), path: path);
+    if (!mounted) return;
+    setState(() { _recState = _RecordState.holding; _recordSecs = 0; });
+    _recordTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() => _recordSecs++);
+    });
+  }
+
+  void _lockRecord() {
+    if (_recState != _RecordState.holding) return;
+    setState(() { _recState = _RecordState.locked; _lockProgress = 0.0; });
+  }
+
+  Future<void> _stopAndSend() async {
+    _recordTimer?.cancel();
+    final path = await _recorder.stop();
+    if (!mounted) return;
+    setState(() { _recState = _RecordState.idle; _recordSecs = 0; _lockProgress = 0.0; });
+    if (path != null && widget.onSendFile != null) {
+      final bytes = await File(path).readAsBytes();
+      final ts    = DateTime.now().millisecondsSinceEpoch;
+      widget.onSendFile!(bytes, 'voice_$ts.m4a');
     }
+  }
+
+  Future<void> _cancelRecord() async {
+    _recordTimer?.cancel();
+    await _recorder.stop();
+    if (!mounted) return;
+    setState(() { _recState = _RecordState.idle; _recordSecs = 0; _lockProgress = 0.0; });
   }
 
   void _showAttachSheet(BuildContext ctx, PhantomTokens t) {
@@ -603,13 +627,21 @@ class _MessageInputState extends State<MessageInput> {
             top: false,
             child: Row(
               children: [
-                _IconBtn(
-                  icon: Icons.add,
-                  color: widget.glassEnabled
-                      ? Colors.white.withValues(alpha: 0.80)
-                      : t.iconDefault,
-                  onTap: () => _showAttachSheet(context, t),
-                ),
+                _recState == _RecordState.locked
+                    ? _IconBtn(
+                        icon: Icons.close,
+                        color: const Color(0xFFFF6B6B),
+                        onTap: _cancelRecord,
+                      )
+                    : _IconBtn(
+                        icon: Icons.add,
+                        color: widget.glassEnabled
+                            ? Colors.white.withValues(alpha: 0.80)
+                            : t.iconDefault,
+                        onTap: _recState == _RecordState.idle
+                            ? () => _showAttachSheet(context, t)
+                            : null,
+                      ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Container(
@@ -643,6 +675,21 @@ class _MessageInputState extends State<MessageInput> {
                                     fontFamily: 'monospace',
                                   ),
                                 ),
+                                const Spacer(),
+                                if (_recState == _RecordState.holding)
+                                  Row(children: [
+                                    Icon(Icons.keyboard_arrow_up,
+                                        color: const Color(0xFFCF6679).withValues(alpha: 0.6),
+                                        size: 16),
+                                    Text('lock',
+                                        style: TextStyle(
+                                            color: const Color(0xFFCF6679).withValues(alpha: 0.6),
+                                            fontSize: 11,
+                                            fontFamily: 'monospace')),
+                                  ]),
+                                if (_recState == _RecordState.locked)
+                                  const Icon(Icons.lock_outline,
+                                      color: Color(0xFFCF6679), size: 14),
                               ],
                             ),
                           )
@@ -673,21 +720,41 @@ class _MessageInputState extends State<MessageInput> {
                 const SizedBox(width: 8),
                 AnimatedSwitcher(
                   duration: const Duration(milliseconds: 150),
-                  child: _hasText
+                  child: _hasText && _recState == _RecordState.idle
                       ? _SendBtn(key: const ValueKey('send'),
                           onTap: _send, color: t.accentLight)
-                      : _IconBtn(
-                          key: const ValueKey('mic'),
-                          icon: _isRecording
-                              ? Icons.stop_circle_outlined
-                              : Icons.mic_none,
-                          color: _isRecording
-                              ? const Color(0xFFFF6B6B)
-                              : (widget.glassEnabled
-                                  ? Colors.white.withValues(alpha: 0.80)
-                                  : t.iconDefault),
-                          onTap: _toggleRecord,
-                        ),
+                      : _recState == _RecordState.locked
+                          ? _SendBtn(
+                              key: const ValueKey('send_audio'),
+                              onTap: _stopAndSend,
+                              color: t.accentLight,
+                            )
+                          : _MicBtn(
+                              key: const ValueKey('mic'),
+                              isRecording: _isRecording,
+                              lockProgress: _lockProgress,
+                              iconColor: _isRecording
+                                  ? const Color(0xFFFF6B6B)
+                                  : (widget.glassEnabled
+                                      ? Colors.white.withValues(alpha: 0.80)
+                                      : t.iconDefault),
+                              accentColor: t.accentLight,
+                              onLongPressStart: (_) => _startRecord(),
+                              onLongPressMoveUpdate: (d) {
+                                if (_recState != _RecordState.holding) return;
+                                final dy = -d.offsetFromOrigin.dy;
+                                setState(() => _lockProgress = (dy / 60.0).clamp(0.0, 1.0));
+                                if (dy >= 60.0) _lockRecord();
+                              },
+                              onLongPressEnd: (_) {
+                                if (_recState == _RecordState.holding) _stopAndSend();
+                                setState(() => _lockProgress = 0.0);
+                              },
+                              onLongPressCancel: () {
+                                if (_recState == _RecordState.holding) _cancelRecord();
+                                setState(() => _lockProgress = 0.0);
+                              },
+                            ),
                 ),
               ],
             ),
@@ -815,7 +882,7 @@ class _IconBtn extends StatelessWidget {
   final Color color;
   final VoidCallback? onTap;
 
-  const _IconBtn({super.key, required this.icon, required this.color, this.onTap});
+  const _IconBtn({required this.icon, required this.color, this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -825,6 +892,85 @@ class _IconBtn extends StatelessWidget {
         width: 38,
         height: 38,
         child: Icon(icon, color: color, size: 20),
+      ),
+    );
+  }
+}
+
+class _MicBtn extends StatelessWidget {
+  final bool isRecording;
+  final double lockProgress;
+  final Color iconColor;
+  final Color accentColor;
+  final void Function(LongPressStartDetails) onLongPressStart;
+  final void Function(LongPressMoveUpdateDetails) onLongPressMoveUpdate;
+  final void Function(LongPressEndDetails) onLongPressEnd;
+  final VoidCallback onLongPressCancel;
+
+  const _MicBtn({
+    super.key,
+    required this.isRecording,
+    required this.lockProgress,
+    required this.iconColor,
+    required this.accentColor,
+    required this.onLongPressStart,
+    required this.onLongPressMoveUpdate,
+    required this.onLongPressEnd,
+    required this.onLongPressCancel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 38,
+      height: 38,
+      child: Stack(
+        clipBehavior: Clip.none,
+        alignment: Alignment.center,
+        children: [
+          if (isRecording && lockProgress > 0)
+            Positioned(
+              bottom: 42,
+              child: Opacity(
+                opacity: lockProgress,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.lock_outline, color: accentColor, size: 14),
+                    const SizedBox(height: 2),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(1),
+                      child: SizedBox(
+                        height: 18,
+                        width: 2,
+                        child: LinearProgressIndicator(
+                          value: lockProgress,
+                          color: accentColor,
+                          backgroundColor: accentColor.withValues(alpha: 0.2),
+                          minHeight: 2,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          GestureDetector(
+            onLongPressStart: onLongPressStart,
+            onLongPressMoveUpdate: onLongPressMoveUpdate,
+            onLongPressEnd: onLongPressEnd,
+            onLongPressCancel: onLongPressCancel,
+            child: SizedBox(
+              width: 38,
+              height: 38,
+              child: Icon(
+                isRecording ? Icons.mic : Icons.mic_none,
+                color: iconColor,
+                size: 20,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
