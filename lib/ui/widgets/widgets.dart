@@ -59,7 +59,6 @@ class ChatBubble extends StatelessWidget {
     final t = PhantomTheme.tokensOf(context);
 
     final bgColor     = isOutgoing ? t.bubbleOut : t.bubbleIn;
-    final textColor   = isOutgoing ? t.bubbleOutText : t.bubbleInText;
     final borderColor = isOutgoing
         ? t.accentLight.withValues(alpha: 0.25)
         : Colors.transparent;
@@ -81,12 +80,34 @@ class ChatBubble extends StatelessWidget {
       isImage ? 4 : 9,
     );
 
-    final inner = _buildInner(t, textColor, isImage);
+    // Tint computed first so it can feed the contrast check below.
+    final tintAlpha = isOutgoing
+        ? (glassOpacity + 0.06).clamp(0.08, 0.52)
+        : (glassOpacity * 1.4).clamp(0.08, 0.50);
+    final tintBase  = isOutgoing ? t.accentLight : t.bgSurface;
+    final tintColor = tintBase.withValues(alpha: tintAlpha);
 
-    final tintColor = (isOutgoing ? t.accentLight : t.bgSurface)
-        .withValues(alpha: isOutgoing
-            ? (glassOpacity + 0.06).clamp(0.08, 0.52)
-            : (glassOpacity * 1.4).clamp(0.08, 0.50));
+    // Resolve text colour with WCAG contrast guarantee.
+    final Color textColor;
+    if (glassEnabled) {
+      if (blurredBg != null) {
+        // Frosted wallpaper: text shadow handles low-contrast areas;
+        // exact pixel colour is unknown here, so default to white.
+        textColor = Colors.white.withValues(alpha: isOutgoing ? 0.95 : 0.88);
+      } else {
+        // Tinted-only fallback: surface is fully deterministic.
+        final surface = ContrastUtils.composite(tintBase, tintAlpha, t.bgBase);
+        final useWhite = ContrastUtils.contrastRatio(Colors.white, surface)
+                       >= ContrastUtils.contrastRatio(Colors.black, surface);
+        textColor = useWhite
+            ? Colors.white.withValues(alpha: isOutgoing ? 0.95 : 0.88)
+            : const Color(0xDD000000);
+      }
+    } else {
+      textColor = isOutgoing ? t.bubbleOutText : t.bubbleInText;
+    }
+
+    final inner = _buildInner(t, textColor, isImage);
 
     final Widget bubble;
     if (glassEnabled && blurredBg != null) {
@@ -160,14 +181,7 @@ class ChatBubble extends StatelessWidget {
     );
   }
 
-  // In glass mode enforce readable text regardless of wallpaper colours.
-  Color _effectiveTextColor(Color base) {
-    if (!glassEnabled) return base;
-    return Colors.white.withValues(alpha: isOutgoing ? 0.95 : 0.88);
-  }
-
   Widget _buildInner(PhantomTokens t, Color textColor, bool isImage) {
-    textColor = _effectiveTextColor(textColor);
     return Column(
       crossAxisAlignment:
           isOutgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,

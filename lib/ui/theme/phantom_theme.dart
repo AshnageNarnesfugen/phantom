@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
@@ -20,6 +21,60 @@ enum PhantomAccent {
   final Color dark;   // texto sobre light, bordes
 
   const PhantomAccent(this.label, this.light, this.dark);
+}
+
+// ── ContrastUtils — WCAG 2.1 accessibility helpers ───────────────────────────
+
+class ContrastUtils {
+  ContrastUtils._();
+
+  static double _lin(double v) =>
+      v <= 0.03928 ? v / 12.92 : math.pow((v + 0.055) / 1.055, 2.4).toDouble();
+
+  /// WCAG 2.1 relative luminance [0..1].
+  static double luminance(Color c) =>
+      0.2126 * _lin(c.r) + 0.7152 * _lin(c.g) + 0.0722 * _lin(c.b);
+
+  /// WCAG 2.1 contrast ratio (always ≥ 1.0).
+  static double contrastRatio(Color a, Color b) {
+    final la = luminance(a);
+    final lb = luminance(b);
+    return (math.max(la, lb) + 0.05) / (math.min(la, lb) + 0.05);
+  }
+
+  /// Composites semi-transparent [fg] at [alpha] (0..1) over solid [bg].
+  static Color composite(Color fg, double alpha, Color bg) => Color.fromARGB(
+    255,
+    ((bg.r + (fg.r - bg.r) * alpha) * 255).round().clamp(0, 255),
+    ((bg.g + (fg.g - bg.g) * alpha) * 255).round().clamp(0, 255),
+    ((bg.b + (fg.b - bg.b) * alpha) * 255).round().clamp(0, 255),
+  );
+
+  /// Returns the option (light or dark) with better contrast against [bg].
+  static Color textFor(
+    Color bg, {
+    Color light = Colors.white,
+    Color dark  = Colors.black,
+  }) =>
+      contrastRatio(dark, bg) >= contrastRatio(light, bg) ? dark : light;
+
+  /// Returns [preferred] if it meets [minRatio] against [bg].
+  /// Otherwise iteratively blends toward white or black until the ratio is met.
+  static Color ensureContrast(
+    Color preferred,
+    Color bg, {
+    double minRatio = 4.5,
+  }) {
+    if (contrastRatio(preferred, bg) >= minRatio) return preferred;
+    final toWhite = contrastRatio(Colors.white, bg);
+    final toBlack = contrastRatio(Colors.black, bg);
+    final target  = toWhite >= toBlack ? Colors.white : Colors.black;
+    for (int i = 1; i <= 20; i++) {
+      final c = Color.lerp(preferred, target, i / 20.0)!;
+      if (contrastRatio(c, bg) >= minRatio) return c;
+    }
+    return target;
+  }
 }
 
 // ── Token system ─────────────────────────────────────────────────────────────
@@ -84,21 +139,27 @@ class PhantomTokens {
   factory PhantomTokens.dark(PhantomAccent accent, {double intensity = 1.0}) {
     final al = _scaled(accent.light, intensity, isDark: true);
     final ad = _scaled(accent.dark,  intensity, isDark: true);
-    // Tint every surface slightly toward the accent colour at high intensity.
-    final s = intensity * 0.055;
+    final s  = intensity * 0.055;
+
+    final bgBase   = Color.lerp(const Color(0xFF0A0A0A), al, s * 0.7)!;
+    final bubbleIn = Color.lerp(const Color(0xFF1E1E1E), al, s * 1.2)!;
+
+    final bubbleOutAlpha    = 0.10 + 0.20 * intensity;
+    final effectiveBubbleOut = ContrastUtils.composite(al, bubbleOutAlpha, bgBase);
+
     return PhantomTokens(
-      bgBase:        Color.lerp(const Color(0xFF0A0A0A), al, s * 0.7)!,
+      bgBase:        bgBase,
       bgSurface:     Color.lerp(const Color(0xFF141414), al, s)!,
       bgSubtle:      Color.lerp(const Color(0xFF1E1E1E), al, s * 1.4)!,
-      textPrimary:   const Color(0xFFF0F0F0),
+      textPrimary:   ContrastUtils.ensureContrast(const Color(0xFFF0F0F0), bgBase),
       textSecondary: const Color(0xFF888888),
       textDisabled:  const Color(0xFF444444),
       accentLight:   al,
       accentDark:    ad,
-      bubbleOut:     al.withValues(alpha: 0.10 + 0.20 * intensity),
-      bubbleOutText: al,
-      bubbleIn:      Color.lerp(const Color(0xFF1E1E1E), al, s * 1.2)!,
-      bubbleInText:  const Color(0xFFE0E0E0),
+      bubbleOut:     al.withValues(alpha: bubbleOutAlpha),
+      bubbleOutText: ContrastUtils.ensureContrast(al, effectiveBubbleOut),
+      bubbleIn:      bubbleIn,
+      bubbleInText:  ContrastUtils.ensureContrast(const Color(0xFFE0E0E0), bubbleIn),
       divider:       Color.lerp(const Color(0xFF222222), al, s * 1.8)!,
       inputBorder:   Color.lerp(const Color(0xFF2A2A2A), al, s * 1.8)!,
       iconDefault:   const Color(0xFF8A8A8A),
@@ -113,19 +174,26 @@ class PhantomTokens {
     final al = _scaled(accent.dark,  intensity, isDark: false);
     final ad = _scaled(accent.light, intensity, isDark: false);
     final s  = intensity * 0.045;
+
+    final bgBase   = Color.lerp(const Color(0xFFFAFAFA), al, s * 0.5)!;
+    final bubbleIn = Color.lerp(const Color(0xFFEEEEEE), al, s * 0.8)!;
+
+    final bubbleOutAlpha     = 0.10 + 0.18 * intensity;
+    final effectiveBubbleOut = ContrastUtils.composite(al, bubbleOutAlpha, bgBase);
+
     return PhantomTokens(
-      bgBase:        Color.lerp(const Color(0xFFFAFAFA), al, s * 0.5)!,
+      bgBase:        bgBase,
       bgSurface:     Color.lerp(const Color(0xFFFFFFFF), al, s * 0.7)!,
       bgSubtle:      Color.lerp(const Color(0xFFF0F0F0), al, s)!,
-      textPrimary:   const Color(0xFF0A0A0A),
+      textPrimary:   ContrastUtils.ensureContrast(const Color(0xFF0A0A0A), bgBase),
       textSecondary: const Color(0xFF666666),
       textDisabled:  const Color(0xFFBBBBBB),
       accentLight:   al,
       accentDark:    ad,
-      bubbleOut:     al.withValues(alpha: 0.10 + 0.18 * intensity),
-      bubbleOutText: al,
-      bubbleIn:      Color.lerp(const Color(0xFFEEEEEE), al, s * 0.8)!,
-      bubbleInText:  const Color(0xFF1A1A1A),
+      bubbleOut:     al.withValues(alpha: bubbleOutAlpha),
+      bubbleOutText: ContrastUtils.ensureContrast(al, effectiveBubbleOut),
+      bubbleIn:      bubbleIn,
+      bubbleInText:  ContrastUtils.ensureContrast(const Color(0xFF1A1A1A), bubbleIn),
       divider:       Color.lerp(const Color(0xFFE8E8E8), al, s * 1.5)!,
       inputBorder:   Color.lerp(const Color(0xFFDDDDDD), al, s * 1.5)!,
       iconDefault:   const Color(0xFF777777),
