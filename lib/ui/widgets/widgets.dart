@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
@@ -28,6 +30,9 @@ class ChatBubble extends StatelessWidget {
   final double glassBlur;
   final ui.Image? blurredBg;
   final Listenable? scrollNotifier;
+  final bool noiseEnabled;
+  final double noiseStrength;
+  final ui.Image? noiseImage;
 
   const ChatBubble({
     super.key,
@@ -44,6 +49,9 @@ class ChatBubble extends StatelessWidget {
     this.glassBlur = 10.0,
     this.blurredBg,
     this.scrollNotifier,
+    this.noiseEnabled = false,
+    this.noiseStrength = 0.15,
+    this.noiseImage,
   });
 
   @override
@@ -95,6 +103,9 @@ class ChatBubble extends StatelessWidget {
               tint: tintColor,
               getBox: () => ctx.findRenderObject() as RenderBox?,
               scrollNotifier: scrollNotifier,
+              noiseEnabled: noiseEnabled,
+              noiseStrength: noiseStrength,
+              noiseImage: noiseImage,
             ),
             child: Container(
               padding: pad,
@@ -300,6 +311,9 @@ class _FrostedBubblePainter extends CustomPainter {
   final Size screenSize;
   final Color tint;
   final RenderBox? Function() getBox;
+  final bool noiseEnabled;
+  final double noiseStrength;
+  final ui.Image? noiseImage;
 
   _FrostedBubblePainter({
     required this.blurredBg,
@@ -307,6 +321,9 @@ class _FrostedBubblePainter extends CustomPainter {
     required this.tint,
     required this.getBox,
     Listenable? scrollNotifier,
+    this.noiseEnabled = false,
+    this.noiseStrength = 0.15,
+    this.noiseImage,
   }) : super(repaint: scrollNotifier);
 
   @override
@@ -338,13 +355,33 @@ class _FrostedBubblePainter extends CustomPainter {
 
     canvas.drawImageRect(blurredBg, src, dst, Paint());
     canvas.drawRect(dst, Paint()..color = tint);
+
+    if (noiseEnabled && noiseImage != null && noiseStrength > 0) {
+      final id = Float64List(16)
+        ..[0] = 1 ..[5] = 1 ..[10] = 1 ..[15] = 1;
+      canvas.drawRect(
+        dst,
+        Paint()
+          ..shader = ui.ImageShader(noiseImage!, TileMode.repeated, TileMode.repeated, id)
+          ..colorFilter = ui.ColorFilter.matrix([
+              noiseStrength, 0, 0, 0, (1 - noiseStrength) * 128,
+              0, noiseStrength, 0, 0, (1 - noiseStrength) * 128,
+              0, 0, noiseStrength, 0, (1 - noiseStrength) * 128,
+              0, 0, 0, 1, 0,
+            ])
+          ..blendMode = BlendMode.overlay,
+      );
+    }
   }
 
   @override
   bool shouldRepaint(_FrostedBubblePainter old) =>
       old.blurredBg != blurredBg ||
       old.tint != tint ||
-      old.screenSize != screenSize;
+      old.screenSize != screenSize ||
+      old.noiseEnabled != noiseEnabled ||
+      old.noiseStrength != noiseStrength ||
+      old.noiseImage != noiseImage;
 }
 
 // ── AudioPlayerBubble ─────────────────────────────────────────────────────────
@@ -1461,4 +1498,88 @@ class PhantomDivider extends StatelessWidget {
       ],
     );
   }
+}
+
+// ── Noise glass overlay ───────────────────────────────────────────────────────
+
+// Shared noise image — generated once, Future kept alive so repeated calls
+// return the already-resolved value without re-generating.
+class NoiseImageCache {
+  static Future<ui.Image>? _future;
+
+  static Future<ui.Image> get() => _future ??= _generate();
+
+  static Future<ui.Image> _generate() async {
+    const size = 200;
+    final rng = math.Random(0xdeadbeef);
+    final pixels = Uint8List(size * size * 4);
+    for (int i = 0; i < pixels.length; i += 4) {
+      final v = rng.nextInt(256);
+      pixels[i] = pixels[i + 1] = pixels[i + 2] = v;
+      pixels[i + 3] = 255;
+    }
+    final buf  = await ui.ImmutableBuffer.fromUint8List(pixels);
+    final desc = ui.ImageDescriptor.raw(
+      buf, width: size, height: size, pixelFormat: ui.PixelFormat.rgba8888,
+    );
+    final codec = await desc.instantiateCodec();
+    return (await codec.getNextFrame()).image;
+  }
+}
+
+// Drop-in noise layer: place inside a Stack on top of any BackdropFilter child.
+class NoiseLayer extends StatefulWidget {
+  final double strength;
+  const NoiseLayer({super.key, required this.strength});
+  @override State<NoiseLayer> createState() => _NoiseLayerState();
+}
+
+class _NoiseLayerState extends State<NoiseLayer> {
+  ui.Image? _noise;
+
+  @override
+  void initState() {
+    super.initState();
+    NoiseImageCache.get().then((img) {
+      if (mounted) setState(() => _noise = img);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final n = _noise;
+    if (n == null || widget.strength <= 0) return const SizedBox.shrink();
+    return CustomPaint(
+      painter: _NoisePainter(n, widget.strength),
+      child: const SizedBox.expand(),
+    );
+  }
+}
+
+class _NoisePainter extends CustomPainter {
+  final ui.Image noise;
+  final double strength;
+  _NoisePainter(this.noise, this.strength);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final id = Float64List(16)
+      ..[0] = 1 ..[5] = 1 ..[10] = 1 ..[15] = 1;
+    canvas.drawRect(
+      Offset.zero & size,
+      Paint()
+        ..shader = ui.ImageShader(noise, TileMode.repeated, TileMode.repeated, id)
+        ..colorFilter = ui.ColorFilter.matrix([
+            strength, 0, 0, 0, (1 - strength) * 128,
+            0, strength, 0, 0, (1 - strength) * 128,
+            0, 0, strength, 0, (1 - strength) * 128,
+            0, 0, 0, 1, 0,
+          ])
+        ..blendMode = BlendMode.overlay,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_NoisePainter old) =>
+      old.noise != noise || old.strength != strength;
 }

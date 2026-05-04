@@ -641,12 +641,14 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
   bool _updateChecked = false;
 
   // App-level glass state (independent from chat glass)
-  bool    _glassEnabled = false;
-  double  _glassOpacity = 0.15;
-  bool    _glassBgBlur  = false;
-  double  _glassBlur    = 10.0;
-  bool    _useWallpaper = false;
+  bool    _glassEnabled      = false;
+  double  _glassOpacity      = 0.15;
+  bool    _glassBgBlur       = false;
+  double  _glassBlur         = 10.0;
+  bool    _useWallpaper      = false;
   String? _appWallpaperPath;
+  bool    _glassNoise        = false;
+  double  _glassNoiseStrength = 0.15;
 
   @override
   void didChangeDependencies() {
@@ -667,20 +669,24 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
   }
 
   Future<void> _loadGlass(PhantomCore core) async {
-    final enabled = await core.storage.getAppGlassEnabled();
-    final opacity = await core.storage.getAppGlassOpacity();
-    final bgBlur  = await core.storage.getAppGlassBgBlur();
-    final blur    = await core.storage.getAppGlassBlur();
-    final useWp   = await core.storage.getAppGlassUseWallpaper();
-    final wp      = useWp ? await core.storage.getAppWallpaper() : null;
+    final enabled  = await core.storage.getAppGlassEnabled();
+    final opacity  = await core.storage.getAppGlassOpacity();
+    final bgBlur   = await core.storage.getAppGlassBgBlur();
+    final blur     = await core.storage.getAppGlassBlur();
+    final useWp    = await core.storage.getAppGlassUseWallpaper();
+    final wp       = useWp ? await core.storage.getAppWallpaper() : null;
+    final noise    = await core.storage.getAppGlassNoise();
+    final noiseSt  = await core.storage.getAppGlassNoiseStrength();
     if (!mounted) return;
     setState(() {
-      _glassEnabled     = enabled;
-      _glassOpacity     = opacity;
-      _glassBgBlur      = bgBlur;
-      _glassBlur        = blur;
-      _useWallpaper     = useWp;
-      _appWallpaperPath = wp;
+      _glassEnabled       = enabled;
+      _glassOpacity       = opacity;
+      _glassBgBlur        = bgBlur;
+      _glassBlur          = blur;
+      _useWallpaper       = useWp;
+      _appWallpaperPath   = wp;
+      _glassNoise         = noise;
+      _glassNoiseStrength = noiseSt;
     });
   }
 
@@ -819,10 +825,16 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
                   filter: ui.ImageFilter.blur(
                       sigmaX: _glassBlur, sigmaY: _glassBlur,
                       tileMode: TileMode.clamp),
-                  child: Container(
-                    color: t.bgSurface
-                        .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
-                  ),
+                  child: Stack(children: [
+                    Positioned.fill(child: Container(
+                      color: t.bgSurface
+                          .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
+                    )),
+                    if (_glassNoise && _glassNoiseStrength > 0)
+                      Positioned.fill(child: IgnorePointer(
+                        child: NoiseLayer(strength: _glassNoiseStrength),
+                      )),
+                  ]),
                 ),
               )
             : null,
@@ -1048,10 +1060,13 @@ class _ChatScreenState extends State<ChatScreen> {
   PhantomCore? _core; // cached — safe to use in dispose()
 
   // Glass effect state
-  bool   _glassEnabled  = false;
-  double _glassOpacity  = 0.12;
-  double _glassBlur     = 10.0;
-  bool   _glassBgBlur   = false;
+  bool   _glassEnabled       = false;
+  double _glassOpacity       = 0.12;
+  double _glassBlur          = 10.0;
+  bool   _glassBgBlur        = false;
+  bool   _glassNoise         = false;
+  double _glassNoiseStrength = 0.15;
+  ui.Image? _noiseImage;
 
   @override
   void didChangeDependencies() {
@@ -1089,14 +1104,25 @@ class _ChatScreenState extends State<ChatScreen> {
     final opacity  = await core.storage.getGlassOpacity();
     final blur     = await core.storage.getGlassBlur();
     final bgBlur   = await core.storage.getGlassBgBlur();
+    final noise    = await core.storage.getGlassNoise();
+    final noiseSt  = await core.storage.getGlassNoiseStrength();
     if (!mounted) return;
     setState(() {
-      _glassEnabled = enabled;
-      _glassOpacity = opacity;
-      _glassBlur    = blur;
-      _glassBgBlur  = bgBlur;
+      _glassEnabled       = enabled;
+      _glassOpacity       = opacity;
+      _glassBlur          = blur;
+      _glassBgBlur        = bgBlur;
+      _glassNoise         = noise;
+      _glassNoiseStrength = noiseSt;
     });
     _refreshBlurredBg();
+    if (noise && _noiseImage == null) _fetchNoise();
+  }
+
+  void _fetchNoise() {
+    NoiseImageCache.get().then((img) {
+      if (mounted) setState(() => _noiseImage = img);
+    });
   }
 
   Future<void> _refreshBlurredBg() async {
@@ -1257,6 +1283,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _presenceSub?.cancel();
     _scrollCtrl.dispose();
     _blurredBg?.dispose();
+    // _noiseImage is shared via NoiseImageCache — do not dispose it here.
     super.dispose();
   }
 
@@ -1276,10 +1303,16 @@ class _ChatScreenState extends State<ChatScreen> {
                 filter: ui.ImageFilter.blur(
                     sigmaX: _glassBlur, sigmaY: _glassBlur,
                     tileMode: TileMode.clamp),
-                child: Container(
-                  color: t.bgSurface
-                      .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
-                ),
+                child: Stack(children: [
+                  Positioned.fill(child: Container(
+                    color: t.bgSurface
+                        .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
+                  )),
+                  if (_glassNoise && _glassNoiseStrength > 0)
+                    Positioned.fill(child: IgnorePointer(
+                      child: NoiseLayer(strength: _glassNoiseStrength),
+                    )),
+                ]),
               ),
             )
           : null,
@@ -1430,6 +1463,9 @@ class _ChatScreenState extends State<ChatScreen> {
               glassBlur:       _glassBlur,
               blurredBg:       _blurredBg,
               scrollNotifier:  _scrollCtrl,
+              noiseEnabled:    _glassNoise,
+              noiseStrength:   _glassNoiseStrength,
+              noiseImage:      _noiseImage,
             ),
           ),
         );
@@ -1615,6 +1651,45 @@ class _ChatScreenState extends State<ChatScreen> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
+                    Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('noise',
+                          style: TextStyle(color: t.textPrimary,
+                              fontFamily: 'monospace', fontSize: 14)),
+                      Text('grain texture on glass',
+                          style: TextStyle(color: t.textDisabled,
+                              fontFamily: 'monospace', fontSize: 11)),
+                    ]),
+                    Switch(
+                      value: _glassNoise,
+                      activeThumbColor: t.accentLight,
+                      onChanged: (val) async {
+                        setS(() {});
+                        if (mounted) setState(() => _glassNoise = val);
+                        await core?.storage.setGlassNoise(val);
+                        if (val && _noiseImage == null) _fetchNoise();
+                      },
+                    ),
+                  ],
+                ),
+                if (_glassNoise) ...[
+                  const SizedBox(height: 4),
+                  _GlassSlider(
+                    label: 'noise',
+                    value: _glassNoiseStrength,
+                    min: 0.0,
+                    max: 1.0,
+                    tokens: t,
+                    onChanged: (v) {
+                      setS(() {});
+                      if (mounted) setState(() => _glassNoiseStrength = v);
+                      core?.storage.setGlassNoiseStrength(v);
+                    },
+                  ),
+                ],
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
                     Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
@@ -1730,12 +1805,14 @@ class _AddContactScreenState extends State<AddContactScreen> {
   String? _error;
   bool _loading = false;
 
-  bool    _glassEnabled    = false;
-  double  _glassOpacity    = 0.15;
-  double  _glassBlur       = 10.0;
-  bool    _glassBgBlur     = false;
-  bool    _useWallpaper    = false;
+  bool    _glassEnabled       = false;
+  double  _glassOpacity       = 0.15;
+  double  _glassBlur          = 10.0;
+  bool    _glassBgBlur        = false;
+  bool    _useWallpaper       = false;
   String? _appWallpaperPath;
+  bool    _glassNoise         = false;
+  double  _glassNoiseStrength = 0.15;
 
   @override
   void didChangeDependencies() {
@@ -1745,20 +1822,24 @@ class _AddContactScreenState extends State<AddContactScreen> {
   }
 
   Future<void> _loadGlass(PhantomCore core) async {
-    final enabled = await core.storage.getAppGlassEnabled();
-    final opacity = await core.storage.getAppGlassOpacity();
-    final bgBlur  = await core.storage.getAppGlassBgBlur();
-    final blur    = await core.storage.getAppGlassBlur();
-    final useWp   = await core.storage.getAppGlassUseWallpaper();
-    final wp      = useWp ? await core.storage.getAppWallpaper() : null;
+    final enabled  = await core.storage.getAppGlassEnabled();
+    final opacity  = await core.storage.getAppGlassOpacity();
+    final bgBlur   = await core.storage.getAppGlassBgBlur();
+    final blur     = await core.storage.getAppGlassBlur();
+    final useWp    = await core.storage.getAppGlassUseWallpaper();
+    final wp       = useWp ? await core.storage.getAppWallpaper() : null;
+    final noise    = await core.storage.getAppGlassNoise();
+    final noiseSt  = await core.storage.getAppGlassNoiseStrength();
     if (!mounted) return;
     setState(() {
-      _glassEnabled    = enabled;
-      _glassOpacity    = opacity;
-      _glassBgBlur     = bgBlur;
-      _glassBlur       = blur;
-      _useWallpaper    = useWp;
-      _appWallpaperPath = wp;
+      _glassEnabled       = enabled;
+      _glassOpacity       = opacity;
+      _glassBgBlur        = bgBlur;
+      _glassBlur          = blur;
+      _useWallpaper       = useWp;
+      _appWallpaperPath   = wp;
+      _glassNoise         = noise;
+      _glassNoiseStrength = noiseSt;
     });
   }
 
@@ -1807,10 +1888,16 @@ class _AddContactScreenState extends State<AddContactScreen> {
                   filter: ui.ImageFilter.blur(
                       sigmaX: _glassBlur, sigmaY: _glassBlur,
                       tileMode: TileMode.clamp),
-                  child: Container(
-                    color: t.bgSurface
-                        .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
-                  ),
+                  child: Stack(children: [
+                    Positioned.fill(child: Container(
+                      color: t.bgSurface
+                          .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
+                    )),
+                    if (_glassNoise && _glassNoiseStrength > 0)
+                      Positioned.fill(child: IgnorePointer(
+                        child: NoiseLayer(strength: _glassNoiseStrength),
+                      )),
+                  ]),
                 ),
               )
             : null,
@@ -1908,12 +1995,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   static const _secure = FlutterSecureStorage(aOptions: AndroidOptions());
 
   // App-level glass state (independent from chat glass)
-  bool    _glassEnabled = false;
-  double  _glassOpacity = 0.15;
-  bool    _glassBgBlur  = false;
-  double  _glassBlur    = 10.0;
-  bool    _useWallpaper = false;
+  bool    _glassEnabled       = false;
+  double  _glassOpacity       = 0.15;
+  bool    _glassBgBlur        = false;
+  double  _glassBlur          = 10.0;
+  bool    _useWallpaper       = false;
   String? _appWallpaperPath;
+  bool    _glassNoise         = false;
+  double  _glassNoiseStrength = 0.15;
 
   // Manual update check
   bool _checkingUpdate = false;
@@ -1934,20 +2023,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _loadGlass(PhantomCore core) async {
-    final enabled = await core.storage.getAppGlassEnabled();
-    final opacity = await core.storage.getAppGlassOpacity();
-    final bgBlur  = await core.storage.getAppGlassBgBlur();
-    final blur    = await core.storage.getAppGlassBlur();
-    final useWp   = await core.storage.getAppGlassUseWallpaper();
-    final wp      = useWp ? await core.storage.getAppWallpaper() : null;
+    final enabled  = await core.storage.getAppGlassEnabled();
+    final opacity  = await core.storage.getAppGlassOpacity();
+    final bgBlur   = await core.storage.getAppGlassBgBlur();
+    final blur     = await core.storage.getAppGlassBlur();
+    final useWp    = await core.storage.getAppGlassUseWallpaper();
+    final wp       = useWp ? await core.storage.getAppWallpaper() : null;
+    final noise    = await core.storage.getAppGlassNoise();
+    final noiseSt  = await core.storage.getAppGlassNoiseStrength();
     if (!mounted) return;
     setState(() {
-      _glassEnabled     = enabled;
-      _glassOpacity     = opacity;
-      _glassBgBlur      = bgBlur;
-      _glassBlur        = blur;
-      _useWallpaper     = useWp;
-      _appWallpaperPath = wp;
+      _glassEnabled       = enabled;
+      _glassOpacity       = opacity;
+      _glassBgBlur        = bgBlur;
+      _glassBlur          = blur;
+      _useWallpaper       = useWp;
+      _appWallpaperPath   = wp;
+      _glassNoise         = noise;
+      _glassNoiseStrength = noiseSt;
     });
   }
 
@@ -2298,6 +2391,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                   ],
                 ],
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('noise',
+                          style: TextStyle(color: t.textPrimary,
+                              fontFamily: 'monospace', fontSize: 14)),
+                      Text('grain texture on glass',
+                          style: TextStyle(color: t.textDisabled,
+                              fontFamily: 'monospace', fontSize: 11)),
+                    ]),
+                    Switch(
+                      value: _glassNoise,
+                      activeThumbColor: t.accentLight,
+                      onChanged: (val) async {
+                        setState(() => _glassNoise = val);
+                        await core?.storage.setAppGlassNoise(val);
+                      },
+                    ),
+                  ],
+                ),
+                if (_glassNoise) ...[
+                  const SizedBox(height: 4),
+                  _GlassSlider(
+                    label: 'noise',
+                    value: _glassNoiseStrength,
+                    min: 0.0,
+                    max: 1.0,
+                    tokens: t,
+                    onChanged: (v) {
+                      setState(() => _glassNoiseStrength = v);
+                      core?.storage.setAppGlassNoiseStrength(v);
+                    },
+                  ),
+                ],
               ],
             ),
           ),
@@ -2359,10 +2488,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   filter: ui.ImageFilter.blur(
                       sigmaX: _glassBlur, sigmaY: _glassBlur,
                       tileMode: TileMode.clamp),
-                  child: Container(
-                    color: t.bgSurface
-                        .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
-                  ),
+                  child: Stack(children: [
+                    Positioned.fill(child: Container(
+                      color: t.bgSurface
+                          .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
+                    )),
+                    if (_glassNoise && _glassNoiseStrength > 0)
+                      Positioned.fill(child: IgnorePointer(
+                        child: NoiseLayer(strength: _glassNoiseStrength),
+                      )),
+                  ]),
                 ),
               )
             : null,

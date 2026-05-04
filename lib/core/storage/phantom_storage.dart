@@ -311,10 +311,15 @@ class PhantomStorage {
   // When true the wallpaper image is blurred at scene level (pre-blur).
   Future<bool>   getGlassBgBlur()   async => (await getSetting<bool>('glass_bg_blur'))    ?? false;
 
-  Future<void> setGlassEnabled(bool v)   => setSetting('glass_enabled', v);
-  Future<void> setGlassOpacity(double v) => setSetting('glass_opacity', v);
-  Future<void> setGlassBlur(double v)    => setSetting('glass_blur', v);
-  Future<void> setGlassBgBlur(bool v)    => setSetting('glass_bg_blur', v);
+  Future<bool>   getGlassNoise()          async => (await getSetting<bool>('glass_noise'))           ?? false;
+  Future<double> getGlassNoiseStrength()  async => (await getSetting<double>('glass_noise_strength')) ?? 0.15;
+
+  Future<void> setGlassEnabled(bool v)       => setSetting('glass_enabled', v);
+  Future<void> setGlassOpacity(double v)     => setSetting('glass_opacity', v);
+  Future<void> setGlassBlur(double v)        => setSetting('glass_blur', v);
+  Future<void> setGlassBgBlur(bool v)        => setSetting('glass_bg_blur', v);
+  Future<void> setGlassNoise(bool v)         => setSetting('glass_noise', v);
+  Future<void> setGlassNoiseStrength(double v) => setSetting('glass_noise_strength', v);
 
   // ── App-level glass (conversations + settings — independent from chat) ────────
 
@@ -324,11 +329,16 @@ class PhantomStorage {
   Future<bool>   getAppGlassBgBlur()       async => (await getSetting<bool>('app_glass_bg_blur'))       ?? false;
   Future<bool>   getAppGlassUseWallpaper() async => (await getSetting<bool>('app_glass_use_wallpaper')) ?? false;
 
-  Future<void> setAppGlassEnabled(bool v)      => setSetting('app_glass_enabled', v);
-  Future<void> setAppGlassOpacity(double v)    => setSetting('app_glass_opacity', v);
-  Future<void> setAppGlassBlur(double v)       => setSetting('app_glass_blur', v);
-  Future<void> setAppGlassBgBlur(bool v)       => setSetting('app_glass_bg_blur', v);
-  Future<void> setAppGlassUseWallpaper(bool v) => setSetting('app_glass_use_wallpaper', v);
+  Future<bool>   getAppGlassNoise()          async => (await getSetting<bool>('app_glass_noise'))           ?? false;
+  Future<double> getAppGlassNoiseStrength()  async => (await getSetting<double>('app_glass_noise_strength')) ?? 0.15;
+
+  Future<void> setAppGlassEnabled(bool v)          => setSetting('app_glass_enabled', v);
+  Future<void> setAppGlassOpacity(double v)        => setSetting('app_glass_opacity', v);
+  Future<void> setAppGlassBlur(double v)           => setSetting('app_glass_blur', v);
+  Future<void> setAppGlassBgBlur(bool v)           => setSetting('app_glass_bg_blur', v);
+  Future<void> setAppGlassUseWallpaper(bool v)     => setSetting('app_glass_use_wallpaper', v);
+  Future<void> setAppGlassNoise(bool v)            => setSetting('app_glass_noise', v);
+  Future<void> setAppGlassNoiseStrength(double v)  => setSetting('app_glass_noise_strength', v);
 
   // ── Internals ─────────────────────────────────────────────────────────────────
 
