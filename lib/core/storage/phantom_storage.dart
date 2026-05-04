@@ -316,6 +316,20 @@ class PhantomStorage {
   Future<void> setGlassBlur(double v)    => setSetting('glass_blur', v);
   Future<void> setGlassBgBlur(bool v)    => setSetting('glass_bg_blur', v);
 
+  // ── App-level glass (conversations + settings — independent from chat) ────────
+
+  Future<bool>   getAppGlassEnabled()      async => (await getSetting<bool>('app_glass_enabled'))       ?? false;
+  Future<double> getAppGlassOpacity()      async => (await getSetting<double>('app_glass_opacity'))     ?? 0.15;
+  Future<double> getAppGlassBlur()         async => (await getSetting<double>('app_glass_blur'))        ?? 10.0;
+  Future<bool>   getAppGlassBgBlur()       async => (await getSetting<bool>('app_glass_bg_blur'))       ?? false;
+  Future<bool>   getAppGlassUseWallpaper() async => (await getSetting<bool>('app_glass_use_wallpaper')) ?? false;
+
+  Future<void> setAppGlassEnabled(bool v)      => setSetting('app_glass_enabled', v);
+  Future<void> setAppGlassOpacity(double v)    => setSetting('app_glass_opacity', v);
+  Future<void> setAppGlassBlur(double v)       => setSetting('app_glass_blur', v);
+  Future<void> setAppGlassBgBlur(bool v)       => setSetting('app_glass_bg_blur', v);
+  Future<void> setAppGlassUseWallpaper(bool v) => setSetting('app_glass_use_wallpaper', v);
+
   // ── Internals ─────────────────────────────────────────────────────────────────
 
   Future<Box> _openBox(String name) async {

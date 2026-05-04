@@ -640,11 +640,12 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
   UpdateInfo? _updateInfo;
   bool _updateChecked = false;
 
-  // Glass effect state (shared global settings)
+  // App-level glass state (independent from chat glass)
   bool    _glassEnabled = false;
-  double  _glassOpacity = 0.12;
+  double  _glassOpacity = 0.15;
   bool    _glassBgBlur  = false;
   double  _glassBlur    = 10.0;
+  bool    _useWallpaper = false;
   String? _appWallpaperPath;
 
   @override
@@ -666,18 +667,20 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
   }
 
   Future<void> _loadGlass(PhantomCore core) async {
-    final enabled = await core.storage.getGlassEnabled();
-    final opacity = await core.storage.getGlassOpacity();
-    final bgBlur  = await core.storage.getGlassBgBlur();
-    final blur    = await core.storage.getGlassBlur();
-    final wp      = enabled ? await core.storage.getAppWallpaper() : null;
+    final enabled = await core.storage.getAppGlassEnabled();
+    final opacity = await core.storage.getAppGlassOpacity();
+    final bgBlur  = await core.storage.getAppGlassBgBlur();
+    final blur    = await core.storage.getAppGlassBlur();
+    final useWp   = await core.storage.getAppGlassUseWallpaper();
+    final wp      = useWp ? await core.storage.getAppWallpaper() : null;
     if (!mounted) return;
     setState(() {
-      _glassEnabled        = enabled;
-      _glassOpacity        = opacity;
-      _glassBgBlur         = bgBlur;
-      _glassBlur           = blur;
-      _appWallpaperPath    = wp;
+      _glassEnabled     = enabled;
+      _glassOpacity     = opacity;
+      _glassBgBlur      = bgBlur;
+      _glassBlur        = blur;
+      _useWallpaper     = useWp;
+      _appWallpaperPath = wp;
     });
   }
 
@@ -766,7 +769,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
     final visible = _visible;
 
     final g      = _glassEnabled;
-    final bgPath = g ? _appWallpaperPath : null;
+    final bgPath = g && _useWallpaper ? _appWallpaperPath : null;
 
     Widget buildBody() => Column(
       children: [
@@ -849,12 +852,12 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
                               tileMode: TileMode.clamp),
                             child: Image.file(File(bgPath), fit: BoxFit.cover))
                         : Image.file(File(bgPath), fit: BoxFit.cover)
-                    : _GlassFallback(accent: t.accentLight),
+                    : Container(color: t.bgBase),
               ),
               Positioned.fill(
                 child: Container(
-                  color: t.bgBase.withValues(
-                      alpha: (0.55 - _glassOpacity).clamp(0.25, 0.70)),
+                  color: Color.lerp(t.bgBase, t.accentLight, 0.06)!
+                      .withValues(alpha: (0.55 - _glassOpacity).clamp(0.22, 0.72)),
                 ),
               ),
               buildBody(),
@@ -1771,11 +1774,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _ownAvatarPath;
   static const _secure = FlutterSecureStorage(aOptions: AndroidOptions());
 
-  // Glass state
+  // App-level glass state (independent from chat glass)
   bool    _glassEnabled = false;
-  double  _glassOpacity = 0.12;
+  double  _glassOpacity = 0.15;
   bool    _glassBgBlur  = false;
   double  _glassBlur    = 10.0;
+  bool    _useWallpaper = false;
   String? _appWallpaperPath;
 
   // Manual update check
@@ -1797,17 +1801,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _loadGlass(PhantomCore core) async {
-    final enabled = await core.storage.getGlassEnabled();
-    final opacity = await core.storage.getGlassOpacity();
-    final bgBlur  = await core.storage.getGlassBgBlur();
-    final blur    = await core.storage.getGlassBlur();
-    final wp      = await core.storage.getAppWallpaper();
+    final enabled = await core.storage.getAppGlassEnabled();
+    final opacity = await core.storage.getAppGlassOpacity();
+    final bgBlur  = await core.storage.getAppGlassBgBlur();
+    final blur    = await core.storage.getAppGlassBlur();
+    final useWp   = await core.storage.getAppGlassUseWallpaper();
+    final wp      = useWp ? await core.storage.getAppWallpaper() : null;
     if (!mounted) return;
     setState(() {
       _glassEnabled     = enabled;
       _glassOpacity     = opacity;
       _glassBgBlur      = bgBlur;
       _glassBlur        = blur;
+      _useWallpaper     = useWp;
       _appWallpaperPath = wp;
     });
   }
@@ -1844,7 +1850,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final core     = provider.core;
 
     final g      = _glassEnabled;
-    final bgPath = g ? _appWallpaperPath : null;
+    final bgPath = g && _useWallpaper ? _appWallpaperPath : null;
 
     Widget buildList() => ListView(
       children: [
@@ -2068,30 +2074,126 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
           ),
-          _SettingTile(
-            icon: Icons.image_outlined,
-            label: _appWallpaperPath != null ? 'change app wallpaper' : 'set app wallpaper',
-            tokens: t,
-            onTap: () async {
-              final picked = await ImagePicker().pickImage(source: ImageSource.gallery);
-              if (picked != null && core != null) {
-                await core.storage.setAppWallpaper(picked.path);
-                if (mounted) setState(() => _appWallpaperPath = picked.path);
-              }
-            },
+          // ── Background (app-level glass, independent from chat) ──
+          _SectionHeader('background', t),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('glass effect',
+                          style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 14)),
+                      Text('transparent bars · tinted background',
+                          style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
+                    ]),
+                    Switch(
+                      value: _glassEnabled,
+                      activeThumbColor: t.accentLight,
+                      onChanged: (val) async {
+                        setState(() => _glassEnabled = val);
+                        await core?.storage.setAppGlassEnabled(val);
+                      },
+                    ),
+                  ],
+                ),
+                if (_glassEnabled) ...[
+                  const SizedBox(height: 8),
+                  _GlassSlider(
+                    label: 'opacity',
+                    value: _glassOpacity,
+                    min: 0.05, max: 0.40,
+                    tokens: t,
+                    onChanged: (v) {
+                      setState(() => _glassOpacity = v);
+                      core?.storage.setAppGlassOpacity(v);
+                    },
+                  ),
+                  const SizedBox(height: 4),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text('custom wallpaper',
+                            style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 14)),
+                        Text('gallery image instead of solid color',
+                            style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
+                      ]),
+                      Switch(
+                        value: _useWallpaper,
+                        activeThumbColor: t.accentLight,
+                        onChanged: (val) async {
+                          setState(() => _useWallpaper = val);
+                          await core?.storage.setAppGlassUseWallpaper(val);
+                          if (val) {
+                            final wp = await core?.storage.getAppWallpaper();
+                            if (mounted) setState(() => _appWallpaperPath = wp);
+                          }
+                        },
+                      ),
+                    ],
+                  ),
+                  if (_useWallpaper) ...[
+                    const SizedBox(height: 4),
+                    _GlassSlider(
+                      label: 'blur',
+                      value: _glassBlur,
+                      min: 2.0, max: 25.0,
+                      tokens: t,
+                      onChanged: (v) {
+                        setState(() => _glassBlur = v);
+                        core?.storage.setAppGlassBlur(v);
+                      },
+                    ),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('blur image',
+                            style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 14)),
+                        Switch(
+                          value: _glassBgBlur,
+                          activeThumbColor: t.accentLight,
+                          onChanged: (val) async {
+                            setState(() => _glassBgBlur = val);
+                            await core?.storage.setAppGlassBgBlur(val);
+                          },
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+              ],
+            ),
           ),
-          if (_appWallpaperPath != null)
+          if (_glassEnabled && _useWallpaper) ...[
             _SettingTile(
-              icon: Icons.hide_image_outlined,
-              label: 'remove app wallpaper',
+              icon: Icons.image_outlined,
+              label: _appWallpaperPath != null ? 'change wallpaper' : 'set wallpaper',
               tokens: t,
               onTap: () async {
-                if (core != null) {
-                  await core.storage.clearAppWallpaper();
-                  if (mounted) setState(() => _appWallpaperPath = null);
+                final picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+                if (picked != null && core != null) {
+                  await core.storage.setAppWallpaper(picked.path);
+                  if (mounted) setState(() => _appWallpaperPath = picked.path);
                 }
               },
             ),
+            if (_appWallpaperPath != null)
+              _SettingTile(
+                icon: Icons.hide_image_outlined,
+                label: 'remove wallpaper',
+                tokens: t,
+                onTap: () async {
+                  if (core != null) {
+                    await core.storage.clearAppWallpaper();
+                    if (mounted) setState(() => _appWallpaperPath = null);
+                  }
+                },
+              ),
+          ],
 
           // ── About ─────────────────────────────────────────────
           _SectionHeader('about', t),
@@ -2149,12 +2251,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             ),
                             child: Image.file(File(bgPath), fit: BoxFit.cover))
                         : Image.file(File(bgPath), fit: BoxFit.cover)
-                    : _GlassFallback(accent: t.accentLight),
+                    : Container(color: t.bgBase),
               ),
               Positioned.fill(
                 child: Container(
-                  color: t.bgBase.withValues(
-                      alpha: (0.55 - _glassOpacity).clamp(0.25, 0.70)),
+                  color: Color.lerp(t.bgBase, t.accentLight, 0.06)!
+                      .withValues(alpha: (0.55 - _glassOpacity).clamp(0.22, 0.72)),
                 ),
               ),
               buildList(),
