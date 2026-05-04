@@ -31,6 +31,9 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+      - name: Download Kubo binaries
+        run: bash scripts/download_kubo.sh
+
       - name: Build release APK
         run: |
           flutter build apk --release \
