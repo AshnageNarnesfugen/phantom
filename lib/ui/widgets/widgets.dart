@@ -27,6 +27,7 @@ class ChatBubble extends StatelessWidget {
   final double glassOpacity;
   final double glassBlur;
   final ui.Image? blurredBg;
+  final Listenable? scrollNotifier;
 
   const ChatBubble({
     super.key,
@@ -42,6 +43,7 @@ class ChatBubble extends StatelessWidget {
     this.glassOpacity = 0.12,
     this.glassBlur = 10.0,
     this.blurredBg,
+    this.scrollNotifier,
   });
 
   @override
@@ -92,6 +94,7 @@ class ChatBubble extends StatelessWidget {
               screenSize: scrSize,
               tint: tintColor,
               getBox: () => ctx.findRenderObject() as RenderBox?,
+              scrollNotifier: scrollNotifier,
             ),
             child: Container(
               padding: pad,
@@ -303,7 +306,8 @@ class _FrostedBubblePainter extends CustomPainter {
     required this.screenSize,
     required this.tint,
     required this.getBox,
-  });
+    Listenable? scrollNotifier,
+  }) : super(repaint: scrollNotifier);
 
   @override
   void paint(Canvas canvas, Size size) {
