@@ -897,6 +897,10 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
               : Container(color: t.bgBase),
         ),
       ),
+      if (g && _glassNoise && _glassNoiseStrength > 0)
+        Positioned.fill(child: IgnorePointer(
+          child: NoiseLayer(strength: _glassNoiseStrength),
+        )),
       Positioned.fill(
         child: ColoredBox(
           color: Color.lerp(t.bgBase, t.accentLight, 0.06)!
@@ -1409,6 +1413,10 @@ class _ChatScreenState extends State<ChatScreen> {
               : _GlassFallback(accent: t.accentLight),
         ),
       ),
+      if (g && _glassNoise && _glassNoiseStrength > 0)
+        Positioned.fill(child: IgnorePointer(
+          child: NoiseLayer(strength: _glassNoiseStrength),
+        )),
       scaffold,
     ]);
   }
@@ -1967,6 +1975,10 @@ class _AddContactScreenState extends State<AddContactScreen> {
               : Container(color: t.bgBase),
         ),
       ),
+      if (_glassNoise && _glassNoiseStrength > 0)
+        Positioned.fill(child: IgnorePointer(
+          child: NoiseLayer(strength: _glassNoiseStrength),
+        )),
       Positioned.fill(
         child: ColoredBox(
           color: Color.lerp(t.bgBase, t.accentLight, 0.06)!
@@ -2538,6 +2550,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
               : Container(color: t.bgBase),
         ),
       ),
+      if (_glassNoise && _glassNoiseStrength > 0)
+        Positioned.fill(child: IgnorePointer(
+          child: NoiseLayer(strength: _glassNoiseStrength),
+        )),
       Positioned.fill(
         child: ColoredBox(
           color: Color.lerp(t.bgBase, t.accentLight, 0.06)!

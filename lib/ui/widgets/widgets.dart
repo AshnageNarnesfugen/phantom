@@ -357,6 +357,8 @@ class _FrostedBubblePainter extends CustomPainter {
     canvas.drawRect(dst, Paint()..color = tint);
 
     if (noiseEnabled && noiseImage != null && noiseStrength > 0) {
+      // Cubic curve: barely perceptible at 0–30%, strong only above 80%.
+      final s = math.pow(noiseStrength, 3).toDouble();
       final id = Float64List(16)
         ..[0] = 1 ..[5] = 1 ..[10] = 1 ..[15] = 1;
       canvas.drawRect(
@@ -364,9 +366,9 @@ class _FrostedBubblePainter extends CustomPainter {
         Paint()
           ..shader = ui.ImageShader(noiseImage!, TileMode.repeated, TileMode.repeated, id)
           ..colorFilter = ui.ColorFilter.matrix([
-              noiseStrength, 0, 0, 0, (1 - noiseStrength) * 128,
-              0, noiseStrength, 0, 0, (1 - noiseStrength) * 128,
-              0, 0, noiseStrength, 0, (1 - noiseStrength) * 128,
+              s, 0, 0, 0, (1 - s) * 128,
+              0, s, 0, 0, (1 - s) * 128,
+              0, 0, s, 0, (1 - s) * 128,
               0, 0, 0, 1, 0,
             ])
           ..blendMode = BlendMode.overlay,
@@ -1563,6 +1565,8 @@ class _NoisePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    // Cubic curve: imperceptible at low values, strong only at 80–100%.
+    final s = math.pow(strength, 3).toDouble();
     final id = Float64List(16)
       ..[0] = 1 ..[5] = 1 ..[10] = 1 ..[15] = 1;
     canvas.drawRect(
@@ -1570,9 +1574,9 @@ class _NoisePainter extends CustomPainter {
       Paint()
         ..shader = ui.ImageShader(noise, TileMode.repeated, TileMode.repeated, id)
         ..colorFilter = ui.ColorFilter.matrix([
-            strength, 0, 0, 0, (1 - strength) * 128,
-            0, strength, 0, 0, (1 - strength) * 128,
-            0, 0, strength, 0, (1 - strength) * 128,
+            s, 0, 0, 0, (1 - s) * 128,
+            0, s, 0, 0, (1 - s) * 128,
+            0, 0, s, 0, (1 - s) * 128,
             0, 0, 0, 1, 0,
           ])
         ..blendMode = BlendMode.overlay,
