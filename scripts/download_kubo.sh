@@ -14,9 +14,9 @@ BASE_URL="https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}"
 JNILIBS_DIR="android/app/src/main/jniLibs"
 
 # Map Android ABI → Kubo archive architecture name
+# armeabi-v7a (linux-arm 32-bit) dropped by Kubo since v0.36; excluded.
 declare -A ARCH_MAP=(
   [arm64-v8a]="arm64"
-  [armeabi-v7a]="arm"
   [x86_64]="amd64"
 )
 
@@ -42,7 +42,7 @@ download_abi() {
 if [[ $# -gt 0 ]]; then
   ABIS=("$@")
 else
-  ABIS=("arm64-v8a" "armeabi-v7a" "x86_64")
+  ABIS=("arm64-v8a" "x86_64")
 fi
 
 cd "$(dirname "$0")/.."
