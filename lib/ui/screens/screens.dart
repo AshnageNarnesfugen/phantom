@@ -1211,9 +1211,20 @@ class _ChatScreenState extends State<ChatScreen> {
     final bgPath = g ? _wallpaperPath : null;
 
     final appBar = AppBar(
-      backgroundColor: g
-          ? t.bgSurface.withValues(alpha: (_glassOpacity * 2.2).clamp(0.12, 0.88))
-          : t.bgSurface,
+      backgroundColor: g ? Colors.transparent : t.bgSurface,
+      flexibleSpace: g
+          ? ClipRect(
+              child: BackdropFilter(
+                filter: ui.ImageFilter.blur(
+                    sigmaX: _glassBlur, sigmaY: _glassBlur,
+                    tileMode: TileMode.clamp),
+                child: Container(
+                  color: t.bgSurface
+                      .withValues(alpha: (_glassOpacity * 2.0).clamp(0.08, 0.80)),
+                ),
+              ),
+            )
+          : null,
       elevation: 0,
       leading: IconButton(
         icon: Icon(Icons.arrow_back, color: t.textSecondary, size: 20),
@@ -1281,21 +1292,23 @@ class _ChatScreenState extends State<ChatScreen> {
     if (g) {
       body = Stack(
         children: [
-          // Full-screen background — optionally blurred if the user enabled
-          // "blur background" in glass settings.
+          // Background in its own layer — RepaintBoundary lets BackdropFilter
+          // on bubbles composite against a cached layer, avoiding scroll artifacts.
           Positioned.fill(
-            child: bgPath != null
-                ? _glassBgBlur
-                    ? ImageFiltered(
-                        imageFilter: ui.ImageFilter.blur(
-                          sigmaX: _glassBlur,
-                          sigmaY: _glassBlur,
-                          tileMode: TileMode.clamp,
-                        ),
-                        child: Image.file(File(bgPath), fit: BoxFit.cover),
-                      )
-                    : Image.file(File(bgPath), fit: BoxFit.cover)
-                : _GlassFallback(accent: t.accentLight),
+            child: RepaintBoundary(
+              child: bgPath != null
+                  ? _glassBgBlur
+                      ? ImageFiltered(
+                          imageFilter: ui.ImageFilter.blur(
+                            sigmaX: _glassBlur,
+                            sigmaY: _glassBlur,
+                            tileMode: TileMode.clamp,
+                          ),
+                          child: Image.file(File(bgPath), fit: BoxFit.cover),
+                        )
+                      : Image.file(File(bgPath), fit: BoxFit.cover)
+                  : _GlassFallback(accent: t.accentLight),
+            ),
           ),
           // Content (offset for AppBar via extendBodyBehindAppBar)
           Column(

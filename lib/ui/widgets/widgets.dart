@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -70,21 +71,26 @@ class ChatBubble extends StatelessWidget {
 
     final inner = _buildInner(t, textColor, isImage);
 
-    // Glass mode: no BackdropFilter per-bubble — the wallpaper is pre-blurred
-    // at the scene level, keeping blur constant during scroll.
     final Widget bubble = glassEnabled
-        ? Container(
-            padding: pad,
-            decoration: BoxDecoration(
-              color: (isOutgoing ? t.accentLight : t.bgSurface)
-                  .withValues(alpha: isOutgoing
-                      ? (glassOpacity + 0.14).clamp(0.10, 1.0)
-                      : (glassOpacity * 2.0).clamp(0.12, 1.0)),
-              borderRadius: br,
-              border: Border.all(
-                  color: Colors.white.withValues(alpha: 0.15), width: 0.5),
+        ? ClipRRect(
+            borderRadius: br,
+            child: BackdropFilter(
+              filter: ui.ImageFilter.blur(
+                  sigmaX: glassBlur, sigmaY: glassBlur,
+                  tileMode: TileMode.clamp),
+              child: Container(
+                padding: pad,
+                decoration: BoxDecoration(
+                  color: (isOutgoing ? t.accentLight : t.bgSurface)
+                      .withValues(alpha: isOutgoing
+                          ? (glassOpacity + 0.06).clamp(0.08, 0.52)
+                          : (glassOpacity * 1.4).clamp(0.08, 0.50)),
+                  border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.12), width: 0.5),
+                ),
+                child: inner,
+              ),
             ),
-            child: inner,
           )
         : Container(
             padding: pad,
@@ -751,22 +757,31 @@ class _GlassBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: enabled
-            ? bgColor.withValues(alpha: (opacity * 1.8).clamp(0.12, 0.85))
-            : bgColor,
-        border: Border(
-          top: BorderSide(
-            color: enabled
-                ? divider.withValues(alpha: 0.25)
-                : divider,
-            width: 0.5,
+    if (!enabled) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: bgColor,
+          border: Border(top: BorderSide(color: divider, width: 0.5)),
+        ),
+        child: child,
+      );
+    }
+    return ClipRect(
+      child: BackdropFilter(
+        filter: ui.ImageFilter.blur(
+            sigmaX: blur, sigmaY: blur, tileMode: TileMode.clamp),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: bgColor.withValues(alpha: (opacity * 1.8).clamp(0.10, 0.75)),
+            border: Border(
+                top: BorderSide(
+                    color: divider.withValues(alpha: 0.25), width: 0.5)),
           ),
+          child: child,
         ),
       ),
-      child: child,
     );
   }
 }
