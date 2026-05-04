@@ -81,6 +81,11 @@
             android:name="flutterEmbedding"
             android:value="2" />
 
+        <!-- Impeller: pre-compiles shaders → eliminates BackdropFilter/compositing jank -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="true" />
+
         <!-- FileProvider for APK installation -->
         <provider
             android:name="androidx.core.content.FileProvider"

@@ -205,7 +205,7 @@ class _NewAccountStepState extends State<_NewAccountStep> {
     if (mounted) {
       Navigator.pushAndRemoveUntil(
         context,
-        MaterialPageRoute(builder: (_) => const ConversationsScreen()),
+        _AppRoute(builder: (_) => const ConversationsScreen()),
         (_) => false,
       );
     }
@@ -349,7 +349,7 @@ class _RestoreStepState extends State<_RestoreStep> {
       if (mounted) {
         Navigator.pushAndRemoveUntil(
           context,
-          MaterialPageRoute(builder: (_) => const ConversationsScreen()),
+          _AppRoute(builder: (_) => const ConversationsScreen()),
           (_) => false,
         );
       }
@@ -500,7 +500,7 @@ class _RestoreFromBackupStepState extends State<_RestoreFromBackupStep> {
       if (mounted) {
         Navigator.pushAndRemoveUntil(
           context,
-          MaterialPageRoute(builder: (_) => const ConversationsScreen()),
+          _AppRoute(builder: (_) => const ConversationsScreen()),
           (_) => false,
         );
       }
@@ -773,7 +773,6 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
 
     Widget buildBody() => Column(
       children: [
-        if (g) SizedBox(height: MediaQuery.viewPaddingOf(context).top + kToolbarHeight),
         if (_updateInfo != null)
           _UpdateBanner(
             info: _updateInfo!,
@@ -799,7 +798,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
                           isOnline:    core.isContactOnline(c.phantomId),
                           avatarBytes: _avatars[c.phantomId],
                           onTap: () => Navigator.push(context,
-                            MaterialPageRoute(builder: (_) => ChatScreen(
+                            _AppRoute(builder: (_) => ChatScreen(
                               contactName: c.displayName, contactId: c.phantomId)))
                             .then((_) => _loadData(core)),
                           onLongPress: () => _showConvMenu(context, t, core, c),
@@ -810,8 +809,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
       ],
     );
 
-    return Scaffold(
-      extendBodyBehindAppBar: g,
+    final scaffold = Scaffold(
       backgroundColor: g ? Colors.transparent : t.bgBase,
       appBar: AppBar(
         backgroundColor: g ? Colors.transparent : t.bgSurface,
@@ -846,7 +844,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
             icon: Icon(Icons.settings_outlined,
                 color: g ? Colors.white70 : t.iconDefault, size: 20),
             onPressed: () => Navigator.push(context,
-                MaterialPageRoute(builder: (_) => const SettingsScreen()))
+                _AppRoute(builder: (_) => const SettingsScreen()))
                 .then((_) => _loadGlass(core)),
           ),
         ],
@@ -854,28 +852,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
             preferredSize: const Size.fromHeight(0.5),
             child: Divider(height: 0.5, color: t.divider)),
       ),
-      body: g
-          ? Stack(children: [
-              Positioned.fill(
-                child: bgPath != null
-                    ? _glassBgBlur
-                        ? ImageFiltered(
-                            imageFilter: ui.ImageFilter.blur(
-                              sigmaX: _glassBlur, sigmaY: _glassBlur,
-                              tileMode: TileMode.clamp),
-                            child: Image.file(File(bgPath), fit: BoxFit.cover))
-                        : Image.file(File(bgPath), fit: BoxFit.cover)
-                    : Container(color: t.bgBase),
-              ),
-              Positioned.fill(
-                child: Container(
-                  color: Color.lerp(t.bgBase, t.accentLight, 0.06)!
-                      .withValues(alpha: (0.55 - _glassOpacity).clamp(0.22, 0.72)),
-                ),
-              ),
-              buildBody(),
-            ])
-          : buildBody(),
+      body: buildBody(),
       floatingActionButton: _showArchived ? null : FloatingActionButton(
         backgroundColor: g
             ? t.bgSurface.withValues(alpha: (_glassOpacity * 2.5).clamp(0.18, 0.88))
@@ -887,10 +864,35 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
         ),
         child: Icon(Icons.edit_outlined, color: t.accentLight, size: 20),
         onPressed: () => Navigator.push(context,
-            MaterialPageRoute(builder: (_) => const AddContactScreen()))
+            _AppRoute(builder: (_) => const AddContactScreen()))
             .then((_) => _loadData(core)),
       ),
     );
+
+    if (!g) return scaffold;
+
+    return Stack(children: [
+      Positioned.fill(
+        child: RepaintBoundary(
+          child: bgPath != null
+              ? _glassBgBlur
+                  ? ImageFiltered(
+                      imageFilter: ui.ImageFilter.blur(
+                          sigmaX: _glassBlur, sigmaY: _glassBlur,
+                          tileMode: TileMode.clamp),
+                      child: Image.file(File(bgPath), fit: BoxFit.cover))
+                  : Image.file(File(bgPath), fit: BoxFit.cover)
+              : Container(color: t.bgBase),
+        ),
+      ),
+      Positioned.fill(
+        child: ColoredBox(
+          color: Color.lerp(t.bgBase, t.accentLight, 0.06)!
+              .withValues(alpha: (0.55 - _glassOpacity).clamp(0.22, 0.72)),
+        ),
+      ),
+      scaffold,
+    ]);
   }
 
   static String _formatTime(DateTime dt) {
@@ -1184,8 +1186,7 @@ class _ChatScreenState extends State<ChatScreen> {
       BuildContext context, PhantomTokens t, PhantomCore? core, Uint8List imageBytes) {
     Navigator.push(
       context,
-      MaterialPageRoute(
-        fullscreenDialog: true,
+      _AppRoute(
         builder: (_) => _ImageViewer(
           imageBytes:  imageBytes,
           tokens:      t,
@@ -1301,55 +1302,38 @@ class _ChatScreenState extends State<ChatScreen> {
           : null,
     );
 
-    Widget body;
-    if (g) {
-      body = Stack(
-        children: [
-          // Background in its own layer — RepaintBoundary lets BackdropFilter
-          // on bubbles composite against a cached layer, avoiding scroll artifacts.
-          Positioned.fill(
-            child: RepaintBoundary(
-              child: bgPath != null
-                  ? _glassBgBlur
-                      ? ImageFiltered(
-                          imageFilter: ui.ImageFilter.blur(
-                            sigmaX: _glassBlur,
-                            sigmaY: _glassBlur,
-                            tileMode: TileMode.clamp,
-                          ),
-                          child: Image.file(File(bgPath), fit: BoxFit.cover),
-                        )
-                      : Image.file(File(bgPath), fit: BoxFit.cover)
-                  : _GlassFallback(accent: t.accentLight),
-            ),
-          ),
-          // Content (offset for AppBar via extendBodyBehindAppBar)
-          Column(
-            children: [
-              SizedBox(
-                height: MediaQuery.of(context).padding.top + kToolbarHeight,
-              ),
-              Expanded(child: messageList),
-              inputBar,
-            ],
-          ),
-        ],
-      );
-    } else {
-      body = Column(
+    final scaffold = Scaffold(
+      backgroundColor: g ? Colors.transparent : t.bgBase,
+      appBar: appBar,
+      body: Column(
         children: [
           Expanded(child: messageList),
           inputBar,
         ],
-      );
-    }
-
-    return Scaffold(
-      extendBodyBehindAppBar: g,
-      backgroundColor: t.bgBase,
-      appBar: appBar,
-      body: body,
+      ),
     );
+
+    if (!g) return scaffold;
+
+    return Stack(children: [
+      Positioned.fill(
+        child: RepaintBoundary(
+          child: bgPath != null
+              ? _glassBgBlur
+                  ? ImageFiltered(
+                      imageFilter: ui.ImageFilter.blur(
+                        sigmaX: _glassBlur,
+                        sigmaY: _glassBlur,
+                        tileMode: TileMode.clamp,
+                      ),
+                      child: Image.file(File(bgPath), fit: BoxFit.cover),
+                    )
+                  : Image.file(File(bgPath), fit: BoxFit.cover)
+              : _GlassFallback(accent: t.accentLight),
+        ),
+      ),
+      scaffold,
+    ]);
   }
 
   Widget _buildMessageList(
@@ -1880,7 +1864,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     Widget buildList() => ListView(
       children: [
-        if (g) SizedBox(height: MediaQuery.viewPaddingOf(context).top + kToolbarHeight),
         if (_updateFromCheck != null)
           _UpdateBanner(
             info: _updateFromCheck!,
@@ -2243,8 +2226,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ],
       );  // closes ListView / buildList
 
-    return Scaffold(
-      extendBodyBehindAppBar: g,
+    final scaffold = Scaffold(
       backgroundColor: g ? Colors.transparent : t.bgBase,
       appBar: AppBar(
         backgroundColor: g ? Colors.transparent : t.bgSurface,
@@ -2277,31 +2259,35 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 preferredSize: const Size.fromHeight(0.5),
                 child: Divider(height: 0.5, color: t.divider)),
       ),
-      body: g
-          ? Stack(children: [
-              Positioned.fill(
-                child: bgPath != null
-                    ? _glassBgBlur
-                        ? ImageFiltered(
-                            imageFilter: ui.ImageFilter.blur(
-                              sigmaX: _glassBlur,
-                              sigmaY: _glassBlur,
-                              tileMode: TileMode.clamp,
-                            ),
-                            child: Image.file(File(bgPath), fit: BoxFit.cover))
-                        : Image.file(File(bgPath), fit: BoxFit.cover)
-                    : Container(color: t.bgBase),
-              ),
-              Positioned.fill(
-                child: Container(
-                  color: Color.lerp(t.bgBase, t.accentLight, 0.06)!
-                      .withValues(alpha: (0.55 - _glassOpacity).clamp(0.22, 0.72)),
-                ),
-              ),
-              buildList(),
-            ])
-          : buildList(),
+      body: buildList(),
     );
+
+    if (!g) return scaffold;
+
+    return Stack(children: [
+      Positioned.fill(
+        child: RepaintBoundary(
+          child: bgPath != null
+              ? _glassBgBlur
+                  ? ImageFiltered(
+                      imageFilter: ui.ImageFilter.blur(
+                        sigmaX: _glassBlur,
+                        sigmaY: _glassBlur,
+                        tileMode: TileMode.clamp,
+                      ),
+                      child: Image.file(File(bgPath), fit: BoxFit.cover))
+                  : Image.file(File(bgPath), fit: BoxFit.cover)
+              : Container(color: t.bgBase),
+        ),
+      ),
+      Positioned.fill(
+        child: ColoredBox(
+          color: Color.lerp(t.bgBase, t.accentLight, 0.06)!
+              .withValues(alpha: (0.55 - _glassOpacity).clamp(0.22, 0.72)),
+        ),
+      ),
+      scaffold,
+    ]);
   }
 
   void _showTransportSheet(BuildContext context, PhantomTokens t, PhantomCore? core) {
@@ -2778,6 +2764,23 @@ class _TransportRow extends StatelessWidget {
       ),
     );
   }
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+// Fade transition — lighter than the default slide, avoids re-painting the
+// outgoing route during the animation which reduces GPU pressure.
+
+class _AppRoute<T> extends PageRouteBuilder<T> {
+  _AppRoute({required WidgetBuilder builder})
+      : super(
+          pageBuilder: (ctx, _, __) => builder(ctx),
+          transitionsBuilder: (_, anim, __, child) => FadeTransition(
+            opacity: CurvedAnimation(parent: anim, curve: Curves.easeInOut),
+            child: child,
+          ),
+          transitionDuration: const Duration(milliseconds: 200),
+          reverseTransitionDuration: const Duration(milliseconds: 160),
+        );
 }
 
 // ── Glass helper widgets ──────────────────────────────────────────────────────
