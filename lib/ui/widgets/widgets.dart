@@ -26,6 +26,7 @@ class ChatBubble extends StatelessWidget {
   final bool glassEnabled;
   final double glassOpacity;
   final double glassBlur;
+  final ui.Image? blurredBg;
 
   const ChatBubble({
     super.key,
@@ -40,6 +41,7 @@ class ChatBubble extends StatelessWidget {
     this.glassEnabled = false,
     this.glassOpacity = 0.12,
     this.glassBlur = 10.0,
+    this.blurredBg,
   });
 
   @override
@@ -71,36 +73,62 @@ class ChatBubble extends StatelessWidget {
 
     final inner = _buildInner(t, textColor, isImage);
 
-    final Widget bubble = glassEnabled
-        ? ClipRRect(
-            borderRadius: br,
-            child: BackdropFilter(
-              filter: ui.ImageFilter.blur(
-                  sigmaX: glassBlur, sigmaY: glassBlur,
-                  tileMode: TileMode.clamp),
-              child: Container(
-                padding: pad,
-                decoration: BoxDecoration(
-                  color: (isOutgoing ? t.accentLight : t.bgSurface)
-                      .withValues(alpha: isOutgoing
-                          ? (glassOpacity + 0.06).clamp(0.08, 0.52)
-                          : (glassOpacity * 1.4).clamp(0.08, 0.50)),
-                  border: Border.all(
-                      color: Colors.white.withValues(alpha: 0.12), width: 0.5),
-                ),
-                child: inner,
+    final tintColor = (isOutgoing ? t.accentLight : t.bgSurface)
+        .withValues(alpha: isOutgoing
+            ? (glassOpacity + 0.06).clamp(0.08, 0.52)
+            : (glassOpacity * 1.4).clamp(0.08, 0.50));
+
+    final Widget bubble;
+    if (glassEnabled && blurredBg != null) {
+      // Static-parallax frosted glass: pre-blurred bg sampled at screen position.
+      // No BackdropFilter — zero scroll jank.
+      bubble = ClipRRect(
+        borderRadius: br,
+        child: Builder(builder: (ctx) {
+          final scrSize = MediaQuery.sizeOf(ctx);
+          return CustomPaint(
+            painter: _FrostedBubblePainter(
+              blurredBg: blurredBg!,
+              screenSize: scrSize,
+              tint: tintColor,
+              getBox: () => ctx.findRenderObject() as RenderBox?,
+            ),
+            child: Container(
+              padding: pad,
+              decoration: BoxDecoration(
+                border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.12), width: 0.5),
               ),
+              child: inner,
             ),
-          )
-        : Container(
-            padding: pad,
-            decoration: BoxDecoration(
-              color: bgColor,
-              border: Border.all(color: borderColor, width: 0.5),
-              borderRadius: br,
-            ),
-            child: inner,
           );
+        }),
+      );
+    } else if (glassEnabled) {
+      // Animated fallback bg (no wallpaper): semi-transparent tint, no blur.
+      bubble = ClipRRect(
+        borderRadius: br,
+        child: Container(
+          padding: pad,
+          decoration: BoxDecoration(
+            color: tintColor,
+            border: Border.all(
+                color: Colors.white.withValues(alpha: 0.12), width: 0.5),
+          ),
+          child: inner,
+        ),
+      );
+    } else {
+      bubble = Container(
+        padding: pad,
+        decoration: BoxDecoration(
+          color: bgColor,
+          border: Border.all(color: borderColor, width: 0.5),
+          borderRadius: br,
+        ),
+        child: inner,
+      );
+    }
 
     return Align(
       alignment: isOutgoing ? Alignment.centerRight : Alignment.centerLeft,
@@ -257,6 +285,62 @@ class ChatBubble extends StatelessWidget {
             height: 1.45,
             fontFamily: 'monospace'),
       );
+}
+
+// ── FrostedBubblePainter ──────────────────────────────────────────────────────
+// Samples the pre-blurred background at the bubble's current screen position so
+// each bubble shows the correct "window" into a fixed background — static
+// parallax frosted glass with zero BackdropFilter overhead.
+
+class _FrostedBubblePainter extends CustomPainter {
+  final ui.Image blurredBg;
+  final Size screenSize;
+  final Color tint;
+  final RenderBox? Function() getBox;
+
+  _FrostedBubblePainter({
+    required this.blurredBg,
+    required this.screenSize,
+    required this.tint,
+    required this.getBox,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final box = getBox();
+    if (box == null || !box.hasSize) return;
+
+    final imgW = blurredBg.width.toDouble();
+    final imgH = blurredBg.height.toDouble();
+    final scrW = screenSize.width;
+    final scrH = screenSize.height;
+
+    // BoxFit.cover: choose the scale that fills the screen on both axes.
+    final scale = imgW / scrW > imgH / scrH ? scrH / imgH : scrW / imgW;
+    final ox = (scrW - imgW * scale) / 2; // horizontal letterbox offset
+    final oy = (scrH - imgH * scale) / 2; // vertical letterbox offset
+
+    // Bubble's top-left in screen (logical) coordinates.
+    final gp = box.localToGlobal(Offset.zero);
+
+    // Map bubble rect → source rect inside the blurred image.
+    final src = Rect.fromLTWH(
+      (gp.dx - ox) / scale,
+      (gp.dy - oy) / scale,
+      size.width / scale,
+      size.height / scale,
+    );
+    final dst = Rect.fromLTWH(0, 0, size.width, size.height);
+
+    canvas.drawImageRect(blurredBg, src, dst, Paint());
+    canvas.drawRect(dst, Paint()..color = tint);
+  }
+
+  @override
+  bool shouldRepaint(_FrostedBubblePainter old) =>
+      old.blurredBg != blurredBg ||
+      old.tint != tint ||
+      old.screenSize != screenSize;
 }
 
 // ── AudioPlayerBubble ─────────────────────────────────────────────────────────

@@ -1043,7 +1043,8 @@ class _ChatScreenState extends State<ChatScreen> {
   StreamSubscription<StoredMessage>? _sub;
   StreamSubscription<String>? _presenceSub;
   StoredMessage? _replyTo;
-  String? _wallpaperPath;
+  String?   _wallpaperPath;
+  ui.Image? _blurredBg;
   PhantomCore? _core; // cached — safe to use in dispose()
 
   // Glass effect state
@@ -1076,7 +1077,10 @@ class _ChatScreenState extends State<ChatScreen> {
               ?? await core.storage.getWallpaper(null);
     if (path != null && mounted) {
       final f = File(path);
-      if (await f.exists()) setState(() => _wallpaperPath = path);
+      if (await f.exists()) {
+        setState(() => _wallpaperPath = path);
+        _refreshBlurredBg();
+      }
     }
   }
 
@@ -1092,6 +1096,45 @@ class _ChatScreenState extends State<ChatScreen> {
       _glassBlur    = blur;
       _glassBgBlur  = bgBlur;
     });
+    _refreshBlurredBg();
+  }
+
+  Future<void> _refreshBlurredBg() async {
+    final path = _wallpaperPath;
+    if (!_glassEnabled || path == null) return;
+    final sigma = _glassBlur;
+    try {
+      final bytes = await File(path).readAsBytes();
+      // Decode at reduced size — heavy blur makes full resolution unnecessary.
+      final codec = await ui.instantiateImageCodec(bytes, targetWidth: 720);
+      final frame = await codec.getNextFrame();
+      final src   = frame.image;
+      final w = src.width;
+      final h = src.height;
+
+      final recorder = ui.PictureRecorder();
+      final canvas   = Canvas(recorder,
+          Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()));
+      canvas.saveLayer(
+        Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()),
+        Paint()
+          ..imageFilter = ui.ImageFilter.blur(
+              sigmaX: sigma, sigmaY: sigma, tileMode: TileMode.clamp),
+      );
+      canvas.drawImage(src, Offset.zero, Paint());
+      canvas.restore();
+      src.dispose();
+
+      final picture = recorder.endRecording();
+      final img     = await picture.toImage(w, h);
+      picture.dispose();
+
+      if (!mounted) { img.dispose(); return; }
+      _blurredBg?.dispose();
+      setState(() => _blurredBg = img);
+    } catch (_) {
+      // Wallpaper unreadable — stay with semi-transparent fallback.
+    }
   }
 
   Future<void> _loadMessages(PhantomCore core) async {
@@ -1213,6 +1256,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _sub?.cancel();
     _presenceSub?.cancel();
     _scrollCtrl.dispose();
+    _blurredBg?.dispose();
     super.dispose();
   }
 
@@ -1384,6 +1428,7 @@ class _ChatScreenState extends State<ChatScreen> {
               glassEnabled: _glassEnabled,
               glassOpacity: _glassOpacity,
               glassBlur:    _glassBlur,
+              blurredBg:    _blurredBg,
             ),
           ),
         );
