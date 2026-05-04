@@ -24,6 +24,8 @@
     <!-- Foreground service — mantener BLE activo en background -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
+    <!-- Foreground service — IPFS daemon (data sync over network) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
 
     <!-- APK self-update installer -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
@@ -57,7 +59,8 @@
         android:fullBackupContent="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:networkSecurityConfig="@xml/network_security_config"
-        android:usesCleartextTraffic="false">
+        android:usesCleartextTraffic="false"
+        android:extractNativeLibs="true">
 
         <activity
             android:name=".MainActivity"
@@ -85,6 +88,12 @@
         <meta-data
             android:name="io.flutter.embedding.android.EnableImpeller"
             android:value="true" />
+
+        <!-- IPFS daemon — survives app backgrounding via a foreground service -->
+        <service
+            android:name=".IpfsForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"/>
 
         <!-- FileProvider for APK installation -->
         <provider

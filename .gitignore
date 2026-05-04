@@ -64,3 +64,8 @@ build_release.sh
 
 # Backup files
 *.bak
+
+# Kubo (go-ipfs) binaries — large, downloaded by scripts/download_kubo.sh
+android/app/src/main/jniLibs/arm64-v8a/libkubo.so
+android/app/src/main/jniLibs/armeabi-v7a/libkubo.so
+android/app/src/main/jniLibs/x86_64/libkubo.so

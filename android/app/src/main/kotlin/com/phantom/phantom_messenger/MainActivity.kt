@@ -1,9 +1,11 @@
 package com.phantom.phantom_messenger
 
 import android.app.WallpaperManager
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
+import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
@@ -49,6 +51,41 @@ class MainActivity : FlutterActivity() {
                     } catch (_: Exception) {
                         result.success(null)
                     }
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        // ── IPFS daemon channel ───────────────────────────────────────────────
+        MethodChannel(
+            flutterEngine!!.dartExecutor.binaryMessenger,
+            "phantom/ipfs_daemon",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getNativeLibDir" -> {
+                    result.success(applicationContext.applicationInfo.nativeLibraryDir)
+                }
+                "startService" -> {
+                    try {
+                        val args       = call.arguments as Map<*, *>
+                        val binaryPath = args["binaryPath"] as String
+                        val repoPath   = args["repoPath"]   as String
+                        val intent     = IpfsForegroundService.startIntent(
+                            applicationContext, binaryPath, repoPath,
+                        )
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("IPFS_START_FAILED", e.message, null)
+                    }
+                }
+                "stopService" -> {
+                    startService(IpfsForegroundService.stopIntent(applicationContext))
+                    result.success(null)
                 }
                 else -> result.notImplemented()
             }

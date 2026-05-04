@@ -1,8 +1,10 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
 import 'core/phantom_core.dart';
+import 'core/ipfs_daemon.dart';
 import 'core/notification_service.dart';
 import 'core_provider.dart';
 import 'ui/theme/phantom_theme.dart';
@@ -47,6 +49,12 @@ class _PhantomAppState extends State<PhantomApp> {
     final persisted = await ThemeController.load();
     persisted.addListener(() { if (mounted) setState(() {}); });
     if (mounted) setState(() => _themeCtrl = persisted);
+    // Start the bundled IPFS daemon early so it is ready by the time the
+    // transport layer initialises. Fire-and-forget: failures are logged
+    // internally and the transport falls back to BLE automatically.
+    if (Platform.isAndroid) {
+      IpfsDaemon.instance.ensure().catchError((_) {});
+    }
     await _tryRestoreAccount();
   }
 
