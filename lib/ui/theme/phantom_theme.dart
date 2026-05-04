@@ -84,52 +84,55 @@ class PhantomTokens {
   factory PhantomTokens.dark(PhantomAccent accent, {double intensity = 1.0}) {
     final al = _scaled(accent.light, intensity, isDark: true);
     final ad = _scaled(accent.dark,  intensity, isDark: true);
+    // Tint every surface slightly toward the accent colour at high intensity.
+    final s = intensity * 0.055;
     return PhantomTokens(
-      bgBase:          const Color(0xFF0A0A0A),
-      bgSurface:       const Color(0xFF141414),
-      bgSubtle:        const Color(0xFF1E1E1E),
-      textPrimary:     const Color(0xFFF0F0F0),
-      textSecondary:   const Color(0xFF888888),
-      textDisabled:    const Color(0xFF444444),
-      accentLight:     al,
-      accentDark:      ad,
-      bubbleOut:       al.withValues(alpha: 0.10 + 0.20 * intensity),
-      bubbleOutText:   al,
-      bubbleIn:        const Color(0xFF1E1E1E),
-      bubbleInText:    const Color(0xFFE0E0E0),
-      divider:         const Color(0xFF222222),
-      inputBorder:     const Color(0xFF2A2A2A),
-      iconDefault:     const Color(0xFF8A8A8A),
-      iconActive:      al,
-      radiusBubble:    14,
-      radiusCard:      12,
-      radiusInput:     10,
+      bgBase:        Color.lerp(const Color(0xFF0A0A0A), al, s * 0.7)!,
+      bgSurface:     Color.lerp(const Color(0xFF141414), al, s)!,
+      bgSubtle:      Color.lerp(const Color(0xFF1E1E1E), al, s * 1.4)!,
+      textPrimary:   const Color(0xFFF0F0F0),
+      textSecondary: const Color(0xFF888888),
+      textDisabled:  const Color(0xFF444444),
+      accentLight:   al,
+      accentDark:    ad,
+      bubbleOut:     al.withValues(alpha: 0.10 + 0.20 * intensity),
+      bubbleOutText: al,
+      bubbleIn:      Color.lerp(const Color(0xFF1E1E1E), al, s * 1.2)!,
+      bubbleInText:  const Color(0xFFE0E0E0),
+      divider:       Color.lerp(const Color(0xFF222222), al, s * 1.8)!,
+      inputBorder:   Color.lerp(const Color(0xFF2A2A2A), al, s * 1.8)!,
+      iconDefault:   const Color(0xFF8A8A8A),
+      iconActive:    al,
+      radiusBubble:  14,
+      radiusCard:    12,
+      radiusInput:   10,
     );
   }
 
   factory PhantomTokens.light(PhantomAccent accent, {double intensity = 1.0}) {
     final al = _scaled(accent.dark,  intensity, isDark: false);
     final ad = _scaled(accent.light, intensity, isDark: false);
+    final s  = intensity * 0.045;
     return PhantomTokens(
-      bgBase:          const Color(0xFFFAFAFA),
-      bgSurface:       const Color(0xFFFFFFFF),
-      bgSubtle:        const Color(0xFFF0F0F0),
-      textPrimary:     const Color(0xFF0A0A0A),
-      textSecondary:   const Color(0xFF666666),
-      textDisabled:    const Color(0xFFBBBBBB),
-      accentLight:     al,
-      accentDark:      ad,
-      bubbleOut:       al.withValues(alpha: 0.10 + 0.18 * intensity),
-      bubbleOutText:   al,
-      bubbleIn:        const Color(0xFFEEEEEE),
-      bubbleInText:    const Color(0xFF1A1A1A),
-      divider:         const Color(0xFFE8E8E8),
-      inputBorder:     const Color(0xFFDDDDDD),
-      iconDefault:     const Color(0xFF777777),
-      iconActive:      al,
-      radiusBubble:    14,
-      radiusCard:      12,
-      radiusInput:     10,
+      bgBase:        Color.lerp(const Color(0xFFFAFAFA), al, s * 0.5)!,
+      bgSurface:     Color.lerp(const Color(0xFFFFFFFF), al, s * 0.7)!,
+      bgSubtle:      Color.lerp(const Color(0xFFF0F0F0), al, s)!,
+      textPrimary:   const Color(0xFF0A0A0A),
+      textSecondary: const Color(0xFF666666),
+      textDisabled:  const Color(0xFFBBBBBB),
+      accentLight:   al,
+      accentDark:    ad,
+      bubbleOut:     al.withValues(alpha: 0.10 + 0.18 * intensity),
+      bubbleOutText: al,
+      bubbleIn:      Color.lerp(const Color(0xFFEEEEEE), al, s * 0.8)!,
+      bubbleInText:  const Color(0xFF1A1A1A),
+      divider:       Color.lerp(const Color(0xFFE8E8E8), al, s * 1.5)!,
+      inputBorder:   Color.lerp(const Color(0xFFDDDDDD), al, s * 1.5)!,
+      iconDefault:   const Color(0xFF777777),
+      iconActive:    al,
+      radiusBubble:  14,
+      radiusCard:    12,
+      radiusInput:   10,
     );
   }
 

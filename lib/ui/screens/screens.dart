@@ -641,6 +641,13 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
   UpdateInfo? _updateInfo;
   bool _updateChecked = false;
 
+  // Glass effect state (shared global settings)
+  bool    _glassEnabled = false;
+  double  _glassOpacity = 0.12;
+  bool    _glassBgBlur  = false;
+  double  _glassBlur    = 10.0;
+  String? _deviceWallpaperPath;
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
@@ -649,6 +656,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
       _msgSub = core.incomingMessages.listen((_) => _loadData(core));
       _presenceSub = core.presenceChanges.listen((_) { if (mounted) setState(() {}); });
       _loadData(core);
+      _loadGlass(core);
     }
     if (!_updateChecked) {
       _updateChecked = true;
@@ -656,6 +664,23 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
         if (info != null && mounted) { setState(() => _updateInfo = info); }
       });
     }
+  }
+
+  Future<void> _loadGlass(PhantomCore core) async {
+    final enabled = await core.storage.getGlassEnabled();
+    final opacity = await core.storage.getGlassOpacity();
+    final bgBlur  = await core.storage.getGlassBgBlur();
+    final blur    = await core.storage.getGlassBlur();
+    String? wp;
+    if (enabled) wp = await DeviceWallpaperService.getWallpaperPath();
+    if (!mounted) return;
+    setState(() {
+      _glassEnabled = enabled;
+      _glassOpacity = opacity;
+      _glassBgBlur  = bgBlur;
+      _glassBlur    = blur;
+      _deviceWallpaperPath = wp;
+    });
   }
 
   Future<void> _loadData(PhantomCore core) async {
@@ -742,10 +767,55 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
 
     final visible = _visible;
 
+    final g      = _glassEnabled;
+    final bgPath = g ? _deviceWallpaperPath : null;
+
+    Widget buildBody() => Column(
+      children: [
+        if (g) SizedBox(height: MediaQuery.of(context).padding.top + kToolbarHeight),
+        if (_updateInfo != null)
+          _UpdateBanner(
+            info: _updateInfo!,
+            tokens: t,
+            onDismiss: () => setState(() => _updateInfo = null),
+          ),
+        Expanded(
+          child: _contacts == null
+              ? Center(child: CircularProgressIndicator(color: t.accentLight, strokeWidth: 1))
+              : visible.isEmpty
+                  ? _EmptyContacts(tokens: t, archived: _showArchived)
+                  : ListView.builder(
+                      itemCount: visible.length,
+                      itemBuilder: (context, i) {
+                        final c    = visible[i];
+                        final last = _lastMessages[c.phantomId];
+                        return ConversationTile(
+                          displayName: c.displayName,
+                          phantomId:   c.phantomId,
+                          lastMessage: last?.type == MessageType.text ? last?.textContent : null,
+                          timeLabel:   last != null ? _formatTime(last.timestamp) : null,
+                          unreadCount: 0,
+                          isOnline:    core.isContactOnline(c.phantomId),
+                          avatarBytes: _avatars[c.phantomId],
+                          onTap: () => Navigator.push(context,
+                            MaterialPageRoute(builder: (_) => ChatScreen(
+                              contactName: c.displayName, contactId: c.phantomId)))
+                            .then((_) => _loadData(core)),
+                          onLongPress: () => _showConvMenu(context, t, core, c),
+                        );
+                      },
+                    ),
+        ),
+      ],
+    );
+
     return Scaffold(
-      backgroundColor: t.bgBase,
+      extendBodyBehindAppBar: g,
+      backgroundColor: g ? Colors.transparent : t.bgBase,
       appBar: AppBar(
-        backgroundColor: t.bgSurface,
+        backgroundColor: g
+            ? t.bgSurface.withValues(alpha: (_glassOpacity * 2.2).clamp(0.12, 0.88))
+            : t.bgSurface,
         elevation: 0,
         title: Text(
           _showArchived ? 'archived' : 'phantom',
@@ -756,56 +826,48 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
           if (_hasArchived || _showArchived)
             IconButton(
               icon: Icon(_showArchived ? Icons.inbox_outlined : Icons.archive_outlined,
-                  color: t.iconDefault, size: 20),
+                  color: g ? Colors.white70 : t.iconDefault, size: 20),
               tooltip: _showArchived ? 'back' : 'archived',
               onPressed: () => setState(() => _showArchived = !_showArchived),
             ),
           IconButton(
-            icon: Icon(Icons.settings_outlined, color: t.iconDefault, size: 20),
-            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen())),
+            icon: Icon(Icons.settings_outlined,
+                color: g ? Colors.white70 : t.iconDefault, size: 20),
+            onPressed: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => const SettingsScreen()))
+                .then((_) => _loadGlass(core)),
           ),
         ],
-        bottom: PreferredSize(preferredSize: const Size.fromHeight(0.5),
+        bottom: g ? null : PreferredSize(
+            preferredSize: const Size.fromHeight(0.5),
             child: Divider(height: 0.5, color: t.divider)),
       ),
-      body: Column(
-        children: [
-          if (_updateInfo != null)
-            _UpdateBanner(
-              info: _updateInfo!,
-              tokens: t,
-              onDismiss: () => setState(() => _updateInfo = null),
-            ),
-          Expanded(
-            child: _contacts == null
-                ? Center(child: CircularProgressIndicator(color: t.accentLight, strokeWidth: 1))
-                : visible.isEmpty
-                    ? _EmptyContacts(tokens: t, archived: _showArchived)
-                    : ListView.builder(
-                        itemCount: visible.length,
-                        itemBuilder: (context, i) {
-                          final c    = visible[i];
-                          final last = _lastMessages[c.phantomId];
-                          return ConversationTile(
-                            displayName: c.displayName,
-                            phantomId:   c.phantomId,
-                            lastMessage: last?.type == MessageType.text ? last?.textContent : null,
-                            timeLabel:   last != null ? _formatTime(last.timestamp) : null,
-                            unreadCount: 0,
-                            isOnline:    core.isContactOnline(c.phantomId),
-                            avatarBytes: _avatars[c.phantomId],
-                            onTap: () => Navigator.push(context,
-                              MaterialPageRoute(builder: (_) => ChatScreen(
-                                contactName: c.displayName, contactId: c.phantomId))).then((_) => _loadData(core)),
-                            onLongPress: () => _showConvMenu(context, t, core, c),
-                          );
-                        },
-                      ),
-          ),
-        ],
-      ),
+      body: g
+          ? Stack(children: [
+              Positioned.fill(
+                child: bgPath != null
+                    ? _glassBgBlur
+                        ? ImageFiltered(
+                            imageFilter: ui.ImageFilter.blur(
+                              sigmaX: _glassBlur, sigmaY: _glassBlur,
+                              tileMode: TileMode.clamp),
+                            child: Image.file(File(bgPath), fit: BoxFit.cover))
+                        : Image.file(File(bgPath), fit: BoxFit.cover)
+                    : _GlassFallback(accent: t.accentLight),
+              ),
+              Positioned.fill(
+                child: Container(
+                  color: t.bgBase.withValues(
+                      alpha: (0.55 - _glassOpacity).clamp(0.25, 0.70)),
+                ),
+              ),
+              buildBody(),
+            ])
+          : buildBody(),
       floatingActionButton: _showArchived ? null : FloatingActionButton(
-        backgroundColor: t.bgSurface,
+        backgroundColor: g
+            ? t.bgSurface.withValues(alpha: (_glassOpacity * 2.5).clamp(0.18, 0.88))
+            : t.bgSurface,
         elevation: 0,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(t.radiusCard),
@@ -813,7 +875,8 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
         ),
         child: Icon(Icons.edit_outlined, color: t.accentLight, size: 20),
         onPressed: () => Navigator.push(context,
-            MaterialPageRoute(builder: (_) => const AddContactScreen())).then((_) => _loadData(core)),
+            MaterialPageRoute(builder: (_) => const AddContactScreen()))
+            .then((_) => _loadData(core)),
       ),
     );
   }
@@ -970,9 +1033,10 @@ class _ChatScreenState extends State<ChatScreen> {
   PhantomCore? _core; // cached — safe to use in dispose()
 
   // Glass effect state
-  bool   _glassEnabled = false;
-  double _glassOpacity = 0.12;
-  double _glassBlur    = 10.0;
+  bool   _glassEnabled  = false;
+  double _glassOpacity  = 0.12;
+  double _glassBlur     = 10.0;
+  bool   _glassBgBlur   = false;
   String? _deviceWallpaperPath;
 
   @override
@@ -1004,14 +1068,16 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _loadGlass(PhantomCore core) async {
-    final enabled = await core.storage.getGlassEnabled();
-    final opacity = await core.storage.getGlassOpacity();
-    final blur    = await core.storage.getGlassBlur();
+    final enabled  = await core.storage.getGlassEnabled();
+    final opacity  = await core.storage.getGlassOpacity();
+    final blur     = await core.storage.getGlassBlur();
+    final bgBlur   = await core.storage.getGlassBgBlur();
     if (!mounted) return;
     setState(() {
       _glassEnabled = enabled;
       _glassOpacity = opacity;
       _glassBlur    = blur;
+      _glassBgBlur  = bgBlur;
     });
     if (enabled) await _fetchDeviceWallpaper();
   }
@@ -1224,18 +1290,20 @@ class _ChatScreenState extends State<ChatScreen> {
     if (g) {
       body = Stack(
         children: [
-          // Full-screen background layer — wallpaper is blurred once here so
-          // per-bubble BackdropFilter is not needed (avoids scroll artifacts).
+          // Full-screen background — optionally blurred if the user enabled
+          // "blur background" in glass settings.
           Positioned.fill(
             child: bgPath != null
-                ? ImageFiltered(
-                    imageFilter: ui.ImageFilter.blur(
-                      sigmaX: _glassBlur,
-                      sigmaY: _glassBlur,
-                      tileMode: TileMode.clamp,
-                    ),
-                    child: Image.file(File(bgPath), fit: BoxFit.cover),
-                  )
+                ? _glassBgBlur
+                    ? ImageFiltered(
+                        imageFilter: ui.ImageFilter.blur(
+                          sigmaX: _glassBlur,
+                          sigmaY: _glassBlur,
+                          tileMode: TileMode.clamp,
+                        ),
+                        child: Image.file(File(bgPath), fit: BoxFit.cover),
+                      )
+                    : Image.file(File(bgPath), fit: BoxFit.cover)
                 : _GlassFallback(accent: t.accentLight),
           ),
           // Content (offset for AppBar via extendBodyBehindAppBar)
@@ -1497,6 +1565,32 @@ class _ChatScreenState extends State<ChatScreen> {
                     core?.storage.setGlassBlur(v);
                   },
                 ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('blur background',
+                            style: TextStyle(color: t.textPrimary,
+                                fontFamily: 'monospace', fontSize: 14)),
+                        Text('apply blur to the wallpaper image',
+                            style: TextStyle(color: t.textDisabled,
+                                fontFamily: 'monospace', fontSize: 11)),
+                      ],
+                    ),
+                    Switch(
+                      value: _glassBgBlur,
+                      activeThumbColor: t.accentLight,
+                      onChanged: (val) {
+                        setS(() {});
+                        if (mounted) setState(() => _glassBgBlur = val);
+                        core?.storage.setGlassBgBlur(val);
+                      },
+                    ),
+                  ],
+                ),
               ],
             ],
           ),
@@ -1688,9 +1782,17 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   String? _contactAddress;
   String? _ownAvatarPath;
-  static const _secure = FlutterSecureStorage(
-    aOptions: AndroidOptions(),
-  );
+  static const _secure = FlutterSecureStorage(aOptions: AndroidOptions());
+
+  // Glass state
+  bool    _glassEnabled = false;
+  double  _glassOpacity = 0.12;
+  bool    _glassBgBlur  = false;
+  double  _glassBlur    = 10.0;
+  String? _deviceWallpaperPath;
+
+  // Manual update check
+  bool _checkingUpdate = false;
 
   @override
   void didChangeDependencies() {
@@ -1703,6 +1805,48 @@ class _SettingsScreenState extends State<SettingsScreen> {
       core.storage.getOwnAvatarPath().then((p) {
         if (mounted) setState(() => _ownAvatarPath = p);
       });
+      _loadGlass(core);
+    }
+  }
+
+  Future<void> _loadGlass(PhantomCore core) async {
+    final enabled = await core.storage.getGlassEnabled();
+    final opacity = await core.storage.getGlassOpacity();
+    final bgBlur  = await core.storage.getGlassBgBlur();
+    final blur    = await core.storage.getGlassBlur();
+    String? wp;
+    if (enabled) wp = await DeviceWallpaperService.getWallpaperPath();
+    if (!mounted) return;
+    setState(() {
+      _glassEnabled = enabled;
+      _glassOpacity = opacity;
+      _glassBgBlur  = bgBlur;
+      _glassBlur    = blur;
+      _deviceWallpaperPath = wp;
+    });
+  }
+
+  UpdateInfo? _updateFromCheck;
+
+  Future<void> _checkUpdate(PhantomTokens t) async {
+    if (_checkingUpdate) return;
+    setState(() => _checkingUpdate = true);
+    // Capture messenger before the async gap.
+    final messenger = ScaffoldMessenger.of(context);
+    final info = await UpdateService.checkForUpdate();
+    if (!mounted) return;
+    setState(() {
+      _checkingUpdate   = false;
+      _updateFromCheck  = info;
+    });
+    if (info == null) {
+      messenger.showSnackBar(SnackBar(
+        backgroundColor: t.bgSurface,
+        content: Text('you are on the latest version',
+            style: TextStyle(color: t.textSecondary,
+                fontFamily: 'monospace', fontSize: 13)),
+        duration: const Duration(seconds: 2),
+      ));
     }
   }
 
@@ -1713,24 +1857,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final t        = theme.tokens;
     final core     = provider.core;
 
-    return Scaffold(
-      backgroundColor: t.bgBase,
-      appBar: AppBar(
-        backgroundColor: t.bgSurface,
-        elevation: 0,
-        leading: IconButton(
-          icon: Icon(Icons.arrow_back, color: t.textSecondary, size: 20),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: Text('settings',
-            style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 16)),
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(0.5),
-          child: Divider(height: 0.5, color: t.divider),
-        ),
-      ),
-      body: ListView(
-        children: [
+    final g      = _glassEnabled;
+    final bgPath = g ? _deviceWallpaperPath : null;
+
+    Widget buildList({bool addSpacer = false}) => ListView(
+      children: [
+        if (addSpacer)
+          SizedBox(height: MediaQuery.of(context).padding.top + kToolbarHeight),
+        if (_updateFromCheck != null)
+          _UpdateBanner(
+            info: _updateFromCheck!,
+            tokens: t,
+            onDismiss: () => setState(() => _updateFromCheck = null),
+          ),
           // ── Profile ───────────────────────────────────────────
           _SectionHeader('profile', t),
           Padding(
@@ -1955,9 +2094,65 @@ class _SettingsScreenState extends State<SettingsScreen> {
               style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11, height: 1.7),
             ),
           ),
+          _SettingTile(
+            icon: _checkingUpdate
+                ? Icons.hourglass_top_outlined
+                : Icons.system_update_outlined,
+            label: _checkingUpdate ? 'checking...' : 'check for updates',
+            tokens: t,
+            onTap: () => _checkUpdate(t),
+          ),
           const SizedBox(height: 32),
         ],
+      );  // closes ListView / buildList
+
+    return Scaffold(
+      extendBodyBehindAppBar: g,
+      backgroundColor: g ? Colors.transparent : t.bgBase,
+      appBar: AppBar(
+        backgroundColor: g
+            ? t.bgSurface.withValues(alpha: (_glassOpacity * 2.2).clamp(0.12, 0.88))
+            : t.bgSurface,
+        elevation: 0,
+        leading: IconButton(
+          icon: Icon(Icons.arrow_back,
+              color: g ? Colors.white70 : t.textSecondary, size: 20),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Text('settings',
+            style: TextStyle(
+                color: g ? Colors.white.withValues(alpha: 0.9) : t.textPrimary,
+                fontFamily: 'monospace', fontSize: 16)),
+        bottom: g
+            ? null
+            : PreferredSize(
+                preferredSize: const Size.fromHeight(0.5),
+                child: Divider(height: 0.5, color: t.divider)),
       ),
+      body: g
+          ? Stack(children: [
+              Positioned.fill(
+                child: bgPath != null
+                    ? _glassBgBlur
+                        ? ImageFiltered(
+                            imageFilter: ui.ImageFilter.blur(
+                              sigmaX: _glassBlur,
+                              sigmaY: _glassBlur,
+                              tileMode: TileMode.clamp,
+                            ),
+                            child: Image.file(File(bgPath), fit: BoxFit.cover))
+                        : Image.file(File(bgPath), fit: BoxFit.cover)
+                    : _GlassFallback(accent: t.accentLight),
+              ),
+              Positioned.fill(
+                child: Container(
+                  color: t.bgBase.withValues(
+                      alpha: (0.55 - _glassOpacity).clamp(0.25, 0.70)),
+                ),
+              ),
+              buildList(addSpacer: true),
+            ])
+          : buildList(),
     );
   }
 
