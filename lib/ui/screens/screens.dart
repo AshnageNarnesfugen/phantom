@@ -1123,11 +1123,11 @@ class _ChatScreenState extends State<ChatScreen> {
       );
       canvas.drawImage(src, Offset.zero, Paint());
       canvas.restore();
-      src.dispose();
 
       final picture = recorder.endRecording();
       final img     = await picture.toImage(w, h);
       picture.dispose();
+      src.dispose();
 
       if (!mounted) { img.dispose(); return; }
       _blurredBg?.dispose();
