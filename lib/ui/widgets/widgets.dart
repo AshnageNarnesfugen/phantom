@@ -357,10 +357,13 @@ class _FrostedBubblePainter extends CustomPainter {
     canvas.drawRect(dst, Paint()..color = tint);
 
     if (noiseEnabled && noiseImage != null && noiseStrength > 0) {
-      // Cubic curve: barely perceptible at 0–30%, strong only above 80%.
+      // Cubic curve: effectively zero below 0.3, intense only above 0.85.
       final s = math.pow(noiseStrength, 3).toDouble();
       final id = Float64List(16)
         ..[0] = 1 ..[5] = 1 ..[10] = 1 ..[15] = 1;
+      // Separate blendMode from colorFilter: blendMode on saveLayer so the
+      // colorFilter fully neutralises the noise before the overlay composite.
+      canvas.saveLayer(dst, Paint()..blendMode = BlendMode.overlay);
       canvas.drawRect(
         dst,
         Paint()
@@ -370,9 +373,9 @@ class _FrostedBubblePainter extends CustomPainter {
               0, s, 0, 0, (1 - s) * 128,
               0, 0, s, 0, (1 - s) * 128,
               0, 0, 0, 1, 0,
-            ])
-          ..blendMode = BlendMode.overlay,
+            ]),
       );
+      canvas.restore();
     }
   }
 
@@ -1565,12 +1568,13 @@ class _NoisePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    // Cubic curve: imperceptible at low values, strong only at 80–100%.
-    final s = math.pow(strength, 3).toDouble();
+    final s  = math.pow(strength, 3).toDouble();
     final id = Float64List(16)
       ..[0] = 1 ..[5] = 1 ..[10] = 1 ..[15] = 1;
+    final bounds = Offset.zero & size;
+    canvas.saveLayer(bounds, Paint()..blendMode = BlendMode.overlay);
     canvas.drawRect(
-      Offset.zero & size,
+      bounds,
       Paint()
         ..shader = ui.ImageShader(noise, TileMode.repeated, TileMode.repeated, id)
         ..colorFilter = ui.ColorFilter.matrix([
@@ -1578,9 +1582,9 @@ class _NoisePainter extends CustomPainter {
             0, s, 0, 0, (1 - s) * 128,
             0, 0, s, 0, (1 - s) * 128,
             0, 0, 0, 1, 0,
-          ])
-        ..blendMode = BlendMode.overlay,
+          ]),
     );
+    canvas.restore();
   }
 
   @override
