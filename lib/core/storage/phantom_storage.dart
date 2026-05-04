@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:typed_data';
 import 'dart:convert';
 import 'package:hive/hive.dart';
@@ -257,6 +258,21 @@ class PhantomStorage {
     final key = contactId == null ? 'wallpaper_global' : 'wallpaper_$contactId';
     final box = await _openBox(_boxSettings);
     await box.delete(key);
+  }
+
+  Future<String?> getAppWallpaper() async {
+    final path = await getSetting<String>('wallpaper_app');
+    if (path == null) return null;
+    if (!await File(path).exists()) return null;
+    return path;
+  }
+
+  Future<void> setAppWallpaper(String path) => setSetting('wallpaper_app', path);
+
+  Future<void> clearAppWallpaper() async {
+    _assertInitialized();
+    final box = await _openBox(_boxSettings);
+    await box.delete('wallpaper_app');
   }
 
   // ── Avatars ───────────────────────────────────────────────────────────────────
