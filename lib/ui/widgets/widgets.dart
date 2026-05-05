@@ -682,9 +682,9 @@ class _MessageInputState extends State<MessageInput> {
                   source: ImageSource.gallery, imageQuality: 80);
               if (picked == null || widget.onSendFile == null) return;
               final bytes = await picked.readAsBytes();
-              if (!ctx.mounted) return;
+              if (!mounted) return;
               final edited = await Navigator.push<Uint8List>(
-                ctx,
+                context,
                 MaterialPageRoute(builder: (_) => PhotoEditorScreen(bytes: bytes)),
               );
               if (edited != null) widget.onSendFile!(edited, picked.name);
@@ -705,9 +705,9 @@ class _MessageInputState extends State<MessageInput> {
                   source: ImageSource.camera, imageQuality: 80);
               if (picked == null || widget.onSendFile == null) return;
               final bytes = await picked.readAsBytes();
-              if (!ctx.mounted) return;
+              if (!mounted) return;
               final edited = await Navigator.push<Uint8List>(
-                ctx,
+                context,
                 MaterialPageRoute(builder: (_) => PhotoEditorScreen(bytes: bytes)),
               );
               if (edited != null) widget.onSendFile!(edited, picked.name);
