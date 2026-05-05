@@ -10,8 +10,7 @@ import 'core_provider.dart';
 import 'ui/theme/phantom_theme.dart';
 import 'ui/screens/screens.dart';
 
-const _seedKey    = 'phantom_seed_v1';
-const _ntfyUrlKey = 'phantom_ntfy_url';
+const _seedKey = 'phantom_seed_v1';
 
 const _messagingChannel = MethodChannel('phantom/messaging');
 
@@ -77,7 +76,7 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
     persisted.addListener(() { if (mounted) setState(() {}); });
     if (mounted) setState(() => _themeCtrl = persisted);
     if (Platform.isAndroid) {
-      IpfsDaemon.instance.ensure().catchError((_) {});
+      try { await IpfsDaemon.instance.ensure(); } catch (_) {}
     }
     await _tryRestoreAccount();
   }
@@ -85,17 +84,12 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
   Future<void> _tryRestoreAccount() async {
     if (!mounted) return;
     try {
-      final seed    = await _secure.read(key: _seedKey);
-      final ntfyUrl = await _secure.read(key: _ntfyUrlKey);
+      final seed = await _secure.read(key: _seedKey);
       if (seed != null) {
-        final dir = await getApplicationDocumentsDirectory();
-        final config = (ntfyUrl != null && ntfyUrl.isNotEmpty)
-            ? TransportConfig(ntfyBaseUrl: ntfyUrl)
-            : null;
+        final dir  = await getApplicationDocumentsDirectory();
         final core = await PhantomCore.restoreAccount(
-          seedPhrase:      seed,
-          storagePath:     dir.path,
-          transportConfig: config,
+          seedPhrase:  seed,
+          storagePath: dir.path,
         );
         if (mounted) setState(() => _core = core);
         NotificationService.requestPermission();
@@ -113,23 +107,12 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
     NotificationService.requestPermission();
   }
 
-  /// Saves a new ntfy URL, disposes the current core, and reinitialises.
-  /// Pass null or empty string to revert to the default https://ntfy.sh.
-  Future<void> _restartCore(String? ntfyUrl) async {
-    final url = (ntfyUrl?.trim().isNotEmpty == true) ? ntfyUrl!.trim() : null;
-    await _secure.write(key: _ntfyUrlKey, value: url ?? '');
-    await _core?.dispose();
-    if (mounted) setState(() { _core = null; _loading = true; });
-    await _tryRestoreAccount();
-  }
-
   @override
   Widget build(BuildContext context) {
     return CoreProvider(
-      core:            _core,
-      themeCtrl:       _themeCtrl,
-      onAccountReady:  _onAccountReady,
-      onRestartCore:   _restartCore,
+      core:           _core,
+      themeCtrl:      _themeCtrl,
+      onAccountReady: _onAccountReady,
       child: PhantomTheme(
         tokens:    _themeCtrl.tokens,
         accent:    _themeCtrl.accent,

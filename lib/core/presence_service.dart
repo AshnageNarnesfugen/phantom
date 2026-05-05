@@ -1,45 +1,37 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
-/// Lightweight presence layer using ntfy.sh as a ping bus.
+/// Lightweight presence layer using the bundled IPFS daemon as a pubsub bus.
 ///
 /// Each user publishes a heartbeat to their own presence topic whenever the
-/// app is active. Contacts' topics are subscribed via SSE so we learn
+/// app is active. Contacts' topics are subscribed via IPFS pubsub so we learn
 /// immediately when they come online. "Online" means a heartbeat was seen
 /// within [_threshold].
 ///
-/// Rate budget (ntfy free tier = 250 publishes/day per IP):
-///   heartbeat every 15 min → 96/day for heartbeats,
-///   leaving ~150/day for actual messages.
+/// No rate limits — entirely P2P, no central relay.
 class PresenceService {
-  static const _defaultBase = 'https://ntfy.sh';
-  // Heartbeat every 15 min → 96 publishes/day — well within ntfy's free-tier
-  // limit of 250/day per IP, leaving ~154 slots/day for actual messages.
-  // Threshold 22 min allows one missed heartbeat before marking offline.
+  static const _defaultApiUrl = 'http://127.0.0.1:5001';
   static const _interval  = Duration(minutes: 15);
   static const _threshold = Duration(minutes: 22);
 
   final String _myId;
-  final String _base;
+  final String _apiUrl;
   final http.Client _client = http.Client();
 
-  final Map<String, DateTime>   _lastSeen    = {};
-  final Set<String>             _subscribed  = {};
+  final Map<String, DateTime> _lastSeen   = {};
+  final Set<String>           _subscribed = {};
   final _changesCtrl = StreamController<String>.broadcast();
 
   Timer? _heartbeatTimer;
   bool _disposed = false;
 
-  /// True while ntfy is rejecting our heartbeats (rate-limited).
-  bool _rateLimited = false;
-  bool get isRateLimited => _rateLimited;
-
   /// Emits a contactId whenever that contact's online status changes.
   Stream<String> get changes => _changesCtrl.stream;
 
-  PresenceService(this._myId, {String? ntfyBase})
-      : _base = ntfyBase ?? _defaultBase;
+  PresenceService(this._myId, {String? ipfsApiUrl})
+      : _apiUrl = ipfsApiUrl ?? _defaultApiUrl;
 
   Future<void> start(List<String> contactIds) async {
     await _publishHeartbeat();
@@ -54,11 +46,7 @@ class PresenceService {
     return last != null && DateTime.now().difference(last) < _threshold;
   }
 
-  /// Publishes an offline marker and clears our own last-seen so we won't
-  /// be shown as online after the app goes to background / is closed.
   Future<void> goOffline() => _publishHeartbeat(online: false);
-
-  /// Immediately publishes a heartbeat so contacts see us as online on resume.
   Future<void> publishOnline() => _publishHeartbeat(online: true);
 
   // ── Internal ────────────────────────────────────────────────────────────────
@@ -80,7 +68,6 @@ class PresenceService {
           _lastSeen[contactId] = event.at;
           if (!wasOnline) _changesCtrl.add(contactId);
         } else {
-          // Explicit offline marker — clear immediately.
           final hadSeen = _lastSeen.remove(contactId) != null;
           if (wasOnline || hadSeen) _changesCtrl.add(contactId);
         }
@@ -91,32 +78,28 @@ class PresenceService {
 
   Stream<_PresenceEvent> _presenceStream(String contactId) async* {
     final topic = _topic(contactId);
-    int since = DateTime.now().millisecondsSinceEpoch ~/ 1000 - _threshold.inSeconds;
+    final uri = Uri.parse(
+        '$_apiUrl/api/v0/pubsub/sub?arg=${Uri.encodeComponent(topic)}');
 
     while (!_disposed) {
       try {
-        final uri = Uri.parse('$_base/$topic/json?since=$since');
-        final streamed = await _client.send(http.Request('GET', uri));
+        final request = http.Request('POST', uri);
+        final response = await _client.send(request);
 
-        await for (final line in streamed.stream
+        await for (final line in response.stream
             .transform(utf8.decoder)
             .transform(const LineSplitter())) {
           if (_disposed) return;
           if (line.trim().isEmpty) continue;
           try {
             final ev = jsonDecode(line) as Map<String, dynamic>;
-            if (ev['event'] != 'message') continue;
-            final at = (ev['time'] as num?)?.toInt() ?? 0;
-            if (at > since) since = at;
-            final body = (ev['message'] as String?)?.trim() ?? '1';
-            yield _PresenceEvent(
-              at: DateTime.fromMillisecondsSinceEpoch(at * 1000),
-              online: body != '0',
-            );
+            final rawData = base64.decode(ev['data'] as String);
+            final body = utf8.decode(rawData).trim();
+            yield _PresenceEvent(at: DateTime.now(), online: body != '0');
           } catch (_) {}
         }
       } catch (_) {
-        if (!_disposed) await Future.delayed(const Duration(seconds: 30));
+        if (!_disposed) await Future.delayed(const Duration(seconds: 15));
       }
     }
   }
@@ -124,21 +107,18 @@ class PresenceService {
   Future<void> _publishHeartbeat({bool online = true}) async {
     if (_disposed) return;
     try {
-      final resp = await _client.post(
-        Uri.parse('$_base/${_topic(_myId)}'),
-        headers: {
-          'Content-Type': 'text/plain',
-          'X-TTL': online
-              ? '${_threshold.inSeconds + 120}'
-              : '${_threshold.inSeconds * 3}',
-        },
-        body: online ? '1' : '0',
+      final topic = _topic(_myId);
+      final uri = Uri.parse(
+          '$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(topic)}');
+      await _client.post(
+        uri,
+        body: Uint8List.fromList(utf8.encode(online ? '1' : '0')),
+        headers: {'Content-Type': 'application/octet-stream'},
       ).timeout(const Duration(seconds: 10));
-      _rateLimited = resp.statusCode == 429;
     } catch (_) {}
   }
 
-  static String _topic(String phantomId) => 'ph-prs-$phantomId';
+  static String _topic(String phantomId) => '/phantom/prs/v1/$phantomId';
 
   void dispose() {
     _disposed = true;

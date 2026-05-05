@@ -74,14 +74,12 @@ class TransportManager {
     String? i2pSocksHost,
     int? i2pSocksPort,
     String? yggdrasilAddress,
-    String? ntfyBaseUrl,
   }) : _transports = [
           if (yggdrasilAddress != null)
             YggdrasilTransport(address: yggdrasilAddress),
           if (i2pSocksHost != null && i2pSocksPort != null)
             I2PTransport(socksHost: i2pSocksHost, socksPort: i2pSocksPort),
           IpfsTransport(apiUrl: ipfsApiUrl ?? 'http://127.0.0.1:5001'),
-          NtfyTransport(baseUrl: ntfyBaseUrl ?? 'https://ntfy.sh'),
         ];
 
   /// Checks all transports in parallel and starts every reachable one.
@@ -107,7 +105,7 @@ class TransportManager {
 
     if (_activeTransports.isEmpty) {
       throw const TransportException(
-          'No transport available. Make sure IPFS, I2P, or Yggdrasil is running.');
+          'No transport available. Make sure the IPFS daemon is running.');
     }
   }
 
@@ -153,26 +151,28 @@ class TransportManager {
 class IpfsTransport implements PhantomTransport {
   final String _apiUrl;
   final http.Client _client = http.Client();
-  StreamSubscription? _sub;
+  bool _disposed = false;
 
   @override
   final String name = 'ipfs-pubsub';
 
   @override
-  bool get isAvailable => true; // verified in checkAvailability()
+  bool get isAvailable => true;
 
   IpfsTransport({required String apiUrl}) : _apiUrl = apiUrl;
 
   @override
   Future<bool> checkAvailability() async {
-    try {
-      final resp = await _client
-          .post(Uri.parse('$_apiUrl/api/v0/id'))
-          .timeout(const Duration(seconds: 3));
-      return resp.statusCode == 200;
-    } catch (_) {
-      return false;
+    for (var attempt = 0; attempt < 5; attempt++) {
+      try {
+        final resp = await _client
+            .post(Uri.parse('$_apiUrl/api/v0/id'))
+            .timeout(const Duration(seconds: 3));
+        if (resp.statusCode == 200) return true;
+      } catch (_) {}
+      if (attempt < 4) await Future.delayed(const Duration(seconds: 2));
     }
+    return false;
   }
 
   @override
@@ -181,7 +181,6 @@ class IpfsTransport implements PhantomTransport {
     required Uint8List encryptedEnvelope,
   }) async {
     final topic = _topicForId(recipientId);
-    // IPFS pubsub publish expects the message as a multipart form
     final uri = Uri.parse('$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(topic)}');
     final response = await _client.post(
       uri,
@@ -201,35 +200,39 @@ class IpfsTransport implements PhantomTransport {
     final uri = Uri.parse(
         '$_apiUrl/api/v0/pubsub/sub?arg=${Uri.encodeComponent(topic)}');
 
-    // IPFS pubsub sub returns NDJSON (one JSON line per message).
-    // LineSplitter correctly handles partial chunks and multi-line data.
-    final request = http.Request('POST', uri);
-    final response = await _client.send(request);
-
-    await for (final line in response.stream
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())) {
-      if (line.trim().isEmpty) continue;
+    while (!_disposed) {
       try {
-        final json = jsonDecode(line) as Map<String, dynamic>;
-        final data = base64.decode(json['data'] as String);
-        yield IncomingEnvelope(
-          data: data,
-          transportName: name,
-          receivedAt: DateTime.now(),
-        );
+        final request = http.Request('POST', uri);
+        final response = await _client.send(request);
+
+        await for (final line in response.stream
+            .transform(utf8.decoder)
+            .transform(const LineSplitter())) {
+          if (_disposed) return;
+          if (line.trim().isEmpty) continue;
+          try {
+            final json = jsonDecode(line) as Map<String, dynamic>;
+            final data = base64.decode(json['data'] as String);
+            yield IncomingEnvelope(
+              data: data,
+              transportName: name,
+              receivedAt: DateTime.now(),
+            );
+          } catch (_) {
+            continue;
+          }
+        }
       } catch (_) {
-        continue;
+        if (!_disposed) await Future.delayed(const Duration(seconds: 15));
       }
     }
   }
 
-  /// Topic IPFS = '/phantom/v1/{phantomId}'
   static String _topicForId(String phantomId) => '/phantom/v1/$phantomId';
 
   @override
   Future<void> dispose() async {
-    await _sub?.cancel();
+    _disposed = true;
     _client.close();
   }
 }
@@ -363,181 +366,3 @@ class TransportException implements Exception {
   String toString() => 'TransportException: $message';
 }
 
-// ── ntfy.sh Relay Transport ───────────────────────────────────────────────────
-
-/// Relay transport via ntfy.sh — a free, open-source pub/sub service.
-///
-/// Each recipient has a topic derived from their PhantomID. Messages are
-/// published as binary attachments (no practical size limit). ntfy retains
-/// messages for 24 hours on the shared instance; self-hosting removes that
-/// cap (see https://ntfy.sh/docs/install/).
-///
-/// Privacy model: the ntfy server sees which topics are active (timing) but
-/// cannot read payloads — they are encrypted by Phantom's Double Ratchet.
-/// Topic names are derived from PhantomIDs, so anyone with a PhantomID can
-/// observe when that user receives messages.
-class NtfyTransport implements PhantomTransport {
-  final String _baseUrl;
-  final http.Client _client = http.Client();
-
-  /// Unix timestamp of the most-recently seen ntfy event.
-  /// Passed as `since=` on reconnect to avoid missing messages during gaps.
-  int _lastSeenAt = 0;
-
-  /// Payloads at or below this size are sent as base64 text in the ntfy message
-  /// body (retained 12 h by ntfy.sh). Larger payloads use a binary PUT
-  /// attachment (retained 3 h only).
-  static const int _maxTextPayload = 2940;
-
-  /// Marker in the ntfy X-Title header that identifies a Phantom base64 message.
-  static const String _textTitle = 'ph-msg';
-
-  @override
-  final String name = 'ntfy-relay';
-
-  @override
-  bool get isAvailable => true;
-
-  NtfyTransport({String baseUrl = 'https://ntfy.sh'}) : _baseUrl = baseUrl;
-
-  @override
-  Future<bool> checkAvailability() async {
-    try {
-      final resp = await _client
-          .get(Uri.parse('$_baseUrl/v1/health'))
-          .timeout(const Duration(seconds: 5));
-      return resp.statusCode == 200;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  @override
-  Future<void> publish({
-    required String recipientId,
-    required Uint8List encryptedEnvelope,
-  }) async {
-    final topic = _topicForId(recipientId);
-    final http.Response response;
-
-    if (encryptedEnvelope.length <= _maxTextPayload) {
-      // Small payload: send as base64 text body. ntfy retains text messages for
-      // 12 h, vs only 3 h for binary attachments. The X-Title marker lets the
-      // subscriber distinguish Phantom messages from unrelated ntfy traffic.
-      response = await _client
-          .post(
-            Uri.parse('$_baseUrl/$topic'),
-            headers: {
-              'Content-Type': 'text/plain',
-              'X-Title': _textTitle,
-            },
-            body: base64.encode(encryptedEnvelope),
-          )
-          .timeout(const Duration(seconds: 15));
-    } else {
-      // Large payload (images, files): binary PUT attachment.
-      response = await _client
-          .put(
-            Uri.parse('$_baseUrl/$topic'),
-            headers: {
-              'Content-Type': 'application/octet-stream',
-              'Filename': 'msg.bin',
-            },
-            body: encryptedEnvelope,
-          )
-          .timeout(const Duration(seconds: 15));
-    }
-
-    if (response.statusCode != 200) {
-      throw TransportException(
-          'ntfy publish failed: ${response.statusCode} ${response.body}');
-    }
-  }
-
-  @override
-  Stream<IncomingEnvelope> subscribe({required String ourId}) async* {
-    final topic = _topicForId(ourId);
-
-    // On first open look back 12 h — matching ntfy's default message-cache
-    // retention — to recover messages missed while the app was closed.
-    // On reconnect, resume from the last successfully processed event.
-    if (_lastSeenAt == 0) {
-      _lastSeenAt = DateTime.now().millisecondsSinceEpoch ~/ 1000 - 43200;
-    }
-
-    while (true) {
-      try {
-        final uri = Uri.parse('$_baseUrl/$topic/json?since=$_lastSeenAt');
-        final request = http.Request('GET', uri);
-        final streamed = await _client.send(request);
-
-        final lines = streamed.stream
-            .transform(utf8.decoder)
-            .transform(const LineSplitter());
-
-        await for (final line in lines) {
-          if (line.trim().isEmpty) continue;
-          try {
-            final event = jsonDecode(line) as Map<String, dynamic>;
-            if (event['event'] == 'open') continue;
-            if (event['event'] != 'message') continue;
-
-            final at = (event['time'] as num?)?.toInt() ?? 0;
-
-            Uint8List? bytes;
-
-            if (event['title'] == _textTitle) {
-              // Base64 text body — small Phantom message.
-              final body = (event['message'] as String?)?.trim() ?? '';
-              if (body.isNotEmpty) {
-                try { bytes = base64.decode(body); } catch (_) {}
-              }
-            } else {
-              // Binary attachment — large Phantom message (image / file).
-              final attachment = event['attachment'] as Map<String, dynamic>?;
-              final attachUrl = attachment?['url'] as String?;
-              if (attachUrl != null) {
-                try {
-                  final binResp = await _client
-                      .get(Uri.parse(attachUrl))
-                      .timeout(const Duration(seconds: 10));
-                  if (binResp.statusCode == 200) bytes = binResp.bodyBytes;
-                } catch (_) {
-                  // Transient download error — do NOT advance _lastSeenAt so
-                  // this event is retried on the next reconnect.
-                  continue;
-                }
-              }
-            }
-
-            if (bytes == null) continue;
-
-            // Only advance the cursor after a successful byte extraction so
-            // that transient failures (network blip, expired attachment) are
-            // retried on the next reconnect rather than silently lost.
-            if (at > _lastSeenAt) _lastSeenAt = at;
-
-            yield IncomingEnvelope(
-              data: bytes,
-              transportName: name,
-              receivedAt: DateTime.now(),
-            );
-          } catch (_) {
-            continue;
-          }
-        }
-      } catch (_) {
-        // Pause before reconnecting on network error.
-        await Future.delayed(const Duration(seconds: 10));
-      }
-    }
-  }
-
-  /// PhantomIDs are base58-encoded (URL-safe alphanumeric) — safe as topic names.
-  static String _topicForId(String phantomId) => 'ph-$phantomId';
-
-  @override
-  Future<void> dispose() async {
-    _client.close();
-  }
-}

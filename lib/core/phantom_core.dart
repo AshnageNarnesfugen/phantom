@@ -62,10 +62,8 @@ class PhantomCore {
   bool get isTransportAvailable => _transportAvailable;
 
   PresenceService? _presence;
-  String? _ntfyBaseUrl;
-  String get ntfyBaseUrl => _ntfyBaseUrl ?? 'https://ntfy.sh';
+  String? _ipfsApiUrl;
   bool isContactOnline(String contactId) => _presence?.isOnline(contactId) ?? false;
-  bool get presenceRateLimited => _presence?.isRateLimited ?? false;
   Stream<String> get presenceChanges => _presence?.changes ?? const Stream.empty();
 
   String? _activeChatId;
@@ -102,7 +100,7 @@ class PhantomCore {
       storage:  PhantomStorage.instance,
       transport: transport,
     );
-    core._ntfyBaseUrl  = transportConfig?.ntfyBaseUrl;
+    core._ipfsApiUrl  = transportConfig?.ipfsApiUrl;
     core._transportV2 = _buildTransportV2(transport, core.myId);
 
     // Derive Kyber-768 keypair deterministically from the seed phrase.
@@ -132,7 +130,7 @@ class PhantomCore {
       storage:  PhantomStorage.instance,
       transport: transport,
     );
-    core._ntfyBaseUrl  = transportConfig?.ntfyBaseUrl;
+    core._ipfsApiUrl  = transportConfig?.ipfsApiUrl;
     core._transportV2 = _buildTransportV2(transport, core.myId);
 
     await core._initKyberKeys(seedPhrase);
@@ -143,12 +141,8 @@ class PhantomCore {
       await core._initializePreKeys();
     }
 
-    // Load all known sessions into memory BEFORE the transport starts.
-    // The ntfy subscriber fetches up to 12 h of missed messages immediately on
-    // connect; those are MSG frames that can only be decrypted if the matching
-    // RatchetSession is already in _sessions. Without this preload the loop in
-    // _handleMsgFrame iterates over an empty map and silently drops every
-    // historical message.
+    // Load all known sessions into memory BEFORE the transport starts so that
+    // any queued or in-flight MSG frames are decryptable immediately.
     await core._preloadSessions();
 
     await core._startTransport();
@@ -162,7 +156,6 @@ class PhantomCore {
       i2pSocksHost:    config?.i2pSocksHost,
       i2pSocksPort:    config?.i2pSocksPort,
       yggdrasilAddress: config?.yggdrasilAddress,
-      ntfyBaseUrl:     config?.ntfyBaseUrl,
     );
   }
 
@@ -475,8 +468,7 @@ class PhantomCore {
   // ── Session management ─────────────────────────────────────────────────────
 
   /// Loads every contact's persisted RatchetSession into [_sessions] so that
-  /// incoming MSG frames can be decrypted immediately — including the burst of
-  /// historical messages that the ntfy subscriber fetches on startup.
+  /// incoming MSG frames can be decrypted immediately on transport connect.
   Future<void> _preloadSessions() async {
     final contacts = await storage.getAllContacts();
     for (final contact in contacts) {
@@ -590,7 +582,7 @@ class PhantomCore {
 
   Future<void> _startPresence() async {
     final contacts = await storage.getAllContacts();
-    _presence = PresenceService(myId, ntfyBase: _ntfyBaseUrl);
+    _presence = PresenceService(myId, ipfsApiUrl: _ipfsApiUrl);
     await _presence!.start(contacts.map((c) => c.phantomId).toList());
   }
 
@@ -644,8 +636,9 @@ class PhantomCore {
 
     // Replay detection: compare the incoming X3DH ephemeral key against the
     // one we stored when we last processed a valid INIT from this sender.
-    // ntfy replays the last 12 h of messages on reconnect; without this check
-    // the replayed INIT would overwrite the current ratchet with a stale one.
+    // A transport may re-deliver an INIT frame (e.g. IPFS re-subscribe after
+    // daemon restart); without this check the replayed INIT would overwrite
+    // the current ratchet with a stale one.
     //
     // A re-INIT after clear-history produces a brand-new ephemeral key, so it
     // passes this guard and correctly replaces the old session.
@@ -654,7 +647,7 @@ class PhantomCore {
         .join();
     final storedEkHex = await storage.getLastInitEkHex(senderPhantomId);
 
-    // Known EK → confirmed ntfy replay. Use existing session.
+    // Known EK → confirmed replay. Use existing session.
     if (storedEkHex != null && storedEkHex == incomingEkHex) {
       await _handleMsgFrame(frame);
       return;
@@ -975,22 +968,13 @@ class TransportConfig {
   final String? i2pSocksHost;
   final int?    i2pSocksPort;
   final String? yggdrasilAddress;
-  final String? ntfyBaseUrl;
 
   const TransportConfig({
     this.ipfsApiUrl,
     this.i2pSocksHost,
     this.i2pSocksPort,
     this.yggdrasilAddress,
-    this.ntfyBaseUrl,
   });
-
-  const TransportConfig.ipfsOnly({String? apiUrl})
-      : ipfsApiUrl = apiUrl ?? 'http://127.0.0.1:5001',
-        i2pSocksHost = null,
-        i2pSocksPort = null,
-        yggdrasilAddress = null,
-        ntfyBaseUrl = null;
 }
 
 class PhantomCoreException implements Exception {
