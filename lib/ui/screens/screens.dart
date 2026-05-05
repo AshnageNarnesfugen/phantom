@@ -3552,12 +3552,33 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
     super.dispose();
   }
 
+  // ── Multibase helpers (Kubo >= 0.11 requires encoded pubsub topic args) ──
+
+  static String _encodeTopic(String topic) {
+    final bytes = utf8.encode(topic);
+    return 'u${base64Url.encode(bytes).replaceAll('=', '')}';
+  }
+
+  static String _decodeTopic(String encoded) {
+    try {
+      if (encoded.startsWith('u')) {
+        return utf8.decode(base64Url.decode(
+            base64Url.normalize(encoded.substring(1))));
+      }
+      if (encoded.startsWith('m')) {
+        return utf8.decode(base64.decode(encoded.substring(1)));
+      }
+    } catch (_) {}
+    return encoded;
+  }
+
   // ── HTTP helpers ──────────────────────────────────────────────────────────
 
-  Future<Map<String, dynamic>?> _post(String path, {String? arg}) async {
+  Future<Map<String, dynamic>?> _post(String path, {String? arg, bool encodeTopic = false}) async {
     try {
-      final uri = arg != null
-          ? Uri.parse('$_apiBase$path?arg=${Uri.encodeComponent(arg)}')
+      final encodedArg = (arg != null && encodeTopic) ? _encodeTopic(arg) : arg;
+      final uri = encodedArg != null
+          ? Uri.parse('$_apiBase$path?arg=${Uri.encodeComponent(encodedArg)}')
           : Uri.parse('$_apiBase$path');
       final resp = await _client.post(uri).timeout(const Duration(seconds: 5));
       if (resp.statusCode != 200) return null;
@@ -3610,7 +3631,8 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
     TransportDebugger.instance.log('DBG: GET /pubsub/ls');
     final r = await _post('/pubsub/ls');
     if (!mounted) return;
-    final topics = (r?['Strings'] as List?)?.cast<String>() ?? [];
+    final raw    = (r?['Strings'] as List?)?.cast<String>() ?? [];
+    final topics = raw.map(_decodeTopic).toList();
     setState(() => _topics = topics);
     TransportDebugger.instance.log('DBG: subscribed topics (${topics.length}):');
     for (final t in topics) {
@@ -3630,8 +3652,8 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
       final msgTopic = '/phantom/v1/${c.phantomId}';
       final prsTopic = '/phantom/prs/v1/${c.phantomId}';
       TransportDebugger.instance.log('DBG: checking peers for ${c.displayName} (${c.phantomId.substring(0, 8)}…)');
-      final msgR = await _post('/pubsub/peers', arg: msgTopic);
-      final prsR = await _post('/pubsub/peers', arg: prsTopic);
+      final msgR = await _post('/pubsub/peers', arg: msgTopic, encodeTopic: true);
+      final prsR = await _post('/pubsub/peers', arg: prsTopic, encodeTopic: true);
       final msgPeers = (msgR?['Strings'] as List?)?.length ?? 0;
       final prsPeers = (prsR?['Strings'] as List?)?.length ?? 0;
       TransportDebugger.instance.log(
@@ -3647,7 +3669,7 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
     TransportDebugger.instance.log('DBG: force-ping ${contact.displayName} on $topic');
     try {
       final uri = Uri.parse(
-          '$_apiBase/pubsub/pub?arg=${Uri.encodeComponent(topic)}');
+          '$_apiBase/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
       final resp = await _client.post(
         uri,
         body: Uint8List.fromList([0xDE, 0xAD]),
@@ -3673,7 +3695,7 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
     if (core == null) return;
     final myTopic = '/phantom/v1/${core.myId}';
     TransportDebugger.instance.log('DBG: checking MY own subscription on $myTopic');
-    final r = await _post('/pubsub/peers', arg: myTopic);
+    final r = await _post('/pubsub/peers', arg: myTopic, encodeTopic: true);
     final peers = (r?['Strings'] as List?)?.cast<String>() ?? [];
     TransportDebugger.instance.log('DBG: peers on MY msg topic: ${peers.length}');
     for (final p in peers) {

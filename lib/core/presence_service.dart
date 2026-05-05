@@ -88,7 +88,7 @@ class PresenceService {
   Stream<_PresenceEvent> _presenceStream(String contactId) async* {
     final topic = _topic(contactId);
     final uri = Uri.parse(
-        '$_apiUrl/api/v0/pubsub/sub?arg=${Uri.encodeComponent(topic)}');
+        '$_apiUrl/api/v0/pubsub/sub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
 
     while (!_disposed) {
       try {
@@ -110,7 +110,17 @@ class PresenceService {
             final ev      = jsonDecode(line) as Map<String, dynamic>;
             final rawData = ev['data'];
             if (rawData == null) continue;
-            final body = utf8.decode(base64.decode(rawData as String)).trim();
+            // Decode multibase payload (Kubo >= 0.11 uses prefix 'm'/'u').
+            final Uint8List bytes;
+            if ((rawData as String).startsWith('m')) {
+              bytes = base64.decode(rawData.substring(1));
+            } else if (rawData.startsWith('u')) {
+              bytes = base64Url.decode(
+                  base64Url.normalize(rawData.substring(1)));
+            } else {
+              bytes = base64.decode(rawData);
+            }
+            final body = utf8.decode(bytes).trim();
             yield _PresenceEvent(at: DateTime.now(), online: body != '0');
           } catch (_) {}
         }
@@ -126,7 +136,7 @@ class PresenceService {
     try {
       final topic = _topic(_myId);
       final uri = Uri.parse(
-          '$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(topic)}');
+          '$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
       await _client.post(
         uri,
         body: Uint8List.fromList(utf8.encode(online ? '1' : '0')),
@@ -136,6 +146,12 @@ class PresenceService {
   }
 
   static String _topic(String phantomId) => '/phantom/prs/v1/$phantomId';
+
+  /// Kubo >= 0.11 requires pubsub args to be multibase-encoded (prefix 'u' = base64url).
+  static String _encodeTopic(String topic) {
+    final bytes = utf8.encode(topic);
+    return 'u${base64Url.encode(bytes).replaceAll('=', '')}';
+  }
 
   void dispose() {
     _disposed = true;

@@ -243,7 +243,7 @@ class IpfsTransport implements PhantomTransport {
       throw const TransportException('No IPFS pubsub peers on recipient topic');
     }
 
-    final uri = Uri.parse('$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(topic)}');
+    final uri = Uri.parse('$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
     final response = await _client.post(
       uri,
       body: encryptedEnvelope,
@@ -261,7 +261,7 @@ class IpfsTransport implements PhantomTransport {
   Future<bool> _checkTopicPeers(String topic) async {
     try {
       final uri = Uri.parse(
-          '$_apiUrl/api/v0/pubsub/peers?arg=${Uri.encodeComponent(topic)}');
+          '$_apiUrl/api/v0/pubsub/peers?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
       final resp = await _client
           .post(uri)
           .timeout(const Duration(seconds: 3));
@@ -279,7 +279,7 @@ class IpfsTransport implements PhantomTransport {
     final dbg   = TransportDebugger.instance;
     final topic = _topicForId(ourId);
     final uri   = Uri.parse(
-        '$_apiUrl/api/v0/pubsub/sub?arg=${Uri.encodeComponent(topic)}');
+        '$_apiUrl/api/v0/pubsub/sub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
 
     while (!_disposed) {
       dbg.log('IPFS: subscribing to ${topic.substring(topic.lastIndexOf('/') + 1)}…');
@@ -306,7 +306,7 @@ class IpfsTransport implements PhantomTransport {
             final json = jsonDecode(line) as Map<String, dynamic>;
             final rawData = json['data'];
             if (rawData == null) continue;
-            final data = base64.decode(rawData as String);
+            final data = _decodeData(rawData as String);
             dbg.log('IPFS: ← received ${data.length} bytes on ${ourId.substring(0, 8)}');
             yield IncomingEnvelope(
               data: data,
@@ -328,6 +328,26 @@ class IpfsTransport implements PhantomTransport {
   }
 
   static String _topicForId(String phantomId) => '/phantom/v1/$phantomId';
+
+  /// Kubo >= 0.11 requires pubsub topic args to be multibase-encoded.
+  /// We use base64url without padding (multibase prefix 'u').
+  static String _encodeTopic(String topic) {
+    final bytes = utf8.encode(topic);
+    return 'u${base64Url.encode(bytes).replaceAll('=', '')}';
+  }
+
+  /// Decodes a multibase-encoded payload from a pubsub response.
+  /// Kubo >= 0.11 encodes data with a multibase prefix ('m'=base64, 'u'=base64url).
+  /// Falls back to plain base64 for compatibility with older daemons.
+  static Uint8List _decodeData(String raw) {
+    if (raw.startsWith('m')) return base64.decode(raw.substring(1));
+    if (raw.startsWith('u')) {
+      final padded = raw.substring(1).padRight(
+          (raw.length - 1 + 3) & ~3, '=');
+      return base64Url.decode(padded);
+    }
+    return base64.decode(raw); // old plain-base64 fallback
+  }
 
   @override
   Future<void> dispose() async {
