@@ -34,9 +34,14 @@ class PresenceService {
       : _apiUrl = ipfsApiUrl ?? _defaultApiUrl;
 
   Future<void> start(List<String> contactIds) async {
-    await _publishHeartbeat();
-    _heartbeatTimer = Timer.periodic(_interval, (_) => _publishHeartbeat());
     _subscribeAll(contactIds);
+    // Publish immediately, then again after 60 s — the IPFS node may not have
+    // found any peers in the first few seconds after the daemon starts, so the
+    // initial heartbeat often goes nowhere.  The second attempt covers that gap
+    // without waiting a full 15 minutes for the periodic timer.
+    await _publishHeartbeat();
+    Timer(const Duration(seconds: 60), _publishHeartbeat);
+    _heartbeatTimer = Timer.periodic(_interval, (_) => _publishHeartbeat());
   }
 
   void addContacts(List<String> contactIds) => _subscribeAll(contactIds);

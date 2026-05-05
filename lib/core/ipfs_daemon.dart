@@ -71,34 +71,46 @@ class IpfsDaemon {
   }
 
   Future<void> _initRepoIfNeeded(String binary, String repoPath) async {
-    // Repo already exists — nothing to do.
-    if (File('$repoPath/config').existsSync()) return;
-
-    debugPrint('[IpfsDaemon] first run — initialising repo at $repoPath');
-
     final env = {'IPFS_PATH': repoPath};
 
-    // Init with the lowpower profile (no NAT, minimal connections) for mobile.
-    final init = await Process.run(
-      binary, ['init', '--profile=lowpower'],
-      environment: env,
-    );
-    if (init.exitCode != 0) {
-      throw Exception('ipfs init failed (exit ${init.exitCode}):\n${init.stderr}');
+    if (!File('$repoPath/config').existsSync()) {
+      debugPrint('[IpfsDaemon] first run — initialising repo at $repoPath');
+
+      final init = await Process.run(
+        binary, ['init', '--profile=lowpower'],
+        environment: env,
+      );
+      if (init.exitCode != 0) {
+        throw Exception('ipfs init failed (exit ${init.exitCode}):\n${init.stderr}');
+      }
+
+      debugPrint('[IpfsDaemon] repo initialised');
     }
 
-    // Enable pubsub experiment required by IpfsTransport.
-    await Process.run(
-      binary, ['config', '--json', 'Experimental.Pubsub', 'true'],
-      environment: env,
-    );
+    // Apply connectivity config every launch so fixes propagate to existing
+    // repos. The lowpower profile disables relay + hole-punching + mDNS, which
+    // prevents two Android devices from ever finding each other in the swarm.
+    await _applyConfig(binary, env);
+  }
 
-    // Disable the resource manager — saves ~30 MB RSS on mobile.
-    await Process.run(
-      binary, ['config', '--json', 'Swarm.ResourceMgr.Enabled', 'false'],
-      environment: env,
-    );
-
-    debugPrint('[IpfsDaemon] repo initialised');
+  Future<void> _applyConfig(String binary, Map<String, String> env) async {
+    final configs = <List<String>>[
+      // Pubsub (required for messaging and presence)
+      ['config', '--json', 'Experimental.Pubsub', 'true'],
+      // Relay client: lets us connect through public relay nodes (NAT traversal)
+      ['config', '--json', 'Swarm.RelayClient.Enabled', 'true'],
+      // Hole punching: direct peer-to-peer once a relay bridges the initial handshake
+      ['config', '--json', 'Swarm.EnableHolePunching', 'true'],
+      // mDNS: lets devices on the same local network find each other instantly
+      ['config', '--json', 'Discovery.MDNS.Enabled', 'true'],
+      // Gossipsub: efficient topic-based routing (default in Kubo ≥ 0.11)
+      ['config', 'Pubsub.Router', 'gossipsub'],
+      // Disable resource manager — saves ~30 MB RSS on mobile
+      ['config', '--json', 'Swarm.ResourceMgr.Enabled', 'false'],
+    ];
+    for (final args in configs) {
+      await Process.run(binary, args, environment: env);
+    }
+    debugPrint('[IpfsDaemon] connectivity config applied');
   }
 }
