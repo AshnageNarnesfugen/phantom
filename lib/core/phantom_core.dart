@@ -41,6 +41,11 @@ class PhantomCore {
 
   final Map<String, RatchetSession> _sessions = {};
 
+  // Tracks contacts to whom we just sent an INIT frame in this session.
+  // Used as a tiebreaker when both sides re-init simultaneously (simultaneous
+  // clear-history): the side with the larger phantom ID keeps its sender session.
+  final Set<String> _pendingInitSent = {};
+
   /// Kyber-768 key pair held in memory for quantum-resistant session setup.
   /// Derived deterministically from the seed phrase — not persisted to disk.
   Uint8List? _kyberPrivateKeyBytes;
@@ -266,6 +271,7 @@ class PhantomCore {
     // Capture BEFORE encode() calls session.encrypt(), which clears both fields.
     final x3dhEk      = session.pendingX3dhEphemeralKey;
     final kyberCipher = session.pendingKyberCipherBytes;
+    if (x3dhEk != null) _pendingInitSent.add(recipientId);
     final envelopeBytes = await protocol.encode(message);
 
     // Wrap in INIT frame on the first message (includes our full ContactAddress
@@ -488,8 +494,15 @@ class PhantomCore {
     final savedState = await storage.getSessionState(recipientId);
     if (savedState != null) {
       final session = await RatchetSession.fromJson(savedState);
-      _sessions[recipientId] = session;
-      return session;
+      if (session.hasSendingChain) {
+        _sessions[recipientId] = session;
+        return session;
+      }
+      // Stuck receiver session (sendingChain == null): the contact sent the only
+      // INIT and we've never replied yet, or we ended up in a broken simultaneous
+      // re-init state.  Delete it and fall through to create a fresh sender session
+      // so the ratchet can re-synchronise.
+      await storage.deleteSessionState(recipientId);
     }
 
     // Create a new session via X3DH
@@ -702,6 +715,15 @@ class PhantomCore {
     try {
       final protocol = PhantomProtocol(session);
       final message  = await protocol.decode(frame.payload);
+
+      // Simultaneous re-init tiebreaker: if both sides cleared history and sent
+      // INITs at the same time, the side with the larger phantom ID keeps its
+      // sender session so both end up with a compatible sender/receiver pair.
+      // The "loser" side's first message is lost but they can resend immediately.
+      if (_pendingInitSent.remove(senderPhantomId) &&
+          myId.compareTo(senderPhantomId) > 0) {
+        return;
+      }
 
       // Build a full ContactRecord from the embedded ContactAddress when possible,
       // so we can re-initiate sessions later without the sender needing to resend.

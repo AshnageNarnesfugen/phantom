@@ -90,6 +90,8 @@ class RatchetSession {
   Uint8List? _sendingChainKey;
   Uint8List? _receivingChainKey;
 
+  bool get hasSendingChain => _sendingChainKey != null;
+
   SimpleKeyPairData _dhSendingKP;
   Uint8List? _dhRemotePublicKey;
 
