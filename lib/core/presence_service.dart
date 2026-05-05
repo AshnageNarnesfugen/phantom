@@ -13,8 +13,8 @@ import 'package:http/http.dart' as http;
 /// No rate limits — entirely P2P, no central relay.
 class PresenceService {
   static const _defaultApiUrl = 'http://127.0.0.1:5001';
-  static const _interval  = Duration(minutes: 15);
-  static const _threshold = Duration(minutes: 22);
+  static const _interval  = Duration(minutes: 2);
+  static const _threshold = Duration(minutes: 7);
 
   final String _myId;
   final String _apiUrl;
@@ -38,12 +38,13 @@ class PresenceService {
 
   Future<void> start(List<String> contactIds) async {
     _subscribeAll(contactIds);
-    // Publish immediately, then again after 60 s — the IPFS node may not have
-    // found any peers in the first few seconds after the daemon starts, so the
-    // initial heartbeat often goes nowhere.  The second attempt covers that gap
-    // without waiting a full 15 minutes for the periodic timer.
+    // Publish immediately and at short intervals for the first few minutes so
+    // that a contact who comes online after us receives a heartbeat quickly
+    // rather than waiting for the full periodic interval.
     await _publishHeartbeat();
-    Timer(const Duration(seconds: 60), _publishHeartbeat);
+    Timer(const Duration(seconds: 10), _publishHeartbeat);
+    Timer(const Duration(seconds: 30), _publishHeartbeat);
+    Timer(const Duration(seconds: 90), _publishHeartbeat);
     _heartbeatTimer = Timer.periodic(_interval, (_) => _publishHeartbeat());
   }
 

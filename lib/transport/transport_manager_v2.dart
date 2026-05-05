@@ -135,9 +135,20 @@ class TransportManagerV2 {
           ),
           targetPhantomId: recipientId,
         );
+        if (ok) _scheduleFlush();
         return ok
             ? SendResult.queued()
             : SendResult.failed('Store full');
+    }
+  }
+
+  /// Schedules an internet flush if one isn't already pending.
+  /// Must be called whenever a message is added to the store so the retry
+  /// timer is always running while there are pending messages.
+  void _scheduleFlush() {
+    if (_retryTimer != null) return;
+    if (_mode == TransportMode.internet) {
+      _retryTimer = Timer(_kRetryInterval, _flushStoreViaInternet);
     }
   }
 
@@ -157,6 +168,7 @@ class TransportManagerV2 {
         ),
         targetPhantomId: recipientId,
       );
+      _scheduleFlush();
       return SendResult.queued();
     }
 

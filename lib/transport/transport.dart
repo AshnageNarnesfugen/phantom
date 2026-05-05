@@ -117,7 +117,7 @@ class TransportManager {
     if (_ourId.isEmpty) return;
     final now = DateTime.now();
     if (_lastRetryAt != null &&
-        now.difference(_lastRetryAt!) < const Duration(seconds: 20)) {
+        now.difference(_lastRetryAt!) < const Duration(seconds: 10)) {
       return;
     }
     _lastRetryAt = now;
