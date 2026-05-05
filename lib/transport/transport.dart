@@ -391,17 +391,21 @@ class IpfsTransport implements PhantomTransport {
         if (_disposed) return;
         if (line.trim().isEmpty) continue;
         try {
-          final json      = jsonDecode(line) as Map<String, dynamic>;
-          final responses = json['Responses'];
-          final peers     = (responses is List)
-              ? responses.cast<Map<String, dynamic>>()
-              : (json['ID'] != null ? [json] : <Map<String, dynamic>>[]);
+          final json = jsonDecode(line) as Map<String, dynamic>;
+          // Only process Type 4 — actual provider records.
+          // Other types (1=PeerResponse, 2=FinalPeer, etc.) are intermediate
+          // DHT routing nodes that happen to be near the CID; connecting to
+          // them wastes time and causes log spam.
+          final type = json['Type'];
+          if (type != null && type != 4) continue;
 
-          for (final peer in peers) {
+          final responses = json['Responses'];
+          if (responses is! List) continue;
+          for (final peer in responses.cast<Map<String, dynamic>>()) {
             final peerId = peer['ID'] as String?;
             final addrs  = (peer['Addrs'] as List?)?.cast<String>() ?? [];
-            if (peerId == null || peerId.isEmpty) continue;
-            dbg.log('IPFS: DHT found peer ${peerId.substring(0, 12)}… — connecting');
+            if (peerId == null || peerId.isEmpty || addrs.isEmpty) continue;
+            dbg.log('IPFS: DHT provider ${peerId.substring(0, 12)}… — connecting');
             if (!_swarmConnected.contains(peerId)) {
               _swarmConnected.add(peerId);
               unawaited(_connectById(peerId, addrs, dbg));
@@ -429,7 +433,15 @@ class IpfsTransport implements PhantomTransport {
   /// Connects to a peer given its already-decoded peer ID and known multiaddrs.
   Future<void> _connectById(
       String peerId, List<String> addrs, TransportDebugger dbg) async {
-    final sorted = [...addrs]..sort((a, b) {
+    // Skip loopback and link-local — connecting to them either fails (can't
+    // reach a remote peer via 127.0.0.1) or hits our own daemon (HTTP 500).
+    final usable = addrs.where((a) =>
+        !a.contains('/127.0.0.1/') &&
+        !a.contains('/::1/') &&
+        !a.contains('/169.254.') &&
+        !a.contains('/fe80:')).toList();
+
+    final sorted = [...usable]..sort((a, b) {
         final aR = a.contains('p2p-circuit') ? 0 : 1;
         final bR = b.contains('p2p-circuit') ? 0 : 1;
         return aR.compareTo(bR);

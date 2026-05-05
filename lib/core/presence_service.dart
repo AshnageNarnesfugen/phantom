@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 /// Lightweight presence layer using the bundled IPFS daemon as a pubsub bus.
@@ -170,10 +170,22 @@ class PresenceService {
     if (_disposed) return;
     try {
       final cid = await _phantomCid(_myId);
-      final uri = Uri.parse(
+      // First put a small block so Kubo has the CID in its store — some
+      // versions of Kubo reject routing/provide for unknown CIDs.
+      final putUri = Uri.parse('$_apiUrl/api/v0/block/put');
+      await _client.post(putUri,
+          body: utf8.encode(_myId),
+          headers: {'Content-Type': 'application/octet-stream'})
+          .timeout(const Duration(seconds: 10));
+
+      final provideUri = Uri.parse(
           '$_apiUrl/api/v0/routing/provide?arg=${Uri.encodeComponent(cid)}&recursive=false');
-      await _client.post(uri).timeout(const Duration(seconds: 30));
-    } catch (_) {}
+      final r = await _client.post(provideUri)
+          .timeout(const Duration(seconds: 30));
+      debugPrint('[Presence] DHT advertise → HTTP ${r.statusCode}');
+    } catch (e) {
+      debugPrint('[Presence] DHT advertise error: $e');
+    }
   }
 
   /// Queries the DHT for each contact's IPFS peer info and connects to them.
@@ -209,17 +221,18 @@ class PresenceService {
         if (line.trim().isEmpty) continue;
         try {
           final json = jsonDecode(line) as Map<String, dynamic>;
-          // Kubo returns: {"Type":4,"Responses":[{"ID":"...","Addrs":["..."]}]}
-          // or sometimes a flat peer object.
-          final responses = json['Responses'];
-          final peers = (responses is List)
-              ? responses.cast<Map<String, dynamic>>()
-              : (json['ID'] != null ? [json] : <Map<String, dynamic>>[]);
+          // Only process Type 4 — actual provider records.
+          // Other types (1=PeerResponse, 2=FinalPeer, etc.) are intermediate
+          // DHT routing nodes; connecting to them wastes time and causes spam.
+          final type = json['Type'];
+          if (type != null && type != 4) continue;
 
-          for (final peer in peers) {
+          final responses = json['Responses'];
+          if (responses is! List) continue;
+          for (final peer in responses.cast<Map<String, dynamic>>()) {
             final peerId = peer['ID'] as String?;
             final addrs  = (peer['Addrs'] as List?)?.cast<String>() ?? [];
-            if (peerId == null || peerId.isEmpty) continue;
+            if (peerId == null || peerId.isEmpty || addrs.isEmpty) continue;
             await _connectToPeer(peerId, addrs);
           }
         } catch (_) {}
@@ -271,6 +284,14 @@ class PresenceService {
         }
       } catch (_) {}
     }
+
+    // Drop loopback/link-local — can't reach a remote peer via 127.0.0.1
+    // and connecting to our own daemon returns HTTP 500.
+    addresses = addresses.where((a) =>
+        !a.contains('/127.0.0.1/') &&
+        !a.contains('/::1/') &&
+        !a.contains('/169.254.') &&
+        !a.contains('/fe80:')).toList();
 
     // Sort: relay addresses first (work through NAT before hole-punch).
     final sorted = [...addresses]..sort((a, b) {
