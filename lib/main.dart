@@ -10,18 +10,16 @@ import 'core_provider.dart';
 import 'ui/theme/phantom_theme.dart';
 import 'ui/screens/screens.dart';
 
-const _seedKey = 'phantom_seed_v1';
+const _seedKey    = 'phantom_seed_v1';
+const _ntfyUrlKey = 'phantom_ntfy_url';
 
 const _messagingChannel = MethodChannel('phantom/messaging');
 
-/// Starts the foreground service that keeps the Dart isolate alive so the ntfy
-/// subscription stays connected and messages can be received while backgrounded.
 void _startMessagingService() {
   if (!Platform.isAndroid) return;
   _messagingChannel.invokeMethod<void>('startService').catchError((_) {});
 }
 
-/// Stops the foreground service when the app returns to the foreground.
 void _stopMessagingService() {
   if (!Platform.isAndroid) return;
   _messagingChannel.invokeMethod<void>('stopService').catchError((_) {});
@@ -44,7 +42,6 @@ class PhantomApp extends StatefulWidget {
 }
 
 class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
-  // Starts with defaults; replaced by persisted values in _init().
   ThemeController _themeCtrl = ThemeController();
   static const _secure = FlutterSecureStorage();
 
@@ -75,14 +72,10 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
   }
 
   Future<void> _init() async {
-    // Init notifications after Flutter engine is fully running.
     NotificationService.initialize().catchError((_) {});
     final persisted = await ThemeController.load();
     persisted.addListener(() { if (mounted) setState(() {}); });
     if (mounted) setState(() => _themeCtrl = persisted);
-    // Start the bundled IPFS daemon early so it is ready by the time the
-    // transport layer initialises. Fire-and-forget: failures are logged
-    // internally and the transport falls back to BLE automatically.
     if (Platform.isAndroid) {
       IpfsDaemon.instance.ensure().catchError((_) {});
     }
@@ -92,12 +85,17 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
   Future<void> _tryRestoreAccount() async {
     if (!mounted) return;
     try {
-      final seed = await _secure.read(key: _seedKey);
+      final seed    = await _secure.read(key: _seedKey);
+      final ntfyUrl = await _secure.read(key: _ntfyUrlKey);
       if (seed != null) {
         final dir = await getApplicationDocumentsDirectory();
+        final config = (ntfyUrl != null && ntfyUrl.isNotEmpty)
+            ? TransportConfig(ntfyBaseUrl: ntfyUrl)
+            : null;
         final core = await PhantomCore.restoreAccount(
-          seedPhrase: seed,
-          storagePath: dir.path,
+          seedPhrase:      seed,
+          storagePath:     dir.path,
+          transportConfig: config,
         );
         if (mounted) setState(() => _core = core);
         NotificationService.requestPermission();
@@ -115,12 +113,23 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
     NotificationService.requestPermission();
   }
 
+  /// Saves a new ntfy URL, disposes the current core, and reinitialises.
+  /// Pass null or empty string to revert to the default https://ntfy.sh.
+  Future<void> _restartCore(String? ntfyUrl) async {
+    final url = (ntfyUrl?.trim().isNotEmpty == true) ? ntfyUrl!.trim() : null;
+    await _secure.write(key: _ntfyUrlKey, value: url ?? '');
+    await _core?.dispose();
+    if (mounted) setState(() { _core = null; _loading = true; });
+    await _tryRestoreAccount();
+  }
+
   @override
   Widget build(BuildContext context) {
     return CoreProvider(
-      core: _core,
-      themeCtrl: _themeCtrl,
-      onAccountReady: _onAccountReady,
+      core:            _core,
+      themeCtrl:       _themeCtrl,
+      onAccountReady:  _onAccountReady,
+      onRestartCore:   _restartCore,
       child: PhantomTheme(
         tokens:    _themeCtrl.tokens,
         accent:    _themeCtrl.accent,

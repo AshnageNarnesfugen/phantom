@@ -2610,6 +2610,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
             tokens: t,
             onTap: () => _showTransportSheet(context, t, core),
           ),
+          _SettingTile(
+            icon: Icons.dns_outlined,
+            label: 'ntfy server',
+            value: core != null
+                ? (core.ntfyBaseUrl == 'https://ntfy.sh' ? 'default' : core.ntfyBaseUrl)
+                : 'default',
+            tokens: t,
+            onTap: () => _showNtfyDialog(context, t, provider, core),
+          ),
 
           // ── Appearance ───────────────────────────────────────
           _SectionHeader('appearance', t),
@@ -2935,6 +2944,57 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
       scaffold,
     ]);
+  }
+
+  void _showNtfyDialog(
+      BuildContext context, PhantomTokens t, CoreProvider provider, PhantomCore? core) {
+    final ctrl = TextEditingController(
+      text: core?.ntfyBaseUrl == 'https://ntfy.sh' ? '' : (core?.ntfyBaseUrl ?? ''),
+    );
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: t.bgSurface,
+        title: Text('ntfy server',
+            style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 15)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'enter the base URL of your ntfy server.\n'
+              'leave blank to use the default (ntfy.sh).',
+              style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 11, height: 1.6),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 13),
+              decoration: InputDecoration(
+                hintText: 'https://ntfy.sh',
+                hintStyle: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 13),
+                enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: t.divider)),
+                focusedBorder: UnderlineInputBorder(borderSide: BorderSide(color: t.accentLight)),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('cancel', style: TextStyle(color: t.textDisabled, fontFamily: 'monospace')),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              await provider.onRestartCore(ctrl.text.trim().isEmpty ? null : ctrl.text.trim());
+            },
+            child: Text('apply & restart', style: TextStyle(color: t.accentLight, fontFamily: 'monospace')),
+          ),
+        ],
+      ),
+    );
   }
 
   void _showTransportSheet(BuildContext context, PhantomTokens t, PhantomCore? core) {

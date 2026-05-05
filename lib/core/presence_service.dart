@@ -13,7 +13,7 @@ import 'package:http/http.dart' as http;
 ///   heartbeat every 15 min → 96/day for heartbeats,
 ///   leaving ~150/day for actual messages.
 class PresenceService {
-  static const _base      = 'https://ntfy.sh';
+  static const _defaultBase = 'https://ntfy.sh';
   // Heartbeat every 15 min → 96 publishes/day — well within ntfy's free-tier
   // limit of 250/day per IP, leaving ~154 slots/day for actual messages.
   // Threshold 22 min allows one missed heartbeat before marking offline.
@@ -21,6 +21,7 @@ class PresenceService {
   static const _threshold = Duration(minutes: 22);
 
   final String _myId;
+  final String _base;
   final http.Client _client = http.Client();
 
   final Map<String, DateTime>   _lastSeen    = {};
@@ -37,7 +38,8 @@ class PresenceService {
   /// Emits a contactId whenever that contact's online status changes.
   Stream<String> get changes => _changesCtrl.stream;
 
-  PresenceService(this._myId);
+  PresenceService(this._myId, {String? ntfyBase})
+      : _base = ntfyBase ?? _defaultBase;
 
   Future<void> start(List<String> contactIds) async {
     await _publishHeartbeat();

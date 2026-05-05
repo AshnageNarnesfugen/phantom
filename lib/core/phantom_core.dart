@@ -62,6 +62,8 @@ class PhantomCore {
   bool get isTransportAvailable => _transportAvailable;
 
   PresenceService? _presence;
+  String? _ntfyBaseUrl;
+  String get ntfyBaseUrl => _ntfyBaseUrl ?? 'https://ntfy.sh';
   bool isContactOnline(String contactId) => _presence?.isOnline(contactId) ?? false;
   bool get presenceRateLimited => _presence?.isRateLimited ?? false;
   Stream<String> get presenceChanges => _presence?.changes ?? const Stream.empty();
@@ -100,6 +102,7 @@ class PhantomCore {
       storage:  PhantomStorage.instance,
       transport: transport,
     );
+    core._ntfyBaseUrl  = transportConfig?.ntfyBaseUrl;
     core._transportV2 = _buildTransportV2(transport, core.myId);
 
     // Derive Kyber-768 keypair deterministically from the seed phrase.
@@ -129,6 +132,7 @@ class PhantomCore {
       storage:  PhantomStorage.instance,
       transport: transport,
     );
+    core._ntfyBaseUrl  = transportConfig?.ntfyBaseUrl;
     core._transportV2 = _buildTransportV2(transport, core.myId);
 
     await core._initKyberKeys(seedPhrase);
@@ -586,7 +590,7 @@ class PhantomCore {
 
   Future<void> _startPresence() async {
     final contacts = await storage.getAllContacts();
-    _presence = PresenceService(myId);
+    _presence = PresenceService(myId, ntfyBase: _ntfyBaseUrl);
     await _presence!.start(contacts.map((c) => c.phantomId).toList());
   }
 
