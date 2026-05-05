@@ -95,6 +95,13 @@
             android:exported="false"
             android:foregroundServiceType="dataSync"/>
 
+        <!-- Message receiver — keeps the Dart isolate alive so ntfy delivers
+             incoming messages and local notifications fire while backgrounded -->
+        <service
+            android:name=".PhantomMessagingService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"/>
+
         <!-- FileProvider for APK installation -->
         <provider
             android:name="androidx.core.content.FileProvider"

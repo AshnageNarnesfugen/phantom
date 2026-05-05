@@ -91,6 +91,37 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // ── Messaging service channel ─────────────────────────────────────────
+        MethodChannel(
+            flutterEngine!!.dartExecutor.binaryMessenger,
+            "phantom/messaging",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "startService" -> {
+                    try {
+                        val intent = PhantomMessagingService.startIntent(applicationContext)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("START_FAILED", e.message, null)
+                    }
+                }
+                "stopService" -> {
+                    try {
+                        startService(PhantomMessagingService.stopIntent(applicationContext))
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("STOP_FAILED", e.message, null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         // ── GATT server channel ───────────────────────────────────────────────
         val channel = MethodChannel(
             flutterEngine!!.dartExecutor.binaryMessenger,

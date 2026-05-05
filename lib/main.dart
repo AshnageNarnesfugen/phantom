@@ -12,6 +12,21 @@ import 'ui/screens/screens.dart';
 
 const _seedKey = 'phantom_seed_v1';
 
+const _messagingChannel = MethodChannel('phantom/messaging');
+
+/// Starts the foreground service that keeps the Dart isolate alive so the ntfy
+/// subscription stays connected and messages can be received while backgrounded.
+void _startMessagingService() {
+  if (!Platform.isAndroid) return;
+  _messagingChannel.invokeMethod<void>('startService').catchError((_) {});
+}
+
+/// Stops the foreground service when the app returns to the foreground.
+void _stopMessagingService() {
+  if (!Platform.isAndroid) return;
+  _messagingChannel.invokeMethod<void>('stopService').catchError((_) {});
+}
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
@@ -50,8 +65,10 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
       case AppLifecycleState.paused:
       case AppLifecycleState.detached:
         _core?.onAppPaused();
+        _startMessagingService();
       case AppLifecycleState.resumed:
         _core?.onAppResumed();
+        _stopMessagingService();
       default:
         break;
     }
