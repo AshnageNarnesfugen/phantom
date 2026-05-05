@@ -45,18 +45,38 @@ class IpfsDaemon {
     _ensured = true;
 
     try {
+      _logBuf.clear();
+
       final libDir = await _ch.invokeMethod<String>('getNativeLibDir') ?? '';
       final binary = '$libDir/libkubo.so';
 
+      _logBuf.writeln('[init] nativeLibDir: $libDir');
+      _logBuf.writeln('[init] binary path:  $binary');
+      _logBuf.writeln('[init] binary exists: ${File(binary).existsSync()}');
+
       if (!File(binary).existsSync()) {
-        debugPrint('[IpfsDaemon] libkubo.so not found '
-            '(run scripts/download_kubo.sh then rebuild) — IPFS skipped');
+        _logBuf.writeln('[init] ERROR: libkubo.so not found — listing dir contents:');
+        try {
+          final dir = Directory(libDir);
+          if (dir.existsSync()) {
+            for (final f in dir.listSync()) {
+              _logBuf.writeln('  ${f.path}');
+            }
+          } else {
+            _logBuf.writeln('  (directory does not exist)');
+          }
+        } catch (e) {
+          _logBuf.writeln('  (could not list: $e)');
+        }
         _ensured = false;
         return;
       }
 
       final repoPath = await _repoPath();
+      _logBuf.writeln('[init] repo path: $repoPath');
+
       await _initRepoIfNeeded(binary, repoPath);
+      _logBuf.writeln('[init] repo ready');
 
       // Attempt to start the foreground service (preferred — survives backgrounding).
       bool serviceStarted = false;
@@ -66,28 +86,28 @@ class IpfsDaemon {
           'repoPath':   repoPath,
         });
         serviceStarted = true;
-        debugPrint('[IpfsDaemon] ForegroundService started');
+        _logBuf.writeln('[init] ForegroundService started');
       } catch (e) {
-        debugPrint('[IpfsDaemon] ForegroundService unavailable: $e');
+        _logBuf.writeln('[init] ForegroundService error: $e');
       }
 
       // Give the service time to bring the daemon up.  Skip the wait entirely
       // if the service call already threw — in that case spawn directly now.
-      // This keeps startup fast in environments like Waydroid where the service
-      // always fails immediately.
       final apiReady = serviceStarted
           ? await _waitForApi(seconds: _serviceWaitSeconds)
           : false;
 
+      _logBuf.writeln('[init] API ready via service: $apiReady');
+
       if (!apiReady) {
-        debugPrint('[IpfsDaemon] API not up — spawning daemon directly');
+        _logBuf.writeln('[init] spawning daemon directly...');
         await _spawnDaemonDirectly(binary, repoPath);
       } else {
-        debugPrint('[IpfsDaemon] API ready via ForegroundService at $apiUrl');
+        _logBuf.writeln('[init] using ForegroundService daemon');
       }
     } catch (e, st) {
+      _logBuf.writeln('[init] EXCEPTION: $e\n$st');
       _ensured = false;
-      debugPrint('[IpfsDaemon] startup error: $e\n$st');
     }
   }
 
