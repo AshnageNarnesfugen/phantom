@@ -48,9 +48,9 @@ jobs:
           # which is required on Android/Waydroid where ld-linux-x86-64 is absent.
           git clone --depth=1 --branch v0.41.0 \
             https://github.com/ipfs/kubo.git /tmp/kubo
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -o /tmp/ipfs /tmp/kubo/cmd/ipfs
-          cp /tmp/ipfs android/app/src/main/jniLibs/x86_64/libkubo.so
+          cd /tmp/kubo && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -o /tmp/ipfs ./cmd/ipfs
+          cp /tmp/ipfs "$GITHUB_WORKSPACE/android/app/src/main/jniLibs/x86_64/libkubo.so"
           echo "✓ Static x86_64 kubo: $(du -sh android/app/src/main/jniLibs/x86_64/libkubo.so | cut -f1)"
 
       - name: Build release APK
