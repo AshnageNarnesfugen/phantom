@@ -635,8 +635,19 @@ class PhantomCore {
         .map((b) => b.toRadixString(16).padLeft(2, '0'))
         .join();
     final storedEkHex = await storage.getLastInitEkHex(senderPhantomId);
+
+    // Known EK → confirmed ntfy replay. Use existing session.
     if (storedEkHex != null && storedEkHex == incomingEkHex) {
-      // Same ephemeral key → ntfy replay.  Use existing session.
+      await _handleMsgFrame(frame);
+      return;
+    }
+
+    // No EK on record yet (cold-start after upgrade) but an active session
+    // already exists.  We can't tell if this is a replay or a re-INIT; protect
+    // the live session rather than overwriting it with a reset receiver state.
+    if (storedEkHex == null &&
+        (_sessions.containsKey(senderPhantomId) ||
+            await storage.getSessionState(senderPhantomId) != null)) {
       await _handleMsgFrame(frame);
       return;
     }
