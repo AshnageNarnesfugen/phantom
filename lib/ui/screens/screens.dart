@@ -1551,94 +1551,102 @@ class _ChatScreenState extends State<ChatScreen> {
     showModalBottomSheet(
       context: context,
       backgroundColor: t.bgSurface,
+      isScrollControlled: true,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(t.radiusCard)),
       ),
-      builder: (_) => Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const SizedBox(height: 8),
-          Container(width: 36, height: 3,
-              decoration: BoxDecoration(color: t.divider, borderRadius: BorderRadius.circular(2))),
-          const SizedBox(height: 16),
-          _MenuItem(icon: Icons.fingerprint, label: 'verify safety number', tokens: t,
-            onTap: () {
-              Navigator.pop(context);
-              if (core != null) _showSafetyNumber(t, core);
-            }),
-          _MenuItem(icon: Icons.wallpaper_outlined, label: 'set chat wallpaper', tokens: t,
-            onTap: () async {
-              Navigator.pop(context);
-              final picked = await ImagePicker().pickImage(
-                  source: ImageSource.gallery, imageQuality: 80);
-              if (picked == null || core == null || !mounted) return;
-              final raw    = await picked.readAsBytes();
-              final edited = await _openPhotoEditor(raw);
-              if (!mounted) return;
-              final path = await _saveTempImage(edited ?? raw, picked.name);
-              await core.storage.setWallpaper(widget.contactId, path);
-              if (mounted) setState(() => _wallpaperPath = path);
-            }),
-          _MenuItem(icon: Icons.wallpaper_outlined, label: 'set global wallpaper', tokens: t,
-            onTap: () async {
-              Navigator.pop(context);
-              final picked = await ImagePicker().pickImage(
-                  source: ImageSource.gallery, imageQuality: 80);
-              if (picked == null || core == null || !mounted) return;
-              final raw    = await picked.readAsBytes();
-              final edited = await _openPhotoEditor(raw);
-              if (!mounted) return;
-              final path = await _saveTempImage(edited ?? raw, picked.name);
-              await core.storage.setWallpaper(null, path);
-              if (mounted && _wallpaperPath == null) setState(() => _wallpaperPath = path);
-            }),
-          if (_wallpaperPath != null) ...[
-            _MenuItem(icon: Icons.tune_outlined, label: 'adjust background', tokens: t,
-              onTap: () {
-                Navigator.pop(context);
-                _showWallpaperPositionSheet(context, t, core);
-              }),
-            _MenuItem(icon: Icons.hide_image_outlined, label: 'remove wallpaper', tokens: t,
-              onTap: () async {
-                Navigator.pop(context);
-                if (core != null) {
-                  await core.storage.clearWallpaper(widget.contactId);
-                  if (mounted) setState(() => _wallpaperPath = null);
-                }
-              }),
-          ],
-          _MenuItem(icon: Icons.account_circle_outlined, label: 'share my avatar', tokens: t,
-            onTap: () async {
-              Navigator.pop(context);
-              await core?.sendAvatarToContact(widget.contactId);
-            }),
-          _MenuItem(icon: Icons.badge_outlined, label: 'share my alias', tokens: t,
-            onTap: () async {
-              Navigator.pop(context);
-              await core?.sendAliasToContact(widget.contactId);
-            }),
-          _MenuItem(icon: Icons.edit_outlined, label: 'edit contact nickname', tokens: t,
-            onTap: () {
-              Navigator.pop(context);
-              _showEditNickname(t, core);
-            }),
-          _MenuItem(icon: Icons.blur_on_outlined, label: 'glass effect', tokens: t,
-            onTap: () {
-              Navigator.pop(context);
-              _showGlassSettings(context, t, core);
-            }),
-          _MenuItem(icon: Icons.delete_outline, label: 'clear history', tokens: t,
-            onTap: () async {
-              Navigator.pop(context);
-              if (core != null) {
-                await core.clearHistory(widget.contactId);
-                if (mounted) _loadMessages(core);
-              }
-            }),
-          _MenuItem(icon: Icons.block, label: 'block', tokens: t, danger: true,
-            onTap: () => Navigator.pop(context)),
-          const SizedBox(height: 16),
-        ],
+      builder: (_) => SafeArea(
+        top: false,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 8),
+              Container(
+                width: 36, height: 3,
+                decoration: BoxDecoration(color: t.divider, borderRadius: BorderRadius.circular(2)),
+              ),
+              const SizedBox(height: 16),
+              _MenuItem(icon: Icons.fingerprint, label: 'verify safety number', tokens: t,
+                onTap: () {
+                  Navigator.pop(context);
+                  if (core != null) _showSafetyNumber(t, core);
+                }),
+              _MenuItem(icon: Icons.wallpaper_outlined, label: 'set chat wallpaper', tokens: t,
+                onTap: () async {
+                  Navigator.pop(context);
+                  final picked = await ImagePicker().pickImage(
+                      source: ImageSource.gallery, imageQuality: 80);
+                  if (picked == null || core == null || !mounted) return;
+                  final raw    = await picked.readAsBytes();
+                  final edited = await _openPhotoEditor(raw);
+                  if (!mounted) return;
+                  final path = await _saveTempImage(edited ?? raw, picked.name);
+                  await core.storage.setWallpaper(widget.contactId, path);
+                  if (mounted) setState(() => _wallpaperPath = path);
+                }),
+              _MenuItem(icon: Icons.wallpaper_outlined, label: 'set global wallpaper', tokens: t,
+                onTap: () async {
+                  Navigator.pop(context);
+                  final picked = await ImagePicker().pickImage(
+                      source: ImageSource.gallery, imageQuality: 80);
+                  if (picked == null || core == null || !mounted) return;
+                  final raw    = await picked.readAsBytes();
+                  final edited = await _openPhotoEditor(raw);
+                  if (!mounted) return;
+                  final path = await _saveTempImage(edited ?? raw, picked.name);
+                  await core.storage.setWallpaper(null, path);
+                  if (mounted && _wallpaperPath == null) setState(() => _wallpaperPath = path);
+                }),
+              if (_wallpaperPath != null) ...[
+                _MenuItem(icon: Icons.tune_outlined, label: 'adjust background', tokens: t,
+                  onTap: () {
+                    Navigator.pop(context);
+                    _showWallpaperPositionSheet(context, t, core);
+                  }),
+                _MenuItem(icon: Icons.hide_image_outlined, label: 'remove wallpaper', tokens: t,
+                  onTap: () async {
+                    Navigator.pop(context);
+                    if (core != null) {
+                      await core.storage.clearWallpaper(widget.contactId);
+                      if (mounted) setState(() => _wallpaperPath = null);
+                    }
+                  }),
+              ],
+              _MenuItem(icon: Icons.account_circle_outlined, label: 'share my avatar', tokens: t,
+                onTap: () async {
+                  Navigator.pop(context);
+                  await core?.sendAvatarToContact(widget.contactId);
+                }),
+              _MenuItem(icon: Icons.badge_outlined, label: 'share my alias', tokens: t,
+                onTap: () async {
+                  Navigator.pop(context);
+                  await core?.sendAliasToContact(widget.contactId);
+                }),
+              _MenuItem(icon: Icons.edit_outlined, label: 'edit contact nickname', tokens: t,
+                onTap: () {
+                  Navigator.pop(context);
+                  _showEditNickname(t, core);
+                }),
+              _MenuItem(icon: Icons.blur_on_outlined, label: 'glass effect', tokens: t,
+                onTap: () {
+                  Navigator.pop(context);
+                  _showGlassSettings(context, t, core);
+                }),
+              _MenuItem(icon: Icons.delete_outline, label: 'clear history', tokens: t,
+                onTap: () async {
+                  Navigator.pop(context);
+                  if (core != null) {
+                    await core.clearHistory(widget.contactId);
+                    if (mounted) _loadMessages(core);
+                  }
+                }),
+              _MenuItem(icon: Icons.block, label: 'block', tokens: t, danger: true,
+                onTap: () => Navigator.pop(context)),
+              const SizedBox(height: 16),
+            ],
+          ),
+        ),
       ),
     );
   }
