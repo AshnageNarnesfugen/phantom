@@ -2625,9 +2625,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ? 'checking...'
                 : _ipfsRunning!
                     ? 'running · $_ipfsPeers peer${_ipfsPeers == 1 ? '' : 's'}'
-                    : 'offline — tap to retry',
+                    : 'offline — tap for details',
             tokens: t,
-            onTap: _refreshIpfsStatus,
+            onTap: () => _showIpfsDiagnostics(context, t),
           ),
           // ── Appearance ───────────────────────────────────────
           _SectionHeader('appearance', t),
@@ -2953,6 +2953,53 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
       scaffold,
     ]);
+  }
+
+  void _showIpfsDiagnostics(BuildContext context, PhantomTokens t) {
+    _refreshIpfsStatus();
+    final log = IpfsDaemon.instance.daemonLog;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: t.bgSurface,
+        title: Text('ipfs node diagnostics',
+            style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 14)),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                _ipfsRunning == true
+                    ? 'status: running ($_ipfsPeers peers)'
+                    : 'status: offline',
+                style: TextStyle(
+                  color: _ipfsRunning == true ? const Color(0xFF4CAF50) : t.textSecondary,
+                  fontFamily: 'monospace', fontSize: 12,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text('daemon log:', style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 11)),
+              const SizedBox(height: 4),
+              SelectableText(
+                log,
+                style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 10, height: 1.5),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () { Navigator.pop(ctx); _refreshIpfsStatus(); },
+            child: Text('refresh', style: TextStyle(color: t.accentLight, fontFamily: 'monospace')),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('close', style: TextStyle(color: t.textDisabled, fontFamily: 'monospace')),
+          ),
+        ],
+      ),
+    );
   }
 
   void _showTransportSheet(BuildContext context, PhantomTokens t, PhantomCore? core) {

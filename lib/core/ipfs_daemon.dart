@@ -31,6 +31,11 @@ class IpfsDaemon {
 
   bool _ensured = false;
   Process? _directProcess;
+  final _logBuf = StringBuffer();
+
+  /// Last captured stderr output from the daemon process.
+  /// Exposed for diagnostic display in the settings screen.
+  String get daemonLog => _logBuf.isEmpty ? '(no output)' : _logBuf.toString();
 
   /// Idempotent setup: init repo (first run) → start ForegroundService →
   /// fall back to direct spawn if the API doesn't come up in time.
@@ -177,17 +182,34 @@ class IpfsDaemon {
     final env = Map<String, String>.from(Platform.environment)
       ..['IPFS_PATH'] = repoPath;
 
+    _logBuf.clear();
+    _logBuf.writeln('[spawn] binary: $binary');
+    _logBuf.writeln('[spawn] repo:   $repoPath');
+    _logBuf.writeln('[spawn] HOME:   ${env['HOME'] ?? '(unset)'}');
+    _logBuf.writeln('[spawn] TMPDIR: ${env['TMPDIR'] ?? '(unset)'}');
+    _logBuf.writeln('---');
+
     _directProcess = await Process.start(
       binary,
       ['daemon', '--enable-pubsub-experiment', '--routing=dhtclient', '--migrate=true'],
       environment: env,
     );
-    // Drain stdout/stderr so the pipe buffer never blocks the daemon.
-    _directProcess!.stdout.drain<void>();
-    _directProcess!.stderr.drain<void>();
-    // Do NOT await API readiness here — the TransportManager retries automatically
-    // every 20 s via _activateLateTransports(), so we return immediately and let
-    // the app continue loading.
+
+    // Capture stdout + stderr so we know WHY the daemon fails.
+    _directProcess!.stdout
+        .transform(utf8.decoder)
+        .listen((s) { _logBuf.write(s); debugPrint('[IPFS] $s'); });
+    _directProcess!.stderr
+        .transform(utf8.decoder)
+        .listen((s) { _logBuf.write(s); debugPrint('[IPFS err] $s'); });
+
+    // Log the exit code when the process dies.
+    _directProcess!.exitCode.then((code) {
+      final msg = '[exit] daemon exited with code $code';
+      _logBuf.writeln(msg);
+      debugPrint('[IpfsDaemon] $msg');
+    });
+
     debugPrint('[IpfsDaemon] daemon spawned directly; transport will poll for readiness');
   }
 
