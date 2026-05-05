@@ -1420,6 +1420,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final inputBar = MessageInput(
       onSend:        _send,
       onSendFile:    _sendFile,
+      onEditImage:   _openPhotoEditor,
       glassEnabled:  g,
       glassOpacity:  _glassOpacity,
       glassBlur:     _glassBlur,
@@ -1570,20 +1571,26 @@ class _ChatScreenState extends State<ChatScreen> {
               Navigator.pop(context);
               final picked = await ImagePicker().pickImage(
                   source: ImageSource.gallery, imageQuality: 80);
-              if (picked != null && core != null && mounted) {
-                await core.storage.setWallpaper(widget.contactId, picked.path);
-                setState(() => _wallpaperPath = picked.path);
-              }
+              if (picked == null || core == null || !mounted) return;
+              final raw    = await picked.readAsBytes();
+              final edited = await _openPhotoEditor(raw);
+              if (!mounted) return;
+              final path = await _saveTempImage(edited ?? raw, picked.name);
+              await core.storage.setWallpaper(widget.contactId, path);
+              if (mounted) setState(() => _wallpaperPath = path);
             }),
           _MenuItem(icon: Icons.wallpaper_outlined, label: 'set global wallpaper', tokens: t,
             onTap: () async {
               Navigator.pop(context);
               final picked = await ImagePicker().pickImage(
                   source: ImageSource.gallery, imageQuality: 80);
-              if (picked != null && core != null && mounted) {
-                await core.storage.setWallpaper(null, picked.path);
-                if (_wallpaperPath == null) setState(() => _wallpaperPath = picked.path);
-              }
+              if (picked == null || core == null || !mounted) return;
+              final raw    = await picked.readAsBytes();
+              final edited = await _openPhotoEditor(raw);
+              if (!mounted) return;
+              final path = await _saveTempImage(edited ?? raw, picked.name);
+              await core.storage.setWallpaper(null, path);
+              if (mounted && _wallpaperPath == null) setState(() => _wallpaperPath = path);
             }),
           if (_wallpaperPath != null) ...[
             _MenuItem(icon: Icons.tune_outlined, label: 'adjust background', tokens: t,
@@ -1874,6 +1881,26 @@ class _ChatScreenState extends State<ChatScreen> {
         ],
       ),
     );
+  }
+
+  /// Opens the photo editor and returns the (possibly modified) bytes,
+  /// or the original bytes if the user taps send without editing.
+  /// Returns null if the user cancels (presses X).
+  Future<Uint8List?> _openPhotoEditor(Uint8List bytes) {
+    return Navigator.push<Uint8List>(
+      context,
+      _AppRoute(builder: (_) => PhotoEditorScreen(bytes: bytes)),
+    );
+  }
+
+  /// Saves [bytes] to the app's temp directory and returns the path.
+  /// Used when a file-path-based store (wallpaper, avatar) needs edited bytes.
+  Future<String> _saveTempImage(Uint8List bytes, String baseName) async {
+    final dir  = await getTemporaryDirectory();
+    final ts   = DateTime.now().millisecondsSinceEpoch;
+    final file = File('${dir.path}/ph_edit_${ts}_$baseName');
+    await file.writeAsBytes(bytes);
+    return file.path;
   }
 
   void _showWallpaperPositionSheet(BuildContext ctx, PhantomTokens t, PhantomCore? core) {
@@ -2410,10 +2437,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   onTap: () async {
                     final picked = await ImagePicker().pickImage(
                         source: ImageSource.gallery, imageQuality: 85, maxWidth: 512, maxHeight: 512);
-                    if (picked != null && core != null) {
-                      await core.storage.setOwnAvatarPath(picked.path);
-                      if (mounted) setState(() => _ownAvatarPath = picked.path);
-                    }
+                    if (picked == null || core == null || !mounted) return;
+                    final raw    = await picked.readAsBytes();
+                    if (!context.mounted) return;
+                    final edited = await Navigator.push<Uint8List>(
+                      context,
+                      _AppRoute(builder: (_) => PhotoEditorScreen(bytes: raw)),
+                    );
+                    if (!mounted) return;
+                    final dir  = await getTemporaryDirectory();
+                    final path = '${dir.path}/ph_avatar_${DateTime.now().millisecondsSinceEpoch}.jpg';
+                    await File(path).writeAsBytes(edited ?? raw);
+                    await core.storage.setOwnAvatarPath(path);
+                    if (mounted) setState(() => _ownAvatarPath = path);
                   },
                   child: Container(
                     width: 64, height: 64,

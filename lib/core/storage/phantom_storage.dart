@@ -260,6 +260,17 @@ class PhantomStorage {
     await box.delete(key);
   }
 
+  // ── INIT replay detection ─────────────────────────────────────────────────────
+  // Stores the hex of the last X3DH ephemeral key we accepted for each contact.
+  // When an INIT arrives with the SAME ephemeral key it is an ntfy replay —
+  // the existing session must not be overwritten.
+
+  Future<String?> getLastInitEkHex(String contactId) =>
+      getSetting<String>('init_ek_$contactId');
+
+  Future<void> setLastInitEkHex(String contactId, String ekHex) =>
+      setSetting('init_ek_$contactId', ekHex);
+
   Future<String> getWallpaperFit(String? contactId) async {
     final key = contactId == null ? 'wp_fit_global' : 'wp_fit_$contactId';
     return (await getSetting<String>(key)) ?? 'cover';

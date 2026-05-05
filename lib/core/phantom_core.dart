@@ -624,6 +624,23 @@ class PhantomCore {
     final senderCaBytes   = frame.senderContactAddressBytes;
     final senderPhantomId = frame.senderPhantomId;
 
+    // Replay detection: compare the incoming X3DH ephemeral key against the
+    // one we stored when we last processed a valid INIT from this sender.
+    // ntfy replays the last 12 h of messages on reconnect; without this check
+    // the replayed INIT would overwrite the current ratchet with a stale one.
+    //
+    // A re-INIT after clear-history produces a brand-new ephemeral key, so it
+    // passes this guard and correctly replaces the old session.
+    final incomingEkHex = senderEkBytes
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+    final storedEkHex = await storage.getLastInitEkHex(senderPhantomId);
+    if (storedEkHex != null && storedEkHex == incomingEkHex) {
+      // Same ephemeral key → ntfy replay.  Use existing session.
+      await _handleMsgFrame(frame);
+      return;
+    }
+
     final preKeyStore = await storage.getPreKeyStore();
     if (preKeyStore == null) return;
 
@@ -683,17 +700,15 @@ class PhantomCore {
         );
       }
 
-      // Install new session, replacing any stale one (handles re-INIT after
-      // one side clears history). If X3DH decryption succeeded the new session
-      // is authoritative; the old ratchet state is no longer valid.
+      // Persist the ephemeral key so future replays of this INIT are detected.
+      await storage.setLastInitEkHex(senderPhantomId, incomingEkHex);
       _sessions[senderPhantomId] = session;
       await _saveSession(senderPhantomId, session);
 
       await _dispatchIncoming(message, senderPhantomId);
     } catch (_) {
-      // X3DH decryption failed — this may be a duplicate INIT delivered by a
-      // second transport while the primary already advanced the ratchet. Try
-      // the existing session as a fallback.
+      // X3DH decryption failed — duplicate INIT from a second transport while
+      // the primary already advanced the ratchet.  Try existing session.
       if (_sessions.containsKey(senderPhantomId) ||
           await storage.getSessionState(senderPhantomId) != null) {
         await _handleMsgFrame(frame);

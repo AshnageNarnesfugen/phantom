@@ -575,6 +575,9 @@ enum _RecordState { idle, holding, locked }
 class MessageInput extends StatefulWidget {
   final void Function(String text) onSend;
   final void Function(Uint8List bytes, String fileName)? onSendFile;
+  /// Called with raw image bytes; should show an editor and return the
+  /// (possibly edited) bytes, or null if the user cancels.
+  final Future<Uint8List?> Function(Uint8List bytes)? onEditImage;
   final String? replyPreview;
   final VoidCallback? onCancelReply;
   final bool glassEnabled;
@@ -585,6 +588,7 @@ class MessageInput extends StatefulWidget {
     super.key,
     required this.onSend,
     this.onSendFile,
+    this.onEditImage,
     this.replyPreview,
     this.onCancelReply,
     this.glassEnabled = false,
@@ -681,13 +685,11 @@ class _MessageInputState extends State<MessageInput> {
               final picked = await ImagePicker().pickImage(
                   source: ImageSource.gallery, imageQuality: 80);
               if (picked == null || widget.onSendFile == null) return;
-              final bytes = await picked.readAsBytes();
-              if (!mounted) return;
-              final edited = await Navigator.push<Uint8List>(
-                context,
-                MaterialPageRoute(builder: (_) => PhotoEditorScreen(bytes: bytes)),
-              );
-              if (edited != null) widget.onSendFile!(edited, picked.name);
+              final raw  = await picked.readAsBytes();
+              final bytes = widget.onEditImage != null
+                  ? await widget.onEditImage!(raw) ?? raw
+                  : raw;
+              widget.onSendFile!(bytes, picked.name);
             }),
           _AttachItem(icon: Icons.videocam_outlined, label: 'video from gallery', tokens: t,
             onTap: () async {
@@ -704,13 +706,11 @@ class _MessageInputState extends State<MessageInput> {
               final picked = await ImagePicker().pickImage(
                   source: ImageSource.camera, imageQuality: 80);
               if (picked == null || widget.onSendFile == null) return;
-              final bytes = await picked.readAsBytes();
-              if (!mounted) return;
-              final edited = await Navigator.push<Uint8List>(
-                context,
-                MaterialPageRoute(builder: (_) => PhotoEditorScreen(bytes: bytes)),
-              );
-              if (edited != null) widget.onSendFile!(edited, picked.name);
+              final raw  = await picked.readAsBytes();
+              final bytes = widget.onEditImage != null
+                  ? await widget.onEditImage!(raw) ?? raw
+                  : raw;
+              widget.onSendFile!(bytes, picked.name);
             }),
           _AttachItem(icon: Icons.folder_outlined, label: 'file', tokens: t,
             onTap: () async {
