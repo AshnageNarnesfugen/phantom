@@ -10,12 +10,16 @@ class CoreProvider extends InheritedWidget {
   final PhantomCore? core;
   final ThemeController themeCtrl;
   final Future<void> Function(PhantomCore core, String seedPhrase) onAccountReady;
+  /// Dispose the current core and recreate it with a new ntfy base URL.
+  /// Pass null or empty string to revert to the default (https://ntfy.sh).
+  final Future<void> Function(String? ntfyUrl) onRestartCore;
 
   const CoreProvider({
     super.key,
     required this.core,
     required this.themeCtrl,
     required this.onAccountReady,
+    required this.onRestartCore,
     required super.child,
   });
 

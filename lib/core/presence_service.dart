@@ -27,6 +27,9 @@ class PresenceService {
   Timer? _heartbeatTimer;
   bool _disposed = false;
 
+  /// Always false — IPFS presence has no rate limits.
+  bool get isRateLimited => false;
+
   /// Emits a contactId whenever that contact's online status changes.
   Stream<String> get changes => _changesCtrl.stream;
 

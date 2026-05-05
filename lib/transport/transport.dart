@@ -71,6 +71,7 @@ class TransportManager {
 
   TransportManager({
     String? ipfsApiUrl,
+    String? ntfyBaseUrl,
     String? i2pSocksHost,
     int? i2pSocksPort,
     String? yggdrasilAddress,
@@ -80,6 +81,7 @@ class TransportManager {
           if (i2pSocksHost != null && i2pSocksPort != null)
             I2PTransport(socksHost: i2pSocksHost, socksPort: i2pSocksPort),
           IpfsTransport(apiUrl: ipfsApiUrl ?? 'http://127.0.0.1:5001'),
+          NtfyTransport(baseUrl: ntfyBaseUrl ?? 'https://ntfy.sh'),
         ];
 
   /// Checks all transports in parallel and starts every reachable one.
@@ -105,7 +107,7 @@ class TransportManager {
 
     if (_activeTransports.isEmpty) {
       throw const TransportException(
-          'No transport available. Make sure the IPFS daemon is running.');
+          'No transport available (IPFS daemon not running, ntfy unreachable).');
     }
   }
 
@@ -364,5 +366,121 @@ class TransportException implements Exception {
   const TransportException(this.message);
   @override
   String toString() => 'TransportException: $message';
+}
+
+// ── ntfy Relay Transport ──────────────────────────────────────────────────────
+
+/// Store-and-forward relay via an ntfy-compatible server.
+///
+/// Used alongside IpfsTransport: IPFS handles direct peer-to-peer delivery
+/// (fast on the same local network via mDNS), ntfy guarantees delivery when
+/// peers are on different networks or come online at different times.
+///
+/// Point [baseUrl] to a self-hosted ntfy instance for zero rate limits:
+///   https://docs.ntfy.sh/install/
+/// The default (ntfy.sh) has a 250-publish/day limit on the shared IP.
+class NtfyTransport implements PhantomTransport {
+  final String _baseUrl;
+  final http.Client _client = http.Client();
+  int _lastSeenAt = 0;
+
+  static const int _maxTextPayload = 2940;
+  static const String _textTitle   = 'ph-msg';
+
+  @override final String name = 'ntfy-relay';
+  @override bool get isAvailable => true;
+
+  NtfyTransport({String baseUrl = 'https://ntfy.sh'}) : _baseUrl = baseUrl;
+
+  @override
+  Future<bool> checkAvailability() async {
+    try {
+      final resp = await _client
+          .get(Uri.parse('$_baseUrl/v1/health'))
+          .timeout(const Duration(seconds: 5));
+      return resp.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<void> publish({
+    required String recipientId,
+    required Uint8List encryptedEnvelope,
+  }) async {
+    final topic = _topic(recipientId);
+    final http.Response response;
+
+    if (encryptedEnvelope.length <= _maxTextPayload) {
+      response = await _client.post(
+        Uri.parse('$_baseUrl/$topic'),
+        headers: {'Content-Type': 'text/plain', 'X-Title': _textTitle},
+        body: base64.encode(encryptedEnvelope),
+      ).timeout(const Duration(seconds: 15));
+    } else {
+      response = await _client.put(
+        Uri.parse('$_baseUrl/$topic'),
+        headers: {'Content-Type': 'application/octet-stream', 'Filename': 'msg.bin'},
+        body: encryptedEnvelope,
+      ).timeout(const Duration(seconds: 15));
+    }
+
+    if (response.statusCode != 200) {
+      throw TransportException('ntfy publish failed: ${response.statusCode}');
+    }
+  }
+
+  @override
+  Stream<IncomingEnvelope> subscribe({required String ourId}) async* {
+    final topic = _topic(ourId);
+    if (_lastSeenAt == 0) {
+      _lastSeenAt = DateTime.now().millisecondsSinceEpoch ~/ 1000 - 43200;
+    }
+
+    while (true) {
+      try {
+        final uri = Uri.parse('$_baseUrl/$topic/json?since=$_lastSeenAt');
+        final streamed = await _client.send(http.Request('GET', uri));
+
+        await for (final line in streamed.stream
+            .transform(utf8.decoder)
+            .transform(const LineSplitter())) {
+          if (line.trim().isEmpty) continue;
+          try {
+            final ev = jsonDecode(line) as Map<String, dynamic>;
+            if (ev['event'] == 'open') continue;
+            if (ev['event'] != 'message') continue;
+            final at = (ev['time'] as num?)?.toInt() ?? 0;
+
+            Uint8List? bytes;
+            if (ev['title'] == _textTitle) {
+              final body = (ev['message'] as String?)?.trim() ?? '';
+              if (body.isNotEmpty) try { bytes = base64.decode(body); } catch (_) {}
+            } else {
+              final url = (ev['attachment'] as Map?)?['url'] as String?;
+              if (url != null) {
+                try {
+                  final r = await _client.get(Uri.parse(url))
+                      .timeout(const Duration(seconds: 10));
+                  if (r.statusCode == 200) bytes = r.bodyBytes;
+                } catch (_) { continue; }
+              }
+            }
+            if (bytes == null) continue;
+            if (at > _lastSeenAt) _lastSeenAt = at;
+            yield IncomingEnvelope(data: bytes, transportName: name, receivedAt: DateTime.now());
+          } catch (_) { continue; }
+        }
+      } catch (_) {
+        await Future.delayed(const Duration(seconds: 10));
+      }
+    }
+  }
+
+  static String _topic(String phantomId) => 'ph-$phantomId';
+
+  @override
+  Future<void> dispose() async => _client.close();
 }
 
