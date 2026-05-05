@@ -384,6 +384,14 @@ class NtfyTransport implements PhantomTransport {
   /// Passed as `since=` on reconnect to avoid missing messages during gaps.
   int _lastSeenAt = 0;
 
+  /// Payloads at or below this size are sent as base64 text in the ntfy message
+  /// body (retained 12 h by ntfy.sh). Larger payloads use a binary PUT
+  /// attachment (retained 3 h only).
+  static const int _maxTextPayload = 2940;
+
+  /// Marker in the ntfy X-Title header that identifies a Phantom base64 message.
+  static const String _textTitle = 'ph-msg';
+
   @override
   final String name = 'ntfy-relay';
 
@@ -410,18 +418,36 @@ class NtfyTransport implements PhantomTransport {
     required Uint8List encryptedEnvelope,
   }) async {
     final topic = _topicForId(recipientId);
-    // PUT creates a binary attachment (preserves arbitrary bytes).
-    // POST sends body as text and garbles non-UTF-8 bytes.
-    final response = await _client
-        .put(
-          Uri.parse('$_baseUrl/$topic'),
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'Filename': 'msg.bin',
-          },
-          body: encryptedEnvelope,
-        )
-        .timeout(const Duration(seconds: 15));
+    final http.Response response;
+
+    if (encryptedEnvelope.length <= _maxTextPayload) {
+      // Small payload: send as base64 text body. ntfy retains text messages for
+      // 12 h, vs only 3 h for binary attachments. The X-Title marker lets the
+      // subscriber distinguish Phantom messages from unrelated ntfy traffic.
+      response = await _client
+          .post(
+            Uri.parse('$_baseUrl/$topic'),
+            headers: {
+              'Content-Type': 'text/plain',
+              'X-Title': _textTitle,
+            },
+            body: base64.encode(encryptedEnvelope),
+          )
+          .timeout(const Duration(seconds: 15));
+    } else {
+      // Large payload (images, files): binary PUT attachment.
+      response = await _client
+          .put(
+            Uri.parse('$_baseUrl/$topic'),
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'Filename': 'msg.bin',
+            },
+            body: encryptedEnvelope,
+          )
+          .timeout(const Duration(seconds: 15));
+    }
+
     if (response.statusCode != 200) {
       throw TransportException(
           'ntfy publish failed: ${response.statusCode} ${response.body}');
@@ -432,11 +458,11 @@ class NtfyTransport implements PhantomTransport {
   Stream<IncomingEnvelope> subscribe({required String ourId}) async* {
     final topic = _topicForId(ourId);
 
-    // On first open look back 3 hours — matching ntfy's attachment download
-    // window — to recover messages missed while the app was closed.
-    // On reconnect, resume from the last acknowledged event.
+    // On first open look back 12 h — matching ntfy's default message-cache
+    // retention — to recover messages missed while the app was closed.
+    // On reconnect, resume from the last successfully processed event.
     if (_lastSeenAt == 0) {
-      _lastSeenAt = DateTime.now().millisecondsSinceEpoch ~/ 1000 - 10800;
+      _lastSeenAt = DateTime.now().millisecondsSinceEpoch ~/ 1000 - 43200;
     }
 
     while (true) {
@@ -457,19 +483,42 @@ class NtfyTransport implements PhantomTransport {
             if (event['event'] != 'message') continue;
 
             final at = (event['time'] as num?)?.toInt() ?? 0;
+
+            Uint8List? bytes;
+
+            if (event['title'] == _textTitle) {
+              // Base64 text body — small Phantom message.
+              final body = (event['message'] as String?)?.trim() ?? '';
+              if (body.isNotEmpty) {
+                try { bytes = base64.decode(body); } catch (_) {}
+              }
+            } else {
+              // Binary attachment — large Phantom message (image / file).
+              final attachment = event['attachment'] as Map<String, dynamic>?;
+              final attachUrl = attachment?['url'] as String?;
+              if (attachUrl != null) {
+                try {
+                  final binResp = await _client
+                      .get(Uri.parse(attachUrl))
+                      .timeout(const Duration(seconds: 10));
+                  if (binResp.statusCode == 200) bytes = binResp.bodyBytes;
+                } catch (_) {
+                  // Transient download error — do NOT advance _lastSeenAt so
+                  // this event is retried on the next reconnect.
+                  continue;
+                }
+              }
+            }
+
+            if (bytes == null) continue;
+
+            // Only advance the cursor after a successful byte extraction so
+            // that transient failures (network blip, expired attachment) are
+            // retried on the next reconnect rather than silently lost.
             if (at > _lastSeenAt) _lastSeenAt = at;
 
-            final attachment = event['attachment'] as Map<String, dynamic>?;
-            final attachUrl = attachment?['url'] as String?;
-            if (attachUrl == null) continue;
-
-            final binResp = await _client
-                .get(Uri.parse(attachUrl))
-                .timeout(const Duration(seconds: 10));
-            if (binResp.statusCode != 200) continue;
-
             yield IncomingEnvelope(
-              data: binResp.bodyBytes,
+              data: bytes,
               transportName: name,
               receivedAt: DateTime.now(),
             );

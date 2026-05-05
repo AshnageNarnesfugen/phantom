@@ -38,7 +38,11 @@ class NotificationService {
     required String preview,
     required String contactId,
   }) async {
-    if (!_initialized) return;
+    if (!_initialized) {
+      // Initialization may have failed silently on startup — retry once.
+      await initialize().catchError((_) {});
+      if (!_initialized) return;
+    }
 
     const details = NotificationDetails(
       android: AndroidNotificationDetails(
