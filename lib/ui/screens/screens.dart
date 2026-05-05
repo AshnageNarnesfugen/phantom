@@ -1060,6 +1060,8 @@ class _ChatScreenState extends State<ChatScreen> {
   StreamSubscription<String>? _presenceSub;
   StoredMessage? _replyTo;
   String?   _wallpaperPath;
+  BoxFit    _bgFit       = BoxFit.cover;
+  Alignment _bgAlignment = Alignment.center;
   ui.Image? _blurredBg;
   PhantomCore? _core; // cached — safe to use in dispose()
 
@@ -1094,14 +1096,44 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _loadWallpaper(PhantomCore core) async {
     final path = await core.storage.getWallpaper(widget.contactId)
               ?? await core.storage.getWallpaper(null);
+    final fitStr   = await core.storage.getWallpaperFit(widget.contactId);
+    final alignStr = await core.storage.getWallpaperAlignment(widget.contactId);
     if (path != null && mounted) {
       final f = File(path);
       if (await f.exists()) {
-        setState(() => _wallpaperPath = path);
+        setState(() {
+          _wallpaperPath = path;
+          _bgFit       = _parseFit(fitStr);
+          _bgAlignment = _parseAlignment(alignStr);
+        });
         _refreshBlurredBg();
       }
     }
   }
+
+  static BoxFit _parseFit(String v) => switch (v) {
+    'contain' => BoxFit.contain,
+    'fill'    => BoxFit.fill,
+    'fitW'    => BoxFit.fitWidth,
+    'fitH'    => BoxFit.fitHeight,
+    _         => BoxFit.cover,
+  };
+
+  static String _fitName(BoxFit f) => switch (f) {
+    BoxFit.contain   => 'contain',
+    BoxFit.fill      => 'fill',
+    BoxFit.fitWidth  => 'fitW',
+    BoxFit.fitHeight => 'fitH',
+    _                => 'cover',
+  };
+
+  static Alignment _parseAlignment(String v) {
+    final p = v.split(',');
+    if (p.length < 2) return Alignment.center;
+    return Alignment(double.tryParse(p[0]) ?? 0, double.tryParse(p[1]) ?? 0);
+  }
+
+  static String _alignName(Alignment a) => '${a.x},${a.y}';
 
   Future<void> _loadGlass(PhantomCore core) async {
     final enabled  = await core.storage.getGlassEnabled();
@@ -1425,9 +1457,9 @@ class _ChatScreenState extends State<ChatScreen> {
                         sigmaY: _glassBlur,
                         tileMode: TileMode.clamp,
                       ),
-                      child: Image.file(File(bgPath), fit: BoxFit.cover),
+                      child: Image.file(File(bgPath), fit: _bgFit, alignment: _bgAlignment),
                     )
-                  : Image.file(File(bgPath), fit: BoxFit.cover)
+                  : Image.file(File(bgPath), fit: _bgFit, alignment: _bgAlignment)
               : _GlassFallback(accent: t.accentLight),
         ),
       ),
@@ -1503,7 +1535,8 @@ class _ChatScreenState extends State<ChatScreen> {
         decoration: BoxDecoration(
           image: DecorationImage(
             image: FileImage(File(_wallpaperPath!)),
-            fit: BoxFit.cover,
+            fit: _bgFit,
+            alignment: _bgAlignment,
             opacity: 0.25,
           ),
         ),
@@ -1552,7 +1585,12 @@ class _ChatScreenState extends State<ChatScreen> {
                 if (_wallpaperPath == null) setState(() => _wallpaperPath = picked.path);
               }
             }),
-          if (_wallpaperPath != null)
+          if (_wallpaperPath != null) ...[
+            _MenuItem(icon: Icons.tune_outlined, label: 'adjust background', tokens: t,
+              onTap: () {
+                Navigator.pop(context);
+                _showWallpaperPositionSheet(context, t, core);
+              }),
             _MenuItem(icon: Icons.hide_image_outlined, label: 'remove wallpaper', tokens: t,
               onTap: () async {
                 Navigator.pop(context);
@@ -1561,6 +1599,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   if (mounted) setState(() => _wallpaperPath = null);
                 }
               }),
+          ],
           _MenuItem(icon: Icons.account_circle_outlined, label: 'share my avatar', tokens: t,
             onTap: () async {
               Navigator.pop(context);
@@ -1837,8 +1876,188 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  void _showWallpaperPositionSheet(BuildContext ctx, PhantomTokens t, PhantomCore? core) {
+    showModalBottomSheet(
+      context: ctx,
+      backgroundColor: t.bgSurface,
+      shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(t.radiusCard))),
+      builder: (_) => _WallpaperPositionSheet(
+        wallpaperPath: _wallpaperPath!,
+        currentFit:       _bgFit,
+        currentAlignment: _bgAlignment,
+        tokens: t,
+        onChanged: (fit, alignment) async {
+          await core?.storage.setWallpaperFit(widget.contactId, _fitName(fit));
+          await core?.storage.setWallpaperAlignment(widget.contactId, _alignName(alignment));
+          if (mounted) setState(() { _bgFit = fit; _bgAlignment = alignment; });
+        },
+      ),
+    );
+  }
+
   static String _formatTime(DateTime dt) {
     return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+  }
+}
+
+// ── Wallpaper position sheet ─────────────────────────────────────────────────
+
+class _WallpaperPositionSheet extends StatefulWidget {
+  final String wallpaperPath;
+  final BoxFit currentFit;
+  final Alignment currentAlignment;
+  final PhantomTokens tokens;
+  final void Function(BoxFit, Alignment) onChanged;
+
+  const _WallpaperPositionSheet({
+    required this.wallpaperPath,
+    required this.currentFit,
+    required this.currentAlignment,
+    required this.tokens,
+    required this.onChanged,
+  });
+
+  @override
+  State<_WallpaperPositionSheet> createState() => _WallpaperPositionSheetState();
+}
+
+class _WallpaperPositionSheetState extends State<_WallpaperPositionSheet> {
+  late BoxFit _fit;
+  late Alignment _alignment;
+
+  static const _fits = [BoxFit.cover, BoxFit.contain, BoxFit.fill];
+  static const _fitLabels = ['cover', 'contain', 'fill'];
+
+  static const _alignments = [
+    [Alignment.topLeft,    Alignment.topCenter,    Alignment.topRight],
+    [Alignment.centerLeft, Alignment.center,       Alignment.centerRight],
+    [Alignment.bottomLeft, Alignment.bottomCenter, Alignment.bottomRight],
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _fit       = widget.currentFit;
+    _alignment = widget.currentAlignment;
+  }
+
+  void _apply(BoxFit fit, Alignment alignment) {
+    setState(() { _fit = fit; _alignment = alignment; });
+    widget.onChanged(fit, alignment);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = widget.tokens;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Center(child: Container(
+            width: 36, height: 3,
+            decoration: BoxDecoration(color: t.divider, borderRadius: BorderRadius.circular(2)),
+          )),
+          const SizedBox(height: 16),
+
+          // ── Preview ───────────────────────────────────────────────────────
+          ClipRRect(
+            borderRadius: BorderRadius.circular(t.radiusCard),
+            child: SizedBox(
+              height: 140,
+              width: double.infinity,
+              child: Image.file(
+                File(widget.wallpaperPath),
+                fit:       _fit,
+                alignment: _alignment,
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // ── Fit ───────────────────────────────────────────────────────────
+          Text('fit', style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
+          const SizedBox(height: 8),
+          Row(
+            children: List.generate(_fits.length, (i) {
+              final selected = _fit == _fits[i];
+              return Expanded(
+                child: GestureDetector(
+                  onTap: () => _apply(_fits[i], _alignment),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 150),
+                    margin: EdgeInsets.only(right: i < _fits.length - 1 ? 8 : 0),
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    decoration: BoxDecoration(
+                      color: selected ? t.accentLight.withValues(alpha: 0.15) : t.bgSubtle,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: selected ? t.accentLight : t.inputBorder,
+                        width: selected ? 1.5 : 0.8,
+                      ),
+                    ),
+                    child: Text(
+                      _fitLabels[i],
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: selected ? t.accentLight : t.textSecondary,
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }),
+          ),
+          const SizedBox(height: 16),
+
+          // ── Alignment ─────────────────────────────────────────────────────
+          Text('position', style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
+          const SizedBox(height: 8),
+          Column(
+            children: List.generate(3, (row) => Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(
+                children: List.generate(3, (col) {
+                  final a = _alignments[row][col];
+                  final selected = _alignment == a;
+                  return Expanded(
+                    child: GestureDetector(
+                      onTap: () => _apply(_fit, a),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 150),
+                        margin: EdgeInsets.only(right: col < 2 ? 6 : 0),
+                        height: 36,
+                        decoration: BoxDecoration(
+                          color: selected ? t.accentLight.withValues(alpha: 0.15) : t.bgSubtle,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: selected ? t.accentLight : t.inputBorder,
+                            width: selected ? 1.5 : 0.8,
+                          ),
+                        ),
+                        child: Center(
+                          child: Container(
+                            width: 6, height: 6,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: selected ? t.accentLight : t.textDisabled,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+                }),
+              ),
+            )),
+          ),
+        ],
+      ),
+    );
   }
 }
 

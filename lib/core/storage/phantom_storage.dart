@@ -260,6 +260,26 @@ class PhantomStorage {
     await box.delete(key);
   }
 
+  Future<String> getWallpaperFit(String? contactId) async {
+    final key = contactId == null ? 'wp_fit_global' : 'wp_fit_$contactId';
+    return (await getSetting<String>(key)) ?? 'cover';
+  }
+
+  Future<void> setWallpaperFit(String? contactId, String fit) {
+    final key = contactId == null ? 'wp_fit_global' : 'wp_fit_$contactId';
+    return setSetting(key, fit);
+  }
+
+  Future<String> getWallpaperAlignment(String? contactId) async {
+    final key = contactId == null ? 'wp_align_global' : 'wp_align_$contactId';
+    return (await getSetting<String>(key)) ?? '0.0,0.0';
+  }
+
+  Future<void> setWallpaperAlignment(String? contactId, String alignment) {
+    final key = contactId == null ? 'wp_align_global' : 'wp_align_$contactId';
+    return setSetting(key, alignment);
+  }
+
   Future<String?> getAppWallpaper() async {
     final path = await getSetting<String>('wallpaper_app');
     if (path == null) return null;

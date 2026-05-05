@@ -680,10 +680,14 @@ class _MessageInputState extends State<MessageInput> {
               Navigator.pop(ctx);
               final picked = await ImagePicker().pickImage(
                   source: ImageSource.gallery, imageQuality: 80);
-              if (picked != null && widget.onSendFile != null) {
-                final bytes = await picked.readAsBytes();
-                widget.onSendFile!(bytes, picked.name);
-              }
+              if (picked == null || widget.onSendFile == null) return;
+              final bytes = await picked.readAsBytes();
+              if (!ctx.mounted) return;
+              final edited = await Navigator.push<Uint8List>(
+                ctx,
+                MaterialPageRoute(builder: (_) => PhotoEditorScreen(bytes: bytes)),
+              );
+              if (edited != null) widget.onSendFile!(edited, picked.name);
             }),
           _AttachItem(icon: Icons.videocam_outlined, label: 'video from gallery', tokens: t,
             onTap: () async {
@@ -699,10 +703,14 @@ class _MessageInputState extends State<MessageInput> {
               Navigator.pop(ctx);
               final picked = await ImagePicker().pickImage(
                   source: ImageSource.camera, imageQuality: 80);
-              if (picked != null && widget.onSendFile != null) {
-                final bytes = await picked.readAsBytes();
-                widget.onSendFile!(bytes, picked.name);
-              }
+              if (picked == null || widget.onSendFile == null) return;
+              final bytes = await picked.readAsBytes();
+              if (!ctx.mounted) return;
+              final edited = await Navigator.push<Uint8List>(
+                ctx,
+                MaterialPageRoute(builder: (_) => PhotoEditorScreen(bytes: bytes)),
+              );
+              if (edited != null) widget.onSendFile!(edited, picked.name);
             }),
           _AttachItem(icon: Icons.folder_outlined, label: 'file', tokens: t,
             onTap: () async {
@@ -1604,4 +1612,188 @@ class _NoisePainter extends CustomPainter {
   @override
   bool shouldRepaint(_NoisePainter old) =>
       old.noise != noise || old.strength != strength;
+}
+
+// ── PhotoEditorScreen ─────────────────────────────────────────────────────────
+//
+// Full-screen photo preview shown before sending a gallery or camera image.
+// Supports rotate (90° steps) and horizontal flip. On confirm the transforms
+// are baked into the bytes at original resolution using dart:ui so the output
+// is full-quality regardless of screen size.
+
+class PhotoEditorScreen extends StatefulWidget {
+  final Uint8List bytes;
+  const PhotoEditorScreen({super.key, required this.bytes});
+
+  @override
+  State<PhotoEditorScreen> createState() => _PhotoEditorScreenState();
+}
+
+class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
+  int  _rotation = 0; // 0=0°  1=90°CW  2=180°  3=270°CW
+  bool _flipH    = false;
+  bool _sending  = false;
+
+  void _rotate(int delta) => setState(() => _rotation = (_rotation + delta + 4) % 4);
+
+  Future<void> _send() async {
+    if (_sending) return;
+    setState(() => _sending = true);
+    try {
+      final result = await _applyTransforms();
+      if (mounted) Navigator.pop(context, result);
+    } catch (_) {
+      if (mounted) Navigator.pop(context);
+    }
+  }
+
+  Future<Uint8List> _applyTransforms() async {
+    final codec = await ui.instantiateImageCodec(widget.bytes);
+    final frame = await codec.getNextFrame();
+    final src   = frame.image;
+    final srcW  = src.width.toDouble();
+    final srcH  = src.height.toDouble();
+
+    // 90° / 270° rotations swap width and height.
+    final swapped = _rotation % 2 == 1;
+    final outW    = swapped ? srcH : srcW;
+    final outH    = swapped ? srcW : srcH;
+
+    final recorder = ui.PictureRecorder();
+    final canvas   = Canvas(recorder, Rect.fromLTWH(0, 0, outW, outH));
+
+    // Build transform: translate to output center, rotate, flip, then draw
+    // image centred at origin.
+    canvas.translate(outW / 2, outH / 2);
+    if (_rotation != 0) canvas.rotate(_rotation * math.pi / 2);
+    if (_flipH) canvas.scale(-1.0, 1.0);
+    canvas.drawImage(src, Offset(-srcW / 2, -srcH / 2), Paint());
+    src.dispose();
+
+    final picture = recorder.endRecording();
+    final result  = await picture.toImage(outW.round(), outH.round());
+    picture.dispose();
+
+    final data = await result.toByteData(format: ui.ImageByteFormat.png);
+    result.dispose();
+    return data!.buffer.asUint8List();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = PhantomTheme.tokensOf(context);
+
+    // Preview transform: rotate then flip (matches _applyTransforms).
+    final angle = _rotation * math.pi / 2;
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        leading: IconButton(
+          icon: const Icon(Icons.close),
+          onPressed: () => Navigator.pop(context),
+        ),
+        actions: [
+          if (_sending)
+            const Padding(
+              padding: EdgeInsets.all(14),
+              child: SizedBox(
+                width: 20, height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+              ),
+            )
+          else
+            IconButton(
+              icon: const Icon(Icons.send_rounded),
+              tooltip: 'send',
+              onPressed: _send,
+            ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // ── Image preview ─────────────────────────────────────────────────
+          Expanded(
+            child: Center(
+              child: Transform.rotate(
+                angle: angle,
+                child: Transform.scale(
+                  scaleX: _flipH ? -1.0 : 1.0,
+                  child: Image.memory(
+                    widget.bytes,
+                    fit: BoxFit.contain,
+                    gaplessPlayback: true,
+                  ),
+                ),
+              ),
+            ),
+          ),
+
+          // ── Toolbar ───────────────────────────────────────────────────────
+          Container(
+            color: const Color(0xFF111111),
+            padding: const EdgeInsets.symmetric(vertical: 10),
+            child: SafeArea(
+              top: false,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  _EditorBtn(
+                    icon: Icons.rotate_left_rounded,
+                    label: 'left',
+                    color: t.accentLight,
+                    onTap: () => _rotate(-1),
+                  ),
+                  _EditorBtn(
+                    icon: Icons.rotate_right_rounded,
+                    label: 'right',
+                    color: t.accentLight,
+                    onTap: () => _rotate(1),
+                  ),
+                  _EditorBtn(
+                    icon: Icons.flip_rounded,
+                    label: 'flip',
+                    color: _flipH ? t.accentLight : Colors.white54,
+                    onTap: () => setState(() => _flipH = !_flipH),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EditorBtn extends StatelessWidget {
+  final IconData icon;
+  final String   label;
+  final Color    color;
+  final VoidCallback onTap;
+
+  const _EditorBtn({
+    required this.icon,
+    required this.label,
+    required this.color,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: color, size: 28),
+          const SizedBox(height: 4),
+          Text(label,
+              style: TextStyle(color: color, fontFamily: 'monospace', fontSize: 11)),
+        ],
+      ),
+    );
+  }
 }
