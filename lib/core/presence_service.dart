@@ -30,6 +30,10 @@ class PresenceService {
   Timer? _heartbeatTimer;
   bool _disposed = false;
 
+  /// True while ntfy is rejecting our heartbeats (rate-limited).
+  bool _rateLimited = false;
+  bool get isRateLimited => _rateLimited;
+
   /// Emits a contactId whenever that contact's online status changes.
   Stream<String> get changes => _changesCtrl.stream;
 
@@ -118,18 +122,17 @@ class PresenceService {
   Future<void> _publishHeartbeat({bool online = true}) async {
     if (_disposed) return;
     try {
-      await _client.post(
+      final resp = await _client.post(
         Uri.parse('$_base/${_topic(_myId)}'),
         headers: {
           'Content-Type': 'text/plain',
-          // Offline marker needs a long TTL so subscribers that reconnect later
-          // still see it and don't treat an old heartbeat as "still online".
           'X-TTL': online
               ? '${_threshold.inSeconds + 120}'
               : '${_threshold.inSeconds * 3}',
         },
         body: online ? '1' : '0',
       ).timeout(const Duration(seconds: 10));
+      _rateLimited = resp.statusCode == 429;
     } catch (_) {}
   }
 

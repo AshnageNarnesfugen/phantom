@@ -63,6 +63,7 @@ class PhantomCore {
 
   PresenceService? _presence;
   bool isContactOnline(String contactId) => _presence?.isOnline(contactId) ?? false;
+  bool get presenceRateLimited => _presence?.isRateLimited ?? false;
   Stream<String> get presenceChanges => _presence?.changes ?? const Stream.empty();
 
   String? _activeChatId;

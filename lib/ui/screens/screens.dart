@@ -1390,7 +1390,13 @@ class _ChatScreenState extends State<ChatScreen> {
               ],
             ),
           ),
-          if (core?.isContactOnline(widget.contactId) == true)
+          if (core?.presenceRateLimited == true)
+            Tooltip(
+              message: 'ntfy rate limit — presence paused',
+              child: Icon(Icons.cloud_off_outlined, size: 13,
+                  color: t.textDisabled, semanticLabel: 'rate limited'),
+            )
+          else if (core?.isContactOnline(widget.contactId) == true)
             Container(
               width: 9, height: 9,
               margin: const EdgeInsets.only(right: 4),
