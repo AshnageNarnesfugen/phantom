@@ -6,7 +6,7 @@ import 'bluetooth/mesh_protocol.dart';
 import 'bluetooth/message_store.dart';
 
 // Retry interval when pending messages remain after a flush attempt.
-const _kRetryInterval = Duration(minutes: 5);
+const _kRetryInterval = Duration(seconds: 30);
 
 /// TransportManager v2 — top-level transport coordinator.
 ///

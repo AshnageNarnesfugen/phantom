@@ -63,9 +63,6 @@ class PhantomCore {
 
   PresenceService? _presence;
   String? _ipfsApiUrl;
-  String? _ntfyBaseUrl;
-  String get ntfyBaseUrl => _ntfyBaseUrl ?? 'https://ntfy.sh';
-  bool get presenceRateLimited => _presence?.isRateLimited ?? false;
   bool isContactOnline(String contactId) => _presence?.isOnline(contactId) ?? false;
   Stream<String> get presenceChanges => _presence?.changes ?? const Stream.empty();
 
@@ -104,7 +101,6 @@ class PhantomCore {
       transport: transport,
     );
     core._ipfsApiUrl  = transportConfig?.ipfsApiUrl;
-    core._ntfyBaseUrl = transportConfig?.ntfyBaseUrl;
     core._transportV2 = _buildTransportV2(transport, core.myId);
 
     // Derive Kyber-768 keypair deterministically from the seed phrase.
@@ -135,7 +131,6 @@ class PhantomCore {
       transport: transport,
     );
     core._ipfsApiUrl  = transportConfig?.ipfsApiUrl;
-    core._ntfyBaseUrl = transportConfig?.ntfyBaseUrl;
     core._transportV2 = _buildTransportV2(transport, core.myId);
 
     await core._initKyberKeys(seedPhrase);
@@ -158,7 +153,6 @@ class PhantomCore {
   static TransportManager _buildTransport(TransportConfig? config) {
     return TransportManager(
       ipfsApiUrl:       config?.ipfsApiUrl,
-      ntfyBaseUrl:      config?.ntfyBaseUrl,
       i2pSocksHost:     config?.i2pSocksHost,
       i2pSocksPort:     config?.i2pSocksPort,
       yggdrasilAddress: config?.yggdrasilAddress,
@@ -971,14 +965,12 @@ class PhantomCore {
 @immutable
 class TransportConfig {
   final String? ipfsApiUrl;
-  final String? ntfyBaseUrl;
   final String? i2pSocksHost;
   final int?    i2pSocksPort;
   final String? yggdrasilAddress;
 
   const TransportConfig({
     this.ipfsApiUrl,
-    this.ntfyBaseUrl,
     this.i2pSocksHost,
     this.i2pSocksPort,
     this.yggdrasilAddress,

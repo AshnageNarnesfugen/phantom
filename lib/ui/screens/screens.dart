@@ -1390,13 +1390,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ],
             ),
           ),
-          if (core?.presenceRateLimited == true)
-            Tooltip(
-              message: 'ntfy rate limit — presence paused',
-              child: Icon(Icons.cloud_off_outlined, size: 13,
-                  color: t.textDisabled, semanticLabel: 'rate limited'),
-            )
-          else if (core?.isContactOnline(widget.contactId) == true)
+          if (core?.isContactOnline(widget.contactId) == true)
             Container(
               width: 9, height: 9,
               margin: const EdgeInsets.only(right: 4),
@@ -2610,16 +2604,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             tokens: t,
             onTap: () => _showTransportSheet(context, t, core),
           ),
-          _SettingTile(
-            icon: Icons.dns_outlined,
-            label: 'ntfy server',
-            value: core != null
-                ? (core.ntfyBaseUrl == 'https://ntfy.sh' ? 'default' : core.ntfyBaseUrl)
-                : 'default',
-            tokens: t,
-            onTap: () => _showNtfyDialog(context, t, provider, core),
-          ),
-
           // ── Appearance ───────────────────────────────────────
           _SectionHeader('appearance', t),
           _SettingTile(
@@ -2944,57 +2928,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
       scaffold,
     ]);
-  }
-
-  void _showNtfyDialog(
-      BuildContext context, PhantomTokens t, CoreProvider provider, PhantomCore? core) {
-    final ctrl = TextEditingController(
-      text: core?.ntfyBaseUrl == 'https://ntfy.sh' ? '' : (core?.ntfyBaseUrl ?? ''),
-    );
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: t.bgSurface,
-        title: Text('ntfy server',
-            style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 15)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'point to your own ntfy instance for unlimited messages.\n'
-              'leave blank to use ntfy.sh (250 msg/day limit).',
-              style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 11, height: 1.6),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: ctrl,
-              autofocus: true,
-              style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 13),
-              decoration: InputDecoration(
-                hintText: 'https://ntfy.sh',
-                hintStyle: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 13),
-                enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: t.divider)),
-                focusedBorder: UnderlineInputBorder(borderSide: BorderSide(color: t.accentLight)),
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: Text('cancel', style: TextStyle(color: t.textDisabled, fontFamily: 'monospace')),
-          ),
-          TextButton(
-            onPressed: () async {
-              Navigator.pop(ctx);
-              await provider.onRestartCore(ctrl.text.trim().isEmpty ? null : ctrl.text.trim());
-            },
-            child: Text('apply & restart', style: TextStyle(color: t.accentLight, fontFamily: 'monospace')),
-          ),
-        ],
-      ),
-    );
   }
 
   void _showTransportSheet(BuildContext context, PhantomTokens t, PhantomCore? core) {
