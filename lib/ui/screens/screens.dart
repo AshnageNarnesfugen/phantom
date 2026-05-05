@@ -8,6 +8,7 @@ import 'package:gal/gal.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import '../../core_provider.dart';
+import '../../core/ipfs_daemon.dart';
 import '../../core/phantom_core.dart';
 import '../../core/update_service.dart';
 import '../theme/phantom_theme.dart';
@@ -2347,6 +2348,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   // Manual update check
   bool _checkingUpdate = false;
 
+  // IPFS node status (null = not yet checked)
+  bool? _ipfsRunning;
+  int   _ipfsPeers = 0;
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
@@ -2362,7 +2367,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
         if (mounted && alias != null) _myAliasCtrl.text = alias;
       });
       _loadGlass(core);
+      _refreshIpfsStatus();
     }
+  }
+
+  void _refreshIpfsStatus() {
+    IpfsDaemon.instance.status().then((s) {
+      if (mounted) setState(() { _ipfsRunning = s.running; _ipfsPeers = s.peers; });
+    });
   }
 
   @override
@@ -2603,6 +2615,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
             value: core?.isTransportAvailable == true ? 'connected' : 'offline',
             tokens: t,
             onTap: () => _showTransportSheet(context, t, core),
+          ),
+          _SettingTile(
+            icon: _ipfsRunning == true
+                ? Icons.hub
+                : Icons.hub_outlined,
+            label: 'ipfs node',
+            value: _ipfsRunning == null
+                ? 'checking...'
+                : _ipfsRunning!
+                    ? 'running · $_ipfsPeers peer${_ipfsPeers == 1 ? '' : 's'}'
+                    : 'offline — tap to retry',
+            tokens: t,
+            onTap: _refreshIpfsStatus,
           ),
           // ── Appearance ───────────────────────────────────────
           _SectionHeader('appearance', t),

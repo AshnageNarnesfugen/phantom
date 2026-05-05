@@ -60,6 +60,10 @@ class TransportManager {
   final StreamController<IncomingEnvelope> _incomingController =
       StreamController.broadcast();
 
+  // Used by _activateLateTransports to subscribe newly-available transports.
+  String _ourId = '';
+  DateTime? _lastRetryAt;
+
   Stream<IncomingEnvelope> get incoming => _incomingController.stream;
 
   /// Names of all currently active transports (empty until [initialize] is called).
@@ -83,8 +87,10 @@ class TransportManager {
         ];
 
   /// Checks all transports in parallel and starts every reachable one.
-  /// Throws only when no transport at all is reachable.
+  /// Does NOT throw when no transport is reachable — the daemon may still be
+  /// starting; [publish] will retry via [_activateLateTransports].
   Future<void> initialize({required String ourId}) async {
+    _ourId = ourId;
     final reachable = await Future.wait(
       _transports.map((t) async {
         try {
@@ -99,24 +105,49 @@ class TransportManager {
       _activeTransports.add(t);
       t.subscribe(ourId: ourId).listen(
         _incomingController.add,
-        onError: (_) {}, // individual transport errors are non-fatal
+        onError: (_) {},
       );
     }
+    // No throw when empty — [publish] retries late-starting transports.
+  }
 
-    if (_activeTransports.isEmpty) {
-      throw const TransportException(
-          'No transport available (IPFS daemon not running).');
+  /// Re-checks any transport that was not available at [initialize] time.
+  /// Throttled to once per 20 s so it doesn't slow down every publish call.
+  Future<void> _activateLateTransports() async {
+    if (_ourId.isEmpty) return;
+    final now = DateTime.now();
+    if (_lastRetryAt != null &&
+        now.difference(_lastRetryAt!) < const Duration(seconds: 20)) {
+      return;
+    }
+    _lastRetryAt = now;
+
+    for (final t in _transports) {
+      if (_activeTransports.contains(t)) { continue; }
+      try {
+        if (await t.checkAvailability()) {
+          _activeTransports.add(t);
+          t.subscribe(ourId: _ourId).listen(
+            _incomingController.add,
+            onError: (_) {},
+          );
+        }
+      } catch (_) {}
     }
   }
 
   /// Publishes to every active transport in parallel.
   /// Succeeds if at least one transport delivers the message.
+  /// If no transport is active, attempts to activate late-starting ones first.
   Future<void> publish({
     required String recipientId,
     required Uint8List encryptedEnvelope,
   }) async {
     if (_activeTransports.isEmpty) {
-      throw const TransportException('TransportManager not initialized.');
+      await _activateLateTransports();
+    }
+    if (_activeTransports.isEmpty) {
+      throw const TransportException('No transport available (IPFS daemon not running).');
     }
     int successes = 0;
     Object? lastError;

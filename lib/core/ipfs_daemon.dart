@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -23,7 +24,7 @@ class IpfsDaemon {
 
   // How long to wait for the foreground service to bring the API up before
   // falling back to a direct Dart process spawn.
-  static const _serviceWaitSeconds = 6;
+  static const _serviceWaitSeconds = 3;
 
   static final instance = IpfsDaemon._();
   IpfsDaemon._();
@@ -168,23 +169,52 @@ class IpfsDaemon {
   /// Spawns the IPFS daemon directly as a Dart [Process].
   /// Used as a fallback when the Android ForegroundService is unavailable
   /// (e.g. Waydroid, rooted devices with restricted service managers).
+  /// Returns immediately — the transport's retry mechanism polls for readiness.
   /// The process is killed when [stop] is called.
   Future<void> _spawnDaemonDirectly(String binary, String repoPath) async {
+    // Merge the inherited process environment so the Go runtime has HOME,
+    // TMPDIR, and any other variables it may need.
+    final env = Map<String, String>.from(Platform.environment)
+      ..['IPFS_PATH'] = repoPath;
+
     _directProcess = await Process.start(
       binary,
       ['daemon', '--enable-pubsub-experiment', '--routing=dhtclient', '--migrate=true'],
-      environment: {'IPFS_PATH': repoPath},
+      environment: env,
     );
     // Drain stdout/stderr so the pipe buffer never blocks the daemon.
     _directProcess!.stdout.drain<void>();
     _directProcess!.stderr.drain<void>();
-    // Wait for the API to become ready (up to 10 s).
-    final ready = await _waitForApi(seconds: 10);
-    if (ready) {
-      debugPrint('[IpfsDaemon] daemon spawned directly, API ready at $apiUrl');
-    } else {
-      debugPrint('[IpfsDaemon] daemon spawned directly but API not yet ready — '
-          'transport will retry');
+    // Do NOT await API readiness here — the TransportManager retries automatically
+    // every 20 s via _activateLateTransports(), so we return immediately and let
+    // the app continue loading.
+    debugPrint('[IpfsDaemon] daemon spawned directly; transport will poll for readiness');
+  }
+
+  /// Returns the current IPFS node status.
+  /// Call this from the settings UI to show the user what is happening.
+  Future<({bool running, int peers})> status() async {
+    if (!Platform.isAndroid) return (running: false, peers: 0);
+    try {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+
+      final idReq  = await client.postUrl(Uri.parse('$apiUrl/api/v0/id'));
+      final idResp = await idReq.close();
+      if (idResp.statusCode != 200) {
+        await idResp.drain<void>();
+        client.close(force: true);
+        return (running: false, peers: 0);
+      }
+      await idResp.drain<void>();
+
+      final peersReq  = await client.postUrl(Uri.parse('$apiUrl/api/v0/swarm/peers'));
+      final peersResp = await peersReq.close();
+      final body      = await peersResp.transform(utf8.decoder).join();
+      client.close(force: true);
+      final count = ((jsonDecode(body) as Map<String, dynamic>)['Peers'] as List?)?.length ?? 0;
+      return (running: true, peers: count);
+    } catch (_) {
+      return (running: false, peers: 0);
     }
   }
 }
