@@ -1,33 +1,43 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:cryptography/cryptography.dart';
 import 'package:http/http.dart' as http;
 
 /// Lightweight presence layer using the bundled IPFS daemon as a pubsub bus.
 ///
-/// Each user publishes a heartbeat to their own presence topic whenever the
-/// app is active. Contacts' topics are subscribed via IPFS pubsub so we learn
-/// immediately when they come online. "Online" means a heartbeat was seen
-/// within [_threshold].
-///
-/// No rate limits — entirely P2P, no central relay.
+/// Peer discovery bootstrap (solves gossipsub cold-start):
+///   1. On startup each node advertises itself on the IPFS DHT using a CID
+///      derived from its own Phantom ID (DHT provider record).
+///   2. For each contact, it queries `routing/findprovs` for that CID to
+///      learn the contact's IPFS peer ID, then calls `swarm/connect`.
+///   3. After a direct swarm connection exists, gossipsub subscription
+///      announcements propagate instantly — pubsub works immediately.
+///   4. Additionally, when any pubsub message arrives the `from` field gives
+///      the sender's peer ID; we swarm/connect there too (covers the case
+///      where DHT lookup succeeded from the other side but not ours).
 class PresenceService {
-  static const _defaultApiUrl = 'http://127.0.0.1:5001';
-  static const _interval  = Duration(minutes: 2);
-  static const _threshold = Duration(minutes: 7);
+  static const _defaultApiUrl        = 'http://127.0.0.1:5001';
+  static const _interval             = Duration(minutes: 2);
+  static const _threshold            = Duration(minutes: 7);
+  static const _dhtAdvertiseInterval = Duration(minutes: 20);
+  static const _dhtDiscoverInterval  = Duration(minutes: 2);
 
   final String _myId;
   final String _apiUrl;
   final http.Client _client = http.Client();
 
-  final Map<String, DateTime> _lastSeen   = {};
-  final Set<String>           _subscribed = {};
+  final Map<String, DateTime> _lastSeen    = {};
+  final Set<String>           _subscribed  = {};
   final _changesCtrl = StreamController<String>.broadcast();
 
-  // Peer IDs we've already connected to via swarm/connect (avoid spamming).
-  final Set<String> _swarmConnected = {};
+  // Peer IDs we attempted swarm/connect to recently.
+  final Map<String, DateTime> _connectAttempts = {};
+  static const _reconnectCooldown = Duration(minutes: 5);
 
   Timer? _heartbeatTimer;
+  Timer? _dhtAdvertiseTimer;
+  Timer? _dhtDiscoverTimer;
   bool _disposed = false;
 
   /// Always false — IPFS presence has no rate limits.
@@ -41,24 +51,35 @@ class PresenceService {
 
   Future<void> start(List<String> contactIds) async {
     _subscribeAll(contactIds);
-    // Publish immediately and at short intervals for the first few minutes so
-    // that a contact who comes online after us receives a heartbeat quickly
-    // rather than waiting for the full periodic interval.
+    // Immediate + burst heartbeats so a contact coming online after us gets
+    // a heartbeat quickly rather than waiting for the full periodic interval.
     await _publishHeartbeat();
     Timer(const Duration(seconds: 10), _publishHeartbeat);
     Timer(const Duration(seconds: 30), _publishHeartbeat);
     Timer(const Duration(seconds: 90), _publishHeartbeat);
     _heartbeatTimer = Timer.periodic(_interval, (_) => _publishHeartbeat());
+
+    // DHT rendezvous bootstrap — runs independently of pubsub.
+    unawaited(_advertiseOnDht());
+    // Small delay so the daemon is fully up before we query.
+    Timer(const Duration(seconds: 5), () => _discoverAll(contactIds));
+    _dhtAdvertiseTimer = Timer.periodic(
+        _dhtAdvertiseInterval, (_) => _advertiseOnDht());
+    _dhtDiscoverTimer = Timer.periodic(
+        _dhtDiscoverInterval, (_) => _discoverAll(_subscribed.toList()));
   }
 
-  void addContacts(List<String> contactIds) => _subscribeAll(contactIds);
+  void addContacts(List<String> contactIds) {
+    _subscribeAll(contactIds);
+    unawaited(_discoverAll(contactIds));
+  }
 
   bool isOnline(String contactId) {
     final last = _lastSeen[contactId];
     return last != null && DateTime.now().difference(last) < _threshold;
   }
 
-  Future<void> goOffline() => _publishHeartbeat(online: false);
+  Future<void> goOffline()     => _publishHeartbeat(online: false);
   Future<void> publishOnline() => _publishHeartbeat(online: true);
 
   // ── Internal ────────────────────────────────────────────────────────────────
@@ -95,7 +116,7 @@ class PresenceService {
 
     while (!_disposed) {
       try {
-        final request = http.Request('POST', uri);
+        final request  = http.Request('POST', uri);
         final response = await _client.send(request);
 
         if (response.statusCode != 200) {
@@ -125,11 +146,10 @@ class PresenceService {
             }
             final body = utf8.decode(bytes).trim();
 
-            // Bootstrap gossipsub mesh: connect directly to the peer that sent
-            // this heartbeat. The 'from' field is a multibase-encoded IPFS peer
-            // ID. Doing this once per peer is enough to join their gossipsub mesh.
+            // The 'from' field carries the sender's IPFS peer ID (multibase).
+            // Connect to them directly to reinforce the gossipsub mesh.
             final rawFrom = ev['from'] as String?;
-            if (rawFrom != null) _trySwarmConnect(rawFrom);
+            if (rawFrom != null) unawaited(_connectFromField(rawFrom));
 
             yield _PresenceEvent(at: DateTime.now(), online: body != '0');
           } catch (_) {}
@@ -141,66 +161,142 @@ class PresenceService {
     }
   }
 
-  /// Connects directly to an IPFS peer to bootstrap gossipsub mesh formation.
-  ///
-  /// [rawFrom] is the multibase-encoded peer ID from a pubsub message's `from`
-  /// field. We decode it to a plain base58 peer ID, look up their multiaddrs
-  /// via `routing/findpeer`, then call `swarm/connect` for each address.
-  Future<void> _trySwarmConnect(String rawFrom) async {
-    // Decode multibase peer ID → plain base58 string for Kubo API calls.
-    String peerId;
+  // ── DHT rendezvous ───────────────────────────────────────────────────────────
+
+  /// Advertises this node on the IPFS DHT so contacts can discover our peer ID.
+  /// Each Phantom node "provides" a CID derived from its Phantom ID; contacts
+  /// query that CID with `routing/findprovs` to get our IPFS peer ID + addrs.
+  Future<void> _advertiseOnDht() async {
+    if (_disposed) return;
     try {
-      if (rawFrom.startsWith('u')) {
-        final padded = rawFrom.substring(1).padRight(
-            (rawFrom.length - 1 + 3) & ~3, '=');
-        final bytes = base64Url.decode(padded);
-        peerId = utf8.decode(bytes);
-      } else if (rawFrom.startsWith('m')) {
-        final bytes = base64.decode(rawFrom.substring(1));
-        peerId = utf8.decode(bytes);
-      } else {
-        peerId = rawFrom; // already plain
-      }
-    } catch (_) {
-      return;
+      final cid = await _phantomCid(_myId);
+      final uri = Uri.parse(
+          '$_apiUrl/api/v0/routing/provide?arg=${Uri.encodeComponent(cid)}&recursive=false');
+      await _client.post(uri).timeout(const Duration(seconds: 30));
+    } catch (_) {}
+  }
+
+  /// Queries the DHT for each contact's IPFS peer info and connects to them.
+  Future<void> _discoverAll(List<String> contactIds) async {
+    for (final id in contactIds) {
+      if (_disposed) return;
+      await _discoverAndConnect(id);
     }
+  }
 
-    if (_swarmConnected.contains(peerId)) return;
-    _swarmConnected.add(peerId);
-
+  /// Finds a contact's IPFS node via DHT provider records and swarm/connect.
+  Future<void> _discoverAndConnect(String contactId) async {
+    if (_disposed) return;
     try {
-      // Find peer's multiaddrs via the DHT/routing.
-      final findUri = Uri.parse(
-          '$_apiUrl/api/v0/routing/findpeer?arg=${Uri.encodeComponent(peerId)}');
-      final findResp = await _client
-          .post(findUri)
-          .timeout(const Duration(seconds: 15));
-      if (findResp.statusCode != 200) return;
+      final cid = await _phantomCid(contactId);
+      final uri = Uri.parse(
+          '$_apiUrl/api/v0/routing/findprovs?arg=${Uri.encodeComponent(cid)}&num-providers=5');
 
-      final json = jsonDecode(findResp.body) as Map<String, dynamic>;
-      final addrs = (json['Addrs'] as List?)?.cast<String>() ?? [];
+      // findprovs streams NDJSON — use a streaming request so we process
+      // results as they arrive rather than waiting for the full response.
+      final request  = http.Request('POST', uri);
+      final response = await _client.send(request)
+          .timeout(const Duration(seconds: 30));
+      if (response.statusCode != 200) {
+        await response.stream.drain<void>();
+        return;
+      }
 
-      // Connect to each address, preferring relay-based ones first so we can
-      // reach peers behind NAT even before hole-punch succeeds.
-      final sorted = [...addrs]..sort((a, b) {
-          final aRelay = a.contains('p2p-circuit') ? 0 : 1;
-          final bRelay = b.contains('p2p-circuit') ? 0 : 1;
-          return aRelay.compareTo(bRelay);
-        });
-
-      for (final addr in sorted.take(3)) {
+      await for (final line in response.stream
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())) {
         if (_disposed) return;
-        final fullAddr = '$addr/p2p/$peerId';
+        if (line.trim().isEmpty) continue;
         try {
-          final connectUri = Uri.parse(
-              '$_apiUrl/api/v0/swarm/connect?arg=${Uri.encodeComponent(fullAddr)}');
-          await _client
-              .post(connectUri)
-              .timeout(const Duration(seconds: 10));
+          final json = jsonDecode(line) as Map<String, dynamic>;
+          // Kubo returns: {"Type":4,"Responses":[{"ID":"...","Addrs":["..."]}]}
+          // or sometimes a flat peer object.
+          final responses = json['Responses'];
+          final peers = (responses is List)
+              ? responses.cast<Map<String, dynamic>>()
+              : (json['ID'] != null ? [json] : <Map<String, dynamic>>[]);
+
+          for (final peer in peers) {
+            final peerId = peer['ID'] as String?;
+            final addrs  = (peer['Addrs'] as List?)?.cast<String>() ?? [];
+            if (peerId == null || peerId.isEmpty) continue;
+            await _connectToPeer(peerId, addrs);
+          }
         } catch (_) {}
       }
     } catch (_) {}
   }
+
+  /// Decodes the multibase `from` field of a pubsub message and connects.
+  Future<void> _connectFromField(String rawFrom) async {
+    String peerId;
+    try {
+      if (rawFrom.startsWith('u')) {
+        final b64 = rawFrom.substring(1).padRight(
+            (rawFrom.length - 1 + 3) & ~3, '=');
+        peerId = utf8.decode(base64Url.decode(b64));
+      } else if (rawFrom.startsWith('m')) {
+        peerId = utf8.decode(base64.decode(rawFrom.substring(1)));
+      } else {
+        peerId = rawFrom;
+      }
+    } catch (_) {
+      return;
+    }
+    await _connectToPeer(peerId, []);
+  }
+
+  /// Establishes a direct swarm connection to [peerId].
+  ///
+  /// If [addrs] is empty (e.g., from the `from` field path), we first call
+  /// `routing/findpeer` to obtain multiaddrs. As a last resort we try
+  /// `/p2p/<peerId>` which IPFS resolves via its routing table.
+  Future<void> _connectToPeer(String peerId, List<String> addrs) async {
+    if (_disposed) return;
+    final now = DateTime.now();
+    final last = _connectAttempts[peerId];
+    if (last != null && now.difference(last) < _reconnectCooldown) return;
+    _connectAttempts[peerId] = now;
+
+    var addresses = addrs;
+    if (addresses.isEmpty) {
+      try {
+        final findUri = Uri.parse(
+            '$_apiUrl/api/v0/routing/findpeer?arg=${Uri.encodeComponent(peerId)}');
+        final r = await _client.post(findUri)
+            .timeout(const Duration(seconds: 15));
+        if (r.statusCode == 200) {
+          final j = jsonDecode(r.body) as Map<String, dynamic>;
+          addresses = (j['Addrs'] as List?)?.cast<String>() ?? [];
+        }
+      } catch (_) {}
+    }
+
+    // Sort: relay addresses first (work through NAT before hole-punch).
+    final sorted = [...addresses]..sort((a, b) {
+        final aR = a.contains('p2p-circuit') ? 0 : 1;
+        final bR = b.contains('p2p-circuit') ? 0 : 1;
+        return aR.compareTo(bR);
+      });
+
+    // Try explicit addresses, then fall back to /p2p/<id> (DHT resolution).
+    final targets = [
+      ...sorted.take(3).map((a) => '$a/p2p/$peerId'),
+      if (sorted.isEmpty) '/p2p/$peerId',
+    ];
+
+    for (final addr in targets) {
+      if (_disposed) return;
+      try {
+        await _client
+            .post(Uri.parse(
+                '$_apiUrl/api/v0/swarm/connect?arg=${Uri.encodeComponent(addr)}'))
+            .timeout(const Duration(seconds: 10));
+      } catch (_) {}
+    }
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────────────────────
 
   Future<void> _publishHeartbeat({bool online = true}) async {
     if (_disposed) return;
@@ -216,9 +312,32 @@ class PresenceService {
     } catch (_) {}
   }
 
+  /// Computes a deterministic CIDv1 (raw codec, sha2-256) from a Phantom ID.
+  /// Used as the rendezvous key on the IPFS DHT.
+  ///
+  /// Format: multibase hex ('f' prefix) of [version=1, codec=0x55(raw),
+  ///   multihash=[0x12(sha2-256), 0x20(32 bytes), sha256("phantom-peer-v1:<id>")]]
+  static Future<String> _phantomCid(String phantomId) async {
+    final sha256   = Sha256();
+    final hash     = await sha256.hash(utf8.encode('phantom-peer-v1:$phantomId'));
+    final hashBytes = Uint8List.fromList(hash.bytes);
+
+    final cidBytes = Uint8List(36);
+    cidBytes[0] = 0x01; // CIDv1
+    cidBytes[1] = 0x55; // raw codec
+    cidBytes[2] = 0x12; // sha2-256 multihash code
+    cidBytes[3] = 0x20; // 32-byte hash length
+    cidBytes.setRange(4, 36, hashBytes);
+
+    // Multibase hex encoding: 'f' prefix + lowercase hex.
+    // Kubo accepts any valid multibase-encoded CID string.
+    final hex = cidBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return 'f$hex';
+  }
+
   static String _topic(String phantomId) => '/phantom/prs/v1/$phantomId';
 
-  /// Kubo >= 0.11 requires pubsub args to be multibase-encoded (prefix 'u' = base64url).
+  /// Kubo >= 0.11 requires pubsub topic args to be multibase-encoded.
   static String _encodeTopic(String topic) {
     final bytes = utf8.encode(topic);
     return 'u${base64Url.encode(bytes).replaceAll('=', '')}';
@@ -227,6 +346,8 @@ class PresenceService {
   void dispose() {
     _disposed = true;
     _heartbeatTimer?.cancel();
+    _dhtAdvertiseTimer?.cancel();
+    _dhtDiscoverTimer?.cancel();
     _changesCtrl.close();
     _client.close();
   }

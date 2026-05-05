@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'dart:convert';
+import 'package:cryptography/cryptography.dart';
 import 'package:http/http.dart' as http;
 import 'package:meta/meta.dart';
 import '../core/transport_debugger.dart';
@@ -241,6 +242,17 @@ class IpfsTransport implements PhantomTransport {
     }
 
     if (!peers) {
+      // Last resort: use the DHT to find the recipient's IPFS peer and
+      // connect directly. PresenceService does this on a timer, but if
+      // the first message is sent before presence has run we do it inline.
+      dbg.log('IPFS: trying DHT discovery for $short…');
+      await _dhtDiscoverAndConnect(recipientId, dbg);
+      await Future.delayed(const Duration(seconds: 2));
+      peers = await _checkTopicPeers(topic);
+      dbg.log('IPFS: peer check pass-3 for $short → ${peers ? "✓ peers found" : "✗ still no peers — queuing"}');
+    }
+
+    if (!peers) {
       throw const TransportException('No IPFS pubsub peers on recipient topic');
     }
 
@@ -354,6 +366,90 @@ class IpfsTransport implements PhantomTransport {
       return base64Url.decode(padded);
     }
     return base64.decode(raw); // old plain-base64 fallback
+  }
+
+  /// Looks up the recipient's IPFS peer via DHT provider records and connects.
+  /// Mirrors the same rendezvous mechanism used by PresenceService so the
+  /// message transport can bootstrap independently when presence hasn't run yet.
+  Future<void> _dhtDiscoverAndConnect(String phantomId, TransportDebugger dbg) async {
+    try {
+      final cid = await _phantomCid(phantomId);
+      final uri = Uri.parse(
+          '$_apiUrl/api/v0/routing/findprovs?arg=${Uri.encodeComponent(cid)}&num-providers=5');
+      final request  = http.Request('POST', uri);
+      final response = await _client.send(request)
+          .timeout(const Duration(seconds: 20));
+      if (response.statusCode != 200) {
+        await response.stream.drain<void>();
+        dbg.log('IPFS: findprovs HTTP ${response.statusCode}');
+        return;
+      }
+
+      await for (final line in response.stream
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())) {
+        if (_disposed) return;
+        if (line.trim().isEmpty) continue;
+        try {
+          final json      = jsonDecode(line) as Map<String, dynamic>;
+          final responses = json['Responses'];
+          final peers     = (responses is List)
+              ? responses.cast<Map<String, dynamic>>()
+              : (json['ID'] != null ? [json] : <Map<String, dynamic>>[]);
+
+          for (final peer in peers) {
+            final peerId = peer['ID'] as String?;
+            final addrs  = (peer['Addrs'] as List?)?.cast<String>() ?? [];
+            if (peerId == null || peerId.isEmpty) continue;
+            dbg.log('IPFS: DHT found peer ${peerId.substring(0, 12)}… — connecting');
+            if (!_swarmConnected.contains(peerId)) {
+              _swarmConnected.add(peerId);
+              unawaited(_connectById(peerId, addrs, dbg));
+            }
+          }
+        } catch (_) {}
+      }
+    } catch (e) {
+      dbg.log('IPFS: DHT discover error: $e');
+    }
+  }
+
+  /// Computes a deterministic CIDv1 (raw, sha2-256) from a Phantom ID.
+  /// Shared rendezvous key with PresenceService — must match exactly.
+  static Future<String> _phantomCid(String phantomId) async {
+    final hash     = await Sha256().hash(utf8.encode('phantom-peer-v1:$phantomId'));
+    final cidBytes = Uint8List(36);
+    cidBytes[0] = 0x01; cidBytes[1] = 0x55; // CIDv1, raw codec
+    cidBytes[2] = 0x12; cidBytes[3] = 0x20; // sha2-256 multihash
+    cidBytes.setRange(4, 36, hash.bytes);
+    final hex = cidBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return 'f$hex';
+  }
+
+  /// Connects to a peer given its already-decoded peer ID and known multiaddrs.
+  Future<void> _connectById(
+      String peerId, List<String> addrs, TransportDebugger dbg) async {
+    final sorted = [...addrs]..sort((a, b) {
+        final aR = a.contains('p2p-circuit') ? 0 : 1;
+        final bR = b.contains('p2p-circuit') ? 0 : 1;
+        return aR.compareTo(bR);
+      });
+    final targets = [
+      ...sorted.take(3).map((a) => '$a/p2p/$peerId'),
+      if (sorted.isEmpty) '/p2p/$peerId',
+    ];
+    for (final addr in targets) {
+      if (_disposed) return;
+      try {
+        final r = await _client
+            .post(Uri.parse(
+                '$_apiUrl/api/v0/swarm/connect?arg=${Uri.encodeComponent(addr)}'))
+            .timeout(const Duration(seconds: 10));
+        dbg.log('IPFS: swarm/connect ${r.statusCode} → ${addr.split('/').take(5).join('/')}…');
+      } catch (e) {
+        dbg.log('IPFS: swarm/connect error: $e');
+      }
+    }
   }
 
   /// Connects directly to the IPFS peer that sent us a message so future
