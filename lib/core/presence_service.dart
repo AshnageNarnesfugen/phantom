@@ -24,6 +24,9 @@ class PresenceService {
   final Set<String>           _subscribed = {};
   final _changesCtrl = StreamController<String>.broadcast();
 
+  // Peer IDs we've already connected to via swarm/connect (avoid spamming).
+  final Set<String> _swarmConnected = {};
+
   Timer? _heartbeatTimer;
   bool _disposed = false;
 
@@ -121,6 +124,13 @@ class PresenceService {
               bytes = base64.decode(rawData);
             }
             final body = utf8.decode(bytes).trim();
+
+            // Bootstrap gossipsub mesh: connect directly to the peer that sent
+            // this heartbeat. The 'from' field is a multibase-encoded IPFS peer
+            // ID. Doing this once per peer is enough to join their gossipsub mesh.
+            final rawFrom = ev['from'] as String?;
+            if (rawFrom != null) _trySwarmConnect(rawFrom);
+
             yield _PresenceEvent(at: DateTime.now(), online: body != '0');
           } catch (_) {}
         }
@@ -129,6 +139,67 @@ class PresenceService {
         if (!_disposed) await Future.delayed(const Duration(seconds: 15));
       }
     }
+  }
+
+  /// Connects directly to an IPFS peer to bootstrap gossipsub mesh formation.
+  ///
+  /// [rawFrom] is the multibase-encoded peer ID from a pubsub message's `from`
+  /// field. We decode it to a plain base58 peer ID, look up their multiaddrs
+  /// via `routing/findpeer`, then call `swarm/connect` for each address.
+  Future<void> _trySwarmConnect(String rawFrom) async {
+    // Decode multibase peer ID → plain base58 string for Kubo API calls.
+    String peerId;
+    try {
+      if (rawFrom.startsWith('u')) {
+        final padded = rawFrom.substring(1).padRight(
+            (rawFrom.length - 1 + 3) & ~3, '=');
+        final bytes = base64Url.decode(padded);
+        peerId = utf8.decode(bytes);
+      } else if (rawFrom.startsWith('m')) {
+        final bytes = base64.decode(rawFrom.substring(1));
+        peerId = utf8.decode(bytes);
+      } else {
+        peerId = rawFrom; // already plain
+      }
+    } catch (_) {
+      return;
+    }
+
+    if (_swarmConnected.contains(peerId)) return;
+    _swarmConnected.add(peerId);
+
+    try {
+      // Find peer's multiaddrs via the DHT/routing.
+      final findUri = Uri.parse(
+          '$_apiUrl/api/v0/routing/findpeer?arg=${Uri.encodeComponent(peerId)}');
+      final findResp = await _client
+          .post(findUri)
+          .timeout(const Duration(seconds: 15));
+      if (findResp.statusCode != 200) return;
+
+      final json = jsonDecode(findResp.body) as Map<String, dynamic>;
+      final addrs = (json['Addrs'] as List?)?.cast<String>() ?? [];
+
+      // Connect to each address, preferring relay-based ones first so we can
+      // reach peers behind NAT even before hole-punch succeeds.
+      final sorted = [...addrs]..sort((a, b) {
+          final aRelay = a.contains('p2p-circuit') ? 0 : 1;
+          final bRelay = b.contains('p2p-circuit') ? 0 : 1;
+          return aRelay.compareTo(bRelay);
+        });
+
+      for (final addr in sorted.take(3)) {
+        if (_disposed) return;
+        final fullAddr = '$addr/p2p/$peerId';
+        try {
+          final connectUri = Uri.parse(
+              '$_apiUrl/api/v0/swarm/connect?arg=${Uri.encodeComponent(fullAddr)}');
+          await _client
+              .post(connectUri)
+              .timeout(const Duration(seconds: 10));
+        } catch (_) {}
+      }
+    } catch (_) {}
   }
 
   Future<void> _publishHeartbeat({bool online = true}) async {

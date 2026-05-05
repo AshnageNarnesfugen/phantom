@@ -184,6 +184,7 @@ class IpfsTransport implements PhantomTransport {
   final String _apiUrl;
   final http.Client _client = http.Client();
   bool _disposed = false;
+  final Set<String> _swarmConnected = {};
 
   @override
   final String name = 'ipfs-pubsub';
@@ -308,6 +309,12 @@ class IpfsTransport implements PhantomTransport {
             if (rawData == null) continue;
             final data = _decodeData(rawData as String);
             dbg.log('IPFS: ← received ${data.length} bytes on ${ourId.substring(0, 8)}');
+
+            // Bootstrap gossipsub mesh with the sender so future outbound
+            // publishes find peers immediately.
+            final rawFrom = json['from'] as String?;
+            if (rawFrom != null) unawaited(_trySwarmConnect(rawFrom, dbg));
+
             yield IncomingEnvelope(
               data: data,
               transportName: name,
@@ -347,6 +354,71 @@ class IpfsTransport implements PhantomTransport {
       return base64Url.decode(padded);
     }
     return base64.decode(raw); // old plain-base64 fallback
+  }
+
+  /// Connects directly to the IPFS peer that sent us a message so future
+  /// outbound publishes find them in the gossipsub mesh immediately.
+  ///
+  /// [rawFrom] is the multibase-encoded peer ID from the pubsub `from` field.
+  Future<void> _trySwarmConnect(String rawFrom, TransportDebugger dbg) async {
+    String peerId;
+    try {
+      if (rawFrom.startsWith('u')) {
+        final padded = rawFrom.substring(1).padRight(
+            (rawFrom.length - 1 + 3) & ~3, '=');
+        peerId = utf8.decode(base64Url.decode(padded));
+      } else if (rawFrom.startsWith('m')) {
+        peerId = utf8.decode(base64.decode(rawFrom.substring(1)));
+      } else {
+        peerId = rawFrom;
+      }
+    } catch (_) {
+      return;
+    }
+
+    if (_swarmConnected.contains(peerId)) return;
+    _swarmConnected.add(peerId);
+    dbg.log('IPFS: swarm-connect → ${peerId.substring(0, 12)}…');
+
+    try {
+      final findUri = Uri.parse(
+          '$_apiUrl/api/v0/routing/findpeer?arg=${Uri.encodeComponent(peerId)}');
+      final findResp = await _client
+          .post(findUri)
+          .timeout(const Duration(seconds: 15));
+      if (findResp.statusCode != 200) {
+        dbg.log('IPFS: findpeer HTTP ${findResp.statusCode}');
+        return;
+      }
+
+      final json  = jsonDecode(findResp.body) as Map<String, dynamic>;
+      final addrs = (json['Addrs'] as List?)?.cast<String>() ?? [];
+      dbg.log('IPFS: findpeer found ${addrs.length} addrs for ${peerId.substring(0, 12)}…');
+
+      // Prefer relay addresses (work through NAT) before direct ones.
+      final sorted = [...addrs]..sort((a, b) {
+          final aR = a.contains('p2p-circuit') ? 0 : 1;
+          final bR = b.contains('p2p-circuit') ? 0 : 1;
+          return aR.compareTo(bR);
+        });
+
+      for (final addr in sorted.take(3)) {
+        if (_disposed) return;
+        final full = '$addr/p2p/$peerId';
+        try {
+          final connectUri = Uri.parse(
+              '$_apiUrl/api/v0/swarm/connect?arg=${Uri.encodeComponent(full)}');
+          final r = await _client
+              .post(connectUri)
+              .timeout(const Duration(seconds: 10));
+          dbg.log('IPFS: swarm/connect ${r.statusCode} to ${addr.split('/').take(5).join('/')}');
+        } catch (e) {
+          dbg.log('IPFS: swarm/connect error: $e');
+        }
+      }
+    } catch (e) {
+      dbg.log('IPFS: _trySwarmConnect error: $e');
+    }
   }
 
   @override
