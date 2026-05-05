@@ -373,7 +373,10 @@ class PhantomStorage {
 
 class ContactRecord {
   final String phantomId;
+  /// Private alias — set locally by this user, never transmitted.
   final String? nickname;
+  /// Alias received from the contact themselves via an aliasData message.
+  final String? sharedAlias;
 
   /// X25519 identity public key (from PhantomID).
   final Uint8List encryptionPublicKeyBytes;
@@ -399,6 +402,7 @@ class ContactRecord {
   ContactRecord({
     required this.phantomId,
     this.nickname,
+    this.sharedAlias,
     required this.encryptionPublicKeyBytes,
     required this.signingPublicKeyBytes,
     required this.signedPreKeyBytes,
@@ -410,7 +414,8 @@ class ContactRecord {
     this.isArchived = false,
   }) : addedAtUs = addedAtUs ?? DateTime.now().microsecondsSinceEpoch;
 
-  String get displayName => nickname ?? _shortId;
+  /// Private nickname takes priority, then the alias the contact shared, then the short ID.
+  String get displayName => nickname ?? sharedAlias ?? _shortId;
   String get _shortId => phantomId.length > 12
       ? '${phantomId.substring(0, 6)}…${phantomId.substring(phantomId.length - 4)}'
       : phantomId;
@@ -428,11 +433,13 @@ class ContactRecord {
         'arch':   isArchived,
         if (kyber768PublicKeyBytes != null)
           'kyber768_pk': base64.encode(kyber768PublicKeyBytes!),
+        if (sharedAlias != null) 'shared_alias': sharedAlias,
       };
 
   static ContactRecord fromJson(Map<String, dynamic> j) => ContactRecord(
         phantomId:                j['id']    as String,
         nickname:                 j['nick']   as String?,
+        sharedAlias:              j['shared_alias'] as String?,
         encryptionPublicKeyBytes: base64.decode(j['pk']  as String),
         signingPublicKeyBytes:    base64.decode((j['sk']  as String?) ?? base64.encode(Uint8List(32))),
         signedPreKeyBytes:        base64.decode((j['spk'] as String?) ?? base64.encode(Uint8List(32))),
@@ -446,9 +453,15 @@ class ContactRecord {
         isArchived:               j['arch']   as bool? ?? false,
       );
 
-  ContactRecord copyWith({String? nickname, bool? isVerified, bool? isArchived}) => ContactRecord(
+  ContactRecord copyWith({
+    String? nickname,
+    String? sharedAlias,
+    bool? isVerified,
+    bool? isArchived,
+  }) => ContactRecord(
         phantomId:                phantomId,
-        nickname:                 nickname   ?? this.nickname,
+        nickname:                 nickname    ?? this.nickname,
+        sharedAlias:              sharedAlias ?? this.sharedAlias,
         encryptionPublicKeyBytes: encryptionPublicKeyBytes,
         signingPublicKeyBytes:    signingPublicKeyBytes,
         signedPreKeyBytes:        signedPreKeyBytes,
@@ -456,8 +469,8 @@ class ContactRecord {
         signedPreKeySignature:    signedPreKeySignature,
         kyber768PublicKeyBytes:   kyber768PublicKeyBytes,
         addedAtUs:                addedAtUs,
-        isVerified:               isVerified ?? this.isVerified,
-        isArchived:               isArchived ?? this.isArchived,
+        isVerified:               isVerified  ?? this.isVerified,
+        isArchived:               isArchived  ?? this.isArchived,
       );
 }
 

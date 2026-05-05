@@ -290,7 +290,11 @@ class PhantomCore {
       direction:      MessageDirection.outgoing,
       status:         MessageStatus.sending,
     );
-    await storage.saveMessage(stored);
+    // System/protocol messages (avatar, alias) are not part of the chat history.
+    const systemTypes = {MessageType.avatarData, MessageType.aliasData};
+    if (!systemTypes.contains(message.type)) {
+      await storage.saveMessage(stored);
+    }
 
     // Try v2 transport first (BLE mesh + internet with fallback + store-and-forward).
     // Fall back to v1 (internet-only) if v2 is not wired.
@@ -664,14 +668,7 @@ class PhantomCore {
       _sessions[senderPhantomId] = session;
       await _saveSession(senderPhantomId, session);
 
-      final stored = StoredMessage.fromPhantomMessage(
-        msg:            message,
-        conversationId: senderPhantomId,
-        direction:      MessageDirection.incoming,
-        status:         MessageStatus.delivered,
-      );
-      await storage.saveMessage(stored);
-      _incomingController.add(stored);
+      await _dispatchIncoming(message, senderPhantomId);
     } catch (_) {
       // Decryption failed — discard
     }
@@ -737,37 +734,7 @@ class PhantomCore {
         final message  = await protocol.decode(frame.payload);
 
         await _saveSession(entry.key, entry.value);
-
-        if (message.type == MessageType.avatarData) {
-          await storage.saveContactAvatar(entry.key, message.content);
-          _incomingController.add(StoredMessage.fromPhantomMessage(
-            msg: message, conversationId: entry.key,
-            direction: MessageDirection.incoming, status: MessageStatus.delivered,
-          ));
-          return;
-        }
-
-        final stored = StoredMessage.fromPhantomMessage(
-          msg:            message,
-          conversationId: entry.key,
-          direction:      MessageDirection.incoming,
-          status:         MessageStatus.delivered,
-        );
-        await storage.saveMessage(stored);
-        _incomingController.add(stored);
-
-        if (_activeChatId != entry.key) {
-          final contact = await storage.getContact(entry.key);
-          final name    = contact?.displayName ?? entry.key.substring(0, 6);
-          final preview = message.type == MessageType.text
-              ? message.textContent
-              : '[file]';
-          NotificationService.showMessage(
-            contactName: name,
-            preview:     preview,
-            contactId:   entry.key,
-          );
-        }
+        await _dispatchIncoming(message, entry.key);
         return;
       } catch (_) {
         _sessions[entry.key] = await RatchetSession.fromJson(snapshot);
@@ -776,7 +743,59 @@ class PhantomCore {
     }
   }
 
-  // ── Avatar ─────────────────────────────────────────────────────────────────
+  // ── Incoming dispatch ──────────────────────────────────────────────────────
+
+  /// Handles a decrypted incoming message: saves system payloads (avatar/alias)
+  /// or stores regular messages and fires notifications.
+  Future<void> _dispatchIncoming(PhantomMessage message, String senderId) async {
+    if (message.type == MessageType.avatarData) {
+      await storage.saveContactAvatar(senderId, message.content);
+      _incomingController.add(StoredMessage.fromPhantomMessage(
+        msg: message, conversationId: senderId,
+        direction: MessageDirection.incoming, status: MessageStatus.delivered,
+      ));
+      return;
+    }
+
+    if (message.type == MessageType.aliasData) {
+      final alias = utf8.decode(message.content).trim();
+      if (alias.isNotEmpty) {
+        final contact = await storage.getContact(senderId);
+        if (contact != null) {
+          await storage.saveContact(contact.copyWith(sharedAlias: alias));
+        }
+      }
+      _incomingController.add(StoredMessage.fromPhantomMessage(
+        msg: message, conversationId: senderId,
+        direction: MessageDirection.incoming, status: MessageStatus.delivered,
+      ));
+      return;
+    }
+
+    final stored = StoredMessage.fromPhantomMessage(
+      msg:            message,
+      conversationId: senderId,
+      direction:      MessageDirection.incoming,
+      status:         MessageStatus.delivered,
+    );
+    await storage.saveMessage(stored);
+    _incomingController.add(stored);
+
+    if (_activeChatId != senderId) {
+      final contact = await storage.getContact(senderId);
+      final name    = contact?.displayName ?? senderId.substring(0, 6);
+      final preview = message.type == MessageType.text
+          ? message.textContent
+          : '[file]';
+      NotificationService.showMessage(
+        contactName: name,
+        preview:     preview,
+        contactId:   senderId,
+      );
+    }
+  }
+
+  // ── Avatar / Alias ─────────────────────────────────────────────────────────
 
   Future<Uint8List?> getContactAvatar(String contactId) =>
       storage.getContactAvatar(contactId);
@@ -792,6 +811,20 @@ class PhantomCore {
       message: PhantomMessage(
         type:    MessageType.avatarData,
         content: Uint8List.fromList(bytes),
+      ),
+    );
+  }
+
+  /// Sends the user's own alias to [contactId] so they can see a name for you.
+  /// No-op if no alias has been configured via the `my_alias` setting.
+  Future<void> sendAliasToContact(String contactId) async {
+    final alias = await storage.getSetting<String>('my_alias');
+    if (alias == null || alias.trim().isEmpty) return;
+    await _sendPhantomMessage(
+      recipientId: contactId,
+      message: PhantomMessage(
+        type:    MessageType.aliasData,
+        content: Uint8List.fromList(utf8.encode(alias.trim())),
       ),
     );
   }

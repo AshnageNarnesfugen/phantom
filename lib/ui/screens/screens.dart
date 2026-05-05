@@ -1190,29 +1190,25 @@ class _ChatScreenState extends State<ChatScreen> {
     if (core == null) return;
     final replyId = _replyTo?.id;
     if (mounted) setState(() => _replyTo = null);
-    final stored = await core.sendMessage(
+    await core.sendMessage(
       recipientId: widget.contactId,
       text: text,
       replyToId: replyId,
     );
-    if (mounted) {
-      setState(() => _messages = [...(_messages ?? []), stored]);
-      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
-    }
+    // Reload from storage so messages are always shown in timestamp order,
+    // even when multiple sends complete out of order (e.g. large file + text).
+    if (mounted) _loadMessages(core);
   }
 
   Future<void> _sendFile(Uint8List bytes, String fileName) async {
     final core = CoreProvider.of(context).core;
     if (core == null) return;
-    final stored = await core.sendFile(
+    await core.sendFile(
       recipientId: widget.contactId,
       bytes: bytes,
       fileName: fileName,
     );
-    if (mounted) {
-      setState(() => _messages = [...(_messages ?? []), stored]);
-      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
-    }
+    if (mounted) _loadMessages(core);
   }
 
   void _showMsgMenu(BuildContext ctx, PhantomTokens t, PhantomCore? core, StoredMessage msg) {
@@ -1548,6 +1544,16 @@ class _ChatScreenState extends State<ChatScreen> {
               Navigator.pop(context);
               await core?.sendAvatarToContact(widget.contactId);
             }),
+          _MenuItem(icon: Icons.badge_outlined, label: 'share my alias', tokens: t,
+            onTap: () async {
+              Navigator.pop(context);
+              await core?.sendAliasToContact(widget.contactId);
+            }),
+          _MenuItem(icon: Icons.edit_outlined, label: 'edit contact nickname', tokens: t,
+            onTap: () {
+              Navigator.pop(context);
+              _showEditNickname(t, core);
+            }),
           _MenuItem(icon: Icons.blur_on_outlined, label: 'glass effect', tokens: t,
             onTap: () {
               Navigator.pop(context);
@@ -1762,6 +1768,51 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       );
     });
+  }
+
+  void _showEditNickname(PhantomTokens t, PhantomCore? core) {
+    final ctrl = TextEditingController(text: widget.contactName);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: t.bgSurface,
+        title: Text('edit nickname',
+            style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('private — only you can see this',
+                style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
+            const SizedBox(height: 10),
+            _PhantomField(controller: ctrl, hint: 'contact nickname...'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('cancel',
+                style: TextStyle(color: t.textSecondary, fontFamily: 'monospace')),
+          ),
+          TextButton(
+            onPressed: () async {
+              final nick = ctrl.text.trim();
+              if (core != null) {
+                final contact = await core.storage.getContact(widget.contactId);
+                if (contact != null) {
+                  await core.storage.saveContact(
+                    contact.copyWith(nickname: nick.isEmpty ? null : nick),
+                  );
+                }
+              }
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+            child: Text('save',
+                style: TextStyle(color: t.accentLight, fontFamily: 'monospace')),
+          ),
+        ],
+      ),
+    );
   }
 
   static String _formatTime(DateTime dt) {
@@ -2004,6 +2055,7 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   String? _contactAddress;
   String? _ownAvatarPath;
+  final _myAliasCtrl = TextEditingController();
   static const _secure = FlutterSecureStorage(aOptions: AndroidOptions());
 
   // App-level glass state (independent from chat glass)
@@ -2030,8 +2082,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
       core.storage.getOwnAvatarPath().then((p) {
         if (mounted) setState(() => _ownAvatarPath = p);
       });
+      core.storage.getSetting<String>('my_alias').then((alias) {
+        if (mounted && alias != null) _myAliasCtrl.text = alias;
+      });
       _loadGlass(core);
     }
+  }
+
+  @override
+  void dispose() {
+    _myAliasCtrl.dispose();
+    super.dispose();
   }
 
   Future<void> _loadGlass(PhantomCore core) async {
@@ -2157,6 +2218,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ],
                     ],
                   ),
+                ),
+              ],
+            ),
+          ),
+
+          // ── My alias ────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('my alias',
+                    style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
+                const SizedBox(height: 3),
+                Text('sent to contacts when you tap "share my alias"',
+                    style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
+                const SizedBox(height: 8),
+                _PhantomField(
+                  controller: _myAliasCtrl,
+                  hint: 'your name or alias...',
+                  onChanged: (v) => core?.storage.setSetting('my_alias', v.trim()),
                 ),
               ],
             ),

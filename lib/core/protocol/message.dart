@@ -28,7 +28,8 @@ enum MessageType {
   readReceipt(0x11),
   keyExchange(0x20),
   bundleUpdate(0x21),
-  avatarData(0x30);
+  avatarData(0x30),
+  aliasData(0x31);
 
   final int code;
   const MessageType(this.code);
@@ -374,7 +375,9 @@ class StoredMessage {
       conversationId: conversationId,
       type: msg.type,
       content: msg.content,
-      timestampUs: msg.noisyTimestampUs,
+      // Use local wall-clock time so messages are always stored in send/receive
+      // order, regardless of the ±5-min noise applied to the wire timestamp.
+      timestampUs: DateTime.now().microsecondsSinceEpoch,
       direction: direction,
       status: status,
       replyToId: msg.replyToId,
