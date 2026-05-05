@@ -5,6 +5,9 @@ import 'bluetooth/bluetooth_mesh_transport.dart';
 import 'bluetooth/mesh_protocol.dart';
 import 'bluetooth/message_store.dart';
 
+// Retry interval when pending messages remain after a flush attempt.
+const _kRetryInterval = Duration(minutes: 5);
+
 /// TransportManager v2 — top-level transport coordinator.
 ///
 /// Two modes, one fallback boundary:
@@ -41,6 +44,7 @@ class TransportManagerV2 {
   TransportMode get currentMode => _mode;
 
   final List<StreamSubscription> _subs = [];
+  Timer? _retryTimer;
 
   TransportManagerV2({
     required BluetoothMeshTransport btMesh,
@@ -192,6 +196,9 @@ class TransportManagerV2 {
   }
 
   Future<void> _flushStoreViaInternet() async {
+    _retryTimer?.cancel();
+    _retryTimer = null;
+
     if (_internetPublish == null) return;
     final pending = _store.getAllPending();
     for (final msg in pending) {
@@ -213,6 +220,18 @@ class TransportManagerV2 {
         _store.recordAttempt(msg.packet.messageIdHex);
       }
     }
+
+    // If messages still couldn't be delivered (e.g. ntfy rate-limited), retry
+    // after a short delay rather than waiting for the next connectivity change.
+    if (_store.pendingCount > 0 && _mode == TransportMode.internet) {
+      _retryTimer = Timer(_kRetryInterval, _flushStoreViaInternet);
+    }
+  }
+
+  /// Manually trigger a flush of locally-queued messages. Call this on app
+  /// resume so messages queued while offline are retried immediately.
+  void flushStore() {
+    if (_mode == TransportMode.internet) _flushStoreViaInternet();
   }
 
   // ── Public state ──────────────────────────────────────────────────────────
@@ -227,6 +246,7 @@ class TransportManagerV2 {
       );
 
   Future<void> dispose() async {
+    _retryTimer?.cancel();
     for (final sub in _subs) { await sub.cancel(); }
     await _btMesh.dispose();
     await _incomingController.close();

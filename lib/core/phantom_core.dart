@@ -133,6 +133,14 @@ class PhantomCore {
       await core._initializePreKeys();
     }
 
+    // Load all known sessions into memory BEFORE the transport starts.
+    // The ntfy subscriber fetches up to 12 h of missed messages immediately on
+    // connect; those are MSG frames that can only be decrypted if the matching
+    // RatchetSession is already in _sessions. Without this preload the loop in
+    // _handleMsgFrame iterates over an empty map and silently drops every
+    // historical message.
+    await core._preloadSessions();
+
     await core._startTransport();
     await core._startPresence();
     return core;
@@ -450,6 +458,21 @@ class PhantomCore {
   }
 
   // ── Session management ─────────────────────────────────────────────────────
+
+  /// Loads every contact's persisted RatchetSession into [_sessions] so that
+  /// incoming MSG frames can be decrypted immediately — including the burst of
+  /// historical messages that the ntfy subscriber fetches on startup.
+  Future<void> _preloadSessions() async {
+    final contacts = await storage.getAllContacts();
+    for (final contact in contacts) {
+      if (_sessions.containsKey(contact.phantomId)) continue;
+      final saved = await storage.getSessionState(contact.phantomId);
+      if (saved == null) continue;
+      try {
+        _sessions[contact.phantomId] = await RatchetSession.fromJson(saved);
+      } catch (_) {}
+    }
+  }
 
   Future<RatchetSession> _getOrCreateSession(String recipientId) async {
     // In-memory cache
@@ -841,6 +864,8 @@ class PhantomCore {
   /// Call when the app returns to foreground.
   Future<void> onAppResumed() async {
     await _presence?.publishOnline();
+    // Retry any messages that were queued while the transport was offline.
+    _transportV2?.flushStore();
   }
 
   // ── Read receipts ──────────────────────────────────────────────────────────

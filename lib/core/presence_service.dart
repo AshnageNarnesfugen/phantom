@@ -14,10 +14,11 @@ import 'package:http/http.dart' as http;
 ///   leaving ~150/day for actual messages.
 class PresenceService {
   static const _base      = 'https://ntfy.sh';
-  // Heartbeat every 6 min → ~240 publishes/day (ntfy free tier: 250/day).
-  // Threshold 9 min → at most 9 min of false-online if goOffline() fails.
-  static const _interval  = Duration(minutes: 6);
-  static const _threshold = Duration(minutes: 9);
+  // Heartbeat every 15 min → 96 publishes/day — well within ntfy's free-tier
+  // limit of 250/day per IP, leaving ~154 slots/day for actual messages.
+  // Threshold 22 min allows one missed heartbeat before marking offline.
+  static const _interval  = Duration(minutes: 15);
+  static const _threshold = Duration(minutes: 22);
 
   final String _myId;
   final http.Client _client = http.Client();
