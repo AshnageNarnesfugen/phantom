@@ -95,18 +95,26 @@ class PresenceService {
         final request = http.Request('POST', uri);
         final response = await _client.send(request);
 
+        if (response.statusCode != 200) {
+          await response.stream.drain<void>();
+          if (!_disposed) await Future.delayed(const Duration(seconds: 15));
+          continue;
+        }
+
         await for (final line in response.stream
             .transform(utf8.decoder)
             .transform(const LineSplitter())) {
           if (_disposed) return;
           if (line.trim().isEmpty) continue;
           try {
-            final ev = jsonDecode(line) as Map<String, dynamic>;
-            final rawData = base64.decode(ev['data'] as String);
-            final body = utf8.decode(rawData).trim();
+            final ev      = jsonDecode(line) as Map<String, dynamic>;
+            final rawData = ev['data'];
+            if (rawData == null) continue;
+            final body = utf8.decode(base64.decode(rawData as String)).trim();
             yield _PresenceEvent(at: DateTime.now(), online: body != '0');
           } catch (_) {}
         }
+        if (!_disposed) await Future.delayed(const Duration(seconds: 5));
       } catch (_) {
         if (!_disposed) await Future.delayed(const Duration(seconds: 15));
       }

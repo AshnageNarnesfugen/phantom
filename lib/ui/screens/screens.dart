@@ -3505,6 +3505,9 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
   final _client         = http.Client();
   final _logScroll      = ScrollController();
   StreamSubscription<String>? _logSub;
+  // Batch log updates to prevent setState storms (e.g. reconnect spin-loops).
+  Timer?       _logFlushTimer;
+  List<String> _pendingLines = [];
 
   List<String> _log     = [];
   bool         _loading = false;
@@ -3519,21 +3522,31 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
   void initState() {
     super.initState();
     _log = List.of(TransportDebugger.instance.entries);
-    _logSub = TransportDebugger.instance.stream.listen((line) {
+    _logSub = TransportDebugger.instance.stream.listen(_onLogLine);
+    _runAutoStatus();
+  }
+
+  void _onLogLine(String line) {
+    _pendingLines.add(line);
+    if (_logFlushTimer != null) return;
+    // Flush at most ~10 times/s regardless of log volume.
+    _logFlushTimer = Timer(const Duration(milliseconds: 100), () {
+      _logFlushTimer = null;
       if (!mounted) return;
-      setState(() => _log.add(line));
+      setState(() => _log.addAll(_pendingLines));
+      _pendingLines = [];
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (_logScroll.hasClients) {
           _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
         }
       });
     });
-    _runAutoStatus();
   }
 
   @override
   void dispose() {
     _logSub?.cancel();
+    _logFlushTimer?.cancel();
     _client.close();
     _logScroll.dispose();
     super.dispose();
@@ -3683,6 +3696,15 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
     setState(() => _log.clear());
   }
 
+  Future<void> _restartDaemon() async {
+    TransportDebugger.instance.log('DBG: stopping IPFS daemon…');
+    await IpfsDaemon.instance.stop();
+    TransportDebugger.instance.log('DBG: restarting IPFS daemon…');
+    await IpfsDaemon.instance.ensure();
+    TransportDebugger.instance.log('DBG: daemon restart complete — refreshing status');
+    await _runAutoStatus();
+  }
+
   // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
@@ -3784,6 +3806,7 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
             _DbgButton(label: 'topics', tokens: t, onTap: _fetchTopics),
             _DbgButton(label: 'contact peers', tokens: t, onTap: _fetchContactPeers),
             _DbgButton(label: 'my sub?', tokens: t, onTap: _checkMySubTopic),
+            _DbgButton(label: 'restart daemon', tokens: t, danger: true, onTap: _restartDaemon),
             _DbgButton(label: 'flush queue', tokens: t, accent: true, onTap: _flushQueue),
             if (widget.core != null)
               FutureBuilder<List<ContactRecord>>(

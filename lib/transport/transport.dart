@@ -286,8 +286,17 @@ class IpfsTransport implements PhantomTransport {
       try {
         final request  = http.Request('POST', uri);
         final response = await _client.send(request);
-        dbg.log('IPFS: subscription stream open (HTTP ${response.statusCode})');
 
+        // HTTP != 200 means pubsub is disabled or the daemon is not ready.
+        // Drain the body (avoids socket leak) and back off — do NOT loop tight.
+        if (response.statusCode != 200) {
+          final body = await response.stream.bytesToString();
+          dbg.log('IPFS: sub returned HTTP ${response.statusCode}: $body — retrying in 15s');
+          if (!_disposed) await Future.delayed(const Duration(seconds: 15));
+          continue;
+        }
+
+        dbg.log('IPFS: subscription stream open');
         await for (final line in response.stream
             .transform(utf8.decoder)
             .transform(const LineSplitter())) {
@@ -295,7 +304,9 @@ class IpfsTransport implements PhantomTransport {
           if (line.trim().isEmpty) continue;
           try {
             final json = jsonDecode(line) as Map<String, dynamic>;
-            final data = base64.decode(json['data'] as String);
+            final rawData = json['data'];
+            if (rawData == null) continue;
+            final data = base64.decode(rawData as String);
             dbg.log('IPFS: ← received ${data.length} bytes on ${ourId.substring(0, 8)}');
             yield IncomingEnvelope(
               data: data,
@@ -307,7 +318,8 @@ class IpfsTransport implements PhantomTransport {
             continue;
           }
         }
-        dbg.log('IPFS: subscription stream closed — reconnecting');
+        dbg.log('IPFS: subscription stream closed — reconnecting in 5s');
+        if (!_disposed) await Future.delayed(const Duration(seconds: 5));
       } catch (e) {
         dbg.log('IPFS: subscription error: $e — retrying in 10s');
         if (!_disposed) await Future.delayed(const Duration(seconds: 10));
