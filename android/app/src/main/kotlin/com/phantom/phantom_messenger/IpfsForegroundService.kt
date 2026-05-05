@@ -83,10 +83,11 @@ class IpfsForegroundService : Service() {
     private fun spawnDaemon(binary: String, repo: String) {
         Thread {
             try {
+                // --enable-pubsub-experiment was removed in Kubo >= 0.11;
+                // pubsub is now enabled via config (Pubsub.Enabled=true).
                 val pb = ProcessBuilder(
                     binary, "daemon",
-                    "--enable-pubsub-experiment",
-                    "--routing=dhtclient",   // client-only DHT — lighter on mobile
+                    "--routing=dhtclient",
                     "--migrate=true",
                 )
                 pb.environment()["IPFS_PATH"] = repo

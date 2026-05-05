@@ -154,16 +154,18 @@ class IpfsDaemon {
 
   Future<void> _applyConfig(String binary, Map<String, String> env) async {
     final configs = <List<String>>[
-      // Pubsub (required for messaging and presence)
-      ['config', '--json', 'Experimental.Pubsub', 'true'],
+      // Pubsub — Kubo ≥ 0.11 uses Pubsub.Enabled; the old Experimental.Pubsub
+      // key is silently ignored in v0.41.0, which caused HTTP 500 on all
+      // pubsub endpoints.
+      ['config', '--json', 'Pubsub.Enabled', 'true'],
+      // Gossipsub: efficient topic-based routing (default in Kubo ≥ 0.11)
+      ['config', 'Pubsub.Router', 'gossipsub'],
       // Relay client: lets us connect through public relay nodes (NAT traversal)
       ['config', '--json', 'Swarm.RelayClient.Enabled', 'true'],
       // Hole punching: direct peer-to-peer once a relay bridges the initial handshake
       ['config', '--json', 'Swarm.EnableHolePunching', 'true'],
       // mDNS: lets devices on the same local network find each other instantly
       ['config', '--json', 'Discovery.MDNS.Enabled', 'true'],
-      // Gossipsub: efficient topic-based routing (default in Kubo ≥ 0.11)
-      ['config', 'Pubsub.Router', 'gossipsub'],
       // Disable resource manager — saves ~30 MB RSS on mobile
       ['config', '--json', 'Swarm.ResourceMgr.Enabled', 'false'],
     ];
@@ -211,7 +213,10 @@ class IpfsDaemon {
 
     _directProcess = await Process.start(
       binary,
-      ['daemon', '--enable-pubsub-experiment', '--routing=dhtclient', '--migrate=true'],
+      // --enable-pubsub-experiment was removed in Kubo ≥ 0.11; pubsub is now
+      // controlled via config (Pubsub.Enabled).  Passing the old flag causes
+      // "flag provided but not defined" in newer builds.
+      ['daemon', '--routing=dhtclient', '--migrate=true'],
       environment: env,
     );
 
