@@ -228,6 +228,10 @@ class PhantomCore {
     required Uint8List bytes,
     required String fileName,
   }) async {
+    if (bytes.length > 15 * 1024 * 1024) {
+      throw const PhantomCoreException('File too large — maximum 15 MB');
+    }
+
     final lower = fileName.toLowerCase();
     final isImage = lower.endsWith('.jpg') || lower.endsWith('.jpeg') ||
         lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp');
@@ -620,15 +624,6 @@ class PhantomCore {
     final senderCaBytes   = frame.senderContactAddressBytes;
     final senderPhantomId = frame.senderPhantomId;
 
-    // If we already have a session for this sender the INIT frame is a
-    // duplicate (e.g. delivered by two transports simultaneously). Try the
-    // existing session so we don't overwrite ratchet state.
-    if (_sessions.containsKey(senderPhantomId) ||
-        await storage.getSessionState(senderPhantomId) != null) {
-      await _handleMsgFrame(frame);
-      return;
-    }
-
     final preKeyStore = await storage.getPreKeyStore();
     if (preKeyStore == null) return;
 
@@ -688,12 +683,21 @@ class PhantomCore {
         );
       }
 
+      // Install new session, replacing any stale one (handles re-INIT after
+      // one side clears history). If X3DH decryption succeeded the new session
+      // is authoritative; the old ratchet state is no longer valid.
       _sessions[senderPhantomId] = session;
       await _saveSession(senderPhantomId, session);
 
       await _dispatchIncoming(message, senderPhantomId);
     } catch (_) {
-      // Decryption failed — discard
+      // X3DH decryption failed — this may be a duplicate INIT delivered by a
+      // second transport while the primary already advanced the ratchet. Try
+      // the existing session as a fallback.
+      if (_sessions.containsKey(senderPhantomId) ||
+          await storage.getSessionState(senderPhantomId) != null) {
+        await _handleMsgFrame(frame);
+      }
     }
   }
 

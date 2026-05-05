@@ -1216,11 +1216,20 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _sendFile(Uint8List bytes, String fileName) async {
     final core = CoreProvider.of(context).core;
     if (core == null) return;
-    await core.sendFile(
-      recipientId: widget.contactId,
-      bytes: bytes,
-      fileName: fileName,
-    );
+    try {
+      await core.sendFile(
+        recipientId: widget.contactId,
+        bytes: bytes,
+        fileName: fileName,
+      );
+    } on PhantomCoreException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.message)),
+        );
+      }
+      return;
+    }
     if (mounted) _loadMessages(core);
   }
 
@@ -3487,6 +3496,13 @@ class _ForwardSheetState extends State<_ForwardSheet> {
         bytes:       widget.imageBytes,
         fileName:    'shared_${DateTime.now().millisecondsSinceEpoch}.jpg',
       );
+    } on PhantomCoreException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.message)),
+        );
+      }
+      return;
     } finally {
       if (mounted) setState(() => _sending.remove(contactId));
     }
