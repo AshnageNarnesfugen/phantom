@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:meta/meta.dart';
+import '../core/transport_debugger.dart';
 
 /// Abstract transport layer.
 ///
@@ -194,15 +195,23 @@ class IpfsTransport implements PhantomTransport {
 
   @override
   Future<bool> checkAvailability() async {
+    final dbg = TransportDebugger.instance;
     for (var attempt = 0; attempt < 5; attempt++) {
       try {
         final resp = await _client
             .post(Uri.parse('$_apiUrl/api/v0/id'))
             .timeout(const Duration(seconds: 3));
-        if (resp.statusCode == 200) return true;
-      } catch (_) {}
+        if (resp.statusCode == 200) {
+          dbg.log('IPFS: API reachable (attempt ${attempt + 1})');
+          return true;
+        }
+        dbg.log('IPFS: /id returned ${resp.statusCode} on attempt ${attempt + 1}');
+      } catch (e) {
+        dbg.log('IPFS: /id error on attempt ${attempt + 1}: $e');
+      }
       if (attempt < 4) await Future.delayed(const Duration(seconds: 2));
     }
+    dbg.log('IPFS: API not reachable after 5 attempts');
     return false;
   }
 
@@ -211,14 +220,26 @@ class IpfsTransport implements PhantomTransport {
     required String recipientId,
     required Uint8List encryptedEnvelope,
   }) async {
+    final dbg   = TransportDebugger.instance;
     final topic = _topicForId(recipientId);
+    final short = recipientId.substring(0, 8);
 
-    // IPFS pubsub always returns HTTP 200 even when no peer receives the message.
-    // Check the mesh peers first: if nobody is subscribed, throw so that the
-    // MessageStore retry machinery queues the message and delivers it once the
-    // remote peer's node connects.
-    final hasPeers = await _checkTopicPeers(topic);
-    if (!hasPeers) {
+    dbg.log('IPFS: publish → $short (${encryptedEnvelope.length} bytes)');
+
+    // Check if the recipient's node is in the gossipsub mesh for their topic.
+    // Gossipsub subscription announcements take a few seconds to propagate, so
+    // retry once after a short delay before giving up and queuing for later.
+    var peers = await _checkTopicPeers(topic);
+    dbg.log('IPFS: peer check pass-1 for $short → ${peers ? "✓ peers found" : "✗ no peers"}');
+
+    if (!peers) {
+      dbg.log('IPFS: waiting 4s for gossipsub propagation…');
+      await Future.delayed(const Duration(seconds: 4));
+      peers = await _checkTopicPeers(topic);
+      dbg.log('IPFS: peer check pass-2 for $short → ${peers ? "✓ peers found" : "✗ still no peers — queuing"}');
+    }
+
+    if (!peers) {
       throw const TransportException('No IPFS pubsub peers on recipient topic');
     }
 
@@ -230,9 +251,11 @@ class IpfsTransport implements PhantomTransport {
     ).timeout(const Duration(seconds: 10));
 
     if (response.statusCode != 200) {
+      dbg.log('IPFS: publish HTTP ${response.statusCode} → ${response.body}');
       throw TransportException(
           'IPFS publish failed: ${response.statusCode} ${response.body}');
     }
+    dbg.log('IPFS: published OK to $short');
   }
 
   Future<bool> _checkTopicPeers(String topic) async {
@@ -243,7 +266,7 @@ class IpfsTransport implements PhantomTransport {
           .post(uri)
           .timeout(const Duration(seconds: 3));
       if (resp.statusCode != 200) return false;
-      final json = jsonDecode(resp.body) as Map<String, dynamic>;
+      final json  = jsonDecode(resp.body) as Map<String, dynamic>;
       final peers = (json['Strings'] as List?)?.cast<String>() ?? [];
       return peers.isNotEmpty;
     } catch (_) {
@@ -253,14 +276,17 @@ class IpfsTransport implements PhantomTransport {
 
   @override
   Stream<IncomingEnvelope> subscribe({required String ourId}) async* {
+    final dbg   = TransportDebugger.instance;
     final topic = _topicForId(ourId);
-    final uri = Uri.parse(
+    final uri   = Uri.parse(
         '$_apiUrl/api/v0/pubsub/sub?arg=${Uri.encodeComponent(topic)}');
 
     while (!_disposed) {
+      dbg.log('IPFS: subscribing to ${topic.substring(topic.lastIndexOf('/') + 1)}…');
       try {
-        final request = http.Request('POST', uri);
+        final request  = http.Request('POST', uri);
         final response = await _client.send(request);
+        dbg.log('IPFS: subscription stream open (HTTP ${response.statusCode})');
 
         await for (final line in response.stream
             .transform(utf8.decoder)
@@ -270,17 +296,21 @@ class IpfsTransport implements PhantomTransport {
           try {
             final json = jsonDecode(line) as Map<String, dynamic>;
             final data = base64.decode(json['data'] as String);
+            dbg.log('IPFS: ← received ${data.length} bytes on ${ourId.substring(0, 8)}');
             yield IncomingEnvelope(
               data: data,
               transportName: name,
               receivedAt: DateTime.now(),
             );
-          } catch (_) {
+          } catch (e) {
+            dbg.log('IPFS: failed to parse incoming line: $e');
             continue;
           }
         }
-      } catch (_) {
-        if (!_disposed) await Future.delayed(const Duration(seconds: 15));
+        dbg.log('IPFS: subscription stream closed — reconnecting');
+      } catch (e) {
+        dbg.log('IPFS: subscription error: $e — retrying in 10s');
+        if (!_disposed) await Future.delayed(const Duration(seconds: 10));
       }
     }
   }
