@@ -14,8 +14,10 @@ import 'package:http/http.dart' as http;
 ///   leaving ~150/day for actual messages.
 class PresenceService {
   static const _base      = 'https://ntfy.sh';
-  static const _interval  = Duration(minutes: 15);
-  static const _threshold = Duration(minutes: 20);
+  // Heartbeat every 6 min → ~240 publishes/day (ntfy free tier: 250/day).
+  // Threshold 9 min → at most 9 min of false-online if goOffline() fails.
+  static const _interval  = Duration(minutes: 6);
+  static const _threshold = Duration(minutes: 9);
 
   final String _myId;
   final http.Client _client = http.Client();
@@ -45,6 +47,13 @@ class PresenceService {
     return last != null && DateTime.now().difference(last) < _threshold;
   }
 
+  /// Publishes an offline marker and clears our own last-seen so we won't
+  /// be shown as online after the app goes to background / is closed.
+  Future<void> goOffline() => _publishHeartbeat(online: false);
+
+  /// Immediately publishes a heartbeat so contacts see us as online on resume.
+  Future<void> publishOnline() => _publishHeartbeat(online: true);
+
   // ── Internal ────────────────────────────────────────────────────────────────
 
   void _subscribeAll(List<String> ids) {
@@ -58,16 +67,22 @@ class PresenceService {
 
   void _streamContact(String contactId) {
     _presenceStream(contactId).listen(
-      (at) {
+      (event) {
         final wasOnline = isOnline(contactId);
-        _lastSeen[contactId] = at;
-        if (!wasOnline) _changesCtrl.add(contactId);
+        if (event.online) {
+          _lastSeen[contactId] = event.at;
+          if (!wasOnline) _changesCtrl.add(contactId);
+        } else {
+          // Explicit offline marker — clear immediately.
+          final hadSeen = _lastSeen.remove(contactId) != null;
+          if (wasOnline || hadSeen) _changesCtrl.add(contactId);
+        }
       },
       onError: (_) {},
     );
   }
 
-  Stream<DateTime> _presenceStream(String contactId) async* {
+  Stream<_PresenceEvent> _presenceStream(String contactId) async* {
     final topic = _topic(contactId);
     int since = DateTime.now().millisecondsSinceEpoch ~/ 1000 - _threshold.inSeconds;
 
@@ -86,7 +101,11 @@ class PresenceService {
             if (ev['event'] != 'message') continue;
             final at = (ev['time'] as num?)?.toInt() ?? 0;
             if (at > since) since = at;
-            yield DateTime.fromMillisecondsSinceEpoch(at * 1000);
+            final body = (ev['message'] as String?)?.trim() ?? '1';
+            yield _PresenceEvent(
+              at: DateTime.fromMillisecondsSinceEpoch(at * 1000),
+              online: body != '0',
+            );
           } catch (_) {}
         }
       } catch (_) {
@@ -95,16 +114,20 @@ class PresenceService {
     }
   }
 
-  Future<void> _publishHeartbeat() async {
+  Future<void> _publishHeartbeat({bool online = true}) async {
     if (_disposed) return;
     try {
       await _client.post(
         Uri.parse('$_base/${_topic(_myId)}'),
         headers: {
           'Content-Type': 'text/plain',
-          'X-TTL': '${_threshold.inSeconds + 120}',
+          // Offline marker needs a long TTL so subscribers that reconnect later
+          // still see it and don't treat an old heartbeat as "still online".
+          'X-TTL': online
+              ? '${_threshold.inSeconds + 120}'
+              : '${_threshold.inSeconds * 3}',
         },
-        body: '1',
+        body: online ? '1' : '0',
       ).timeout(const Duration(seconds: 10));
     } catch (_) {}
   }
@@ -117,4 +140,10 @@ class PresenceService {
     _changesCtrl.close();
     _client.close();
   }
+}
+
+class _PresenceEvent {
+  final DateTime at;
+  final bool online;
+  const _PresenceEvent({required this.at, required this.online});
 }

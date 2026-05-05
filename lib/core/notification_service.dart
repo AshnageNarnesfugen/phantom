@@ -19,7 +19,7 @@ class NotificationService {
         ?.createNotificationChannel(channel);
 
     const initSettings = InitializationSettings(
-      android: AndroidInitializationSettings('ic_launcher'),
+      android: AndroidInitializationSettings('ic_notification'),
     );
 
     await _plugin.initialize(initSettings);
@@ -46,7 +46,7 @@ class NotificationService {
         'Messages',
         importance: Importance.high,
         priority: Priority.high,
-        icon: 'ic_launcher',
+        icon: 'ic_notification',
       ),
     );
 

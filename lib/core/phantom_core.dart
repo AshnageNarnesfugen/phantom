@@ -291,7 +291,7 @@ class PhantomCore {
       status:         MessageStatus.sending,
     );
     // System/protocol messages (avatar, alias) are not part of the chat history.
-    const systemTypes = {MessageType.avatarData, MessageType.aliasData};
+    const systemTypes = {MessageType.avatarData, MessageType.aliasData, MessageType.readReceipt};
     if (!systemTypes.contains(message.type)) {
       await storage.saveMessage(stored);
     }
@@ -772,6 +772,22 @@ class PhantomCore {
       return;
     }
 
+    if (message.type == MessageType.readReceipt) {
+      final ids = utf8.decode(message.content)
+          .split('\n')
+          .where((s) => s.isNotEmpty)
+          .toList();
+      for (final id in ids) {
+        await storage.updateMessageStatus(senderId, id, MessageStatus.read);
+      }
+      // Emit so the sender's chat screen reloads and shows blue double ticks.
+      _incomingController.add(StoredMessage.fromPhantomMessage(
+        msg: message, conversationId: senderId,
+        direction: MessageDirection.incoming, status: MessageStatus.delivered,
+      ));
+      return;
+    }
+
     final stored = StoredMessage.fromPhantomMessage(
       msg:            message,
       conversationId: senderId,
@@ -811,6 +827,32 @@ class PhantomCore {
       message: PhantomMessage(
         type:    MessageType.avatarData,
         content: Uint8List.fromList(bytes),
+      ),
+    );
+  }
+
+  // ── App lifecycle ──────────────────────────────────────────────────────────
+
+  /// Call when the app goes to background / is closed.
+  Future<void> onAppPaused() async {
+    await _presence?.goOffline();
+  }
+
+  /// Call when the app returns to foreground.
+  Future<void> onAppResumed() async {
+    await _presence?.publishOnline();
+  }
+
+  // ── Read receipts ──────────────────────────────────────────────────────────
+
+  /// Sends read receipts to [contactId] for the given [messageIds].
+  Future<void> sendReadReceipts(String contactId, List<String> messageIds) async {
+    if (messageIds.isEmpty) return;
+    await _sendPhantomMessage(
+      recipientId: contactId,
+      message: PhantomMessage(
+        type:    MessageType.readReceipt,
+        content: Uint8List.fromList(utf8.encode(messageIds.join('\n'))),
       ),
     );
   }

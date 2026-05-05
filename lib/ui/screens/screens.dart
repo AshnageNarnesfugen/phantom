@@ -1169,9 +1169,22 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _loadMessages(PhantomCore core) async {
     final msgs = await core.getMessages(widget.contactId, limit: 100);
-    if (mounted) {
-      setState(() => _messages = msgs);
-      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    if (!mounted) return;
+    setState(() => _messages = msgs);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+
+    // Mark all unread incoming messages as read and notify the sender.
+    final unread = msgs
+        .where((m) =>
+            m.direction == MessageDirection.incoming &&
+            m.status == MessageStatus.delivered)
+        .map((m) => m.id)
+        .toList();
+    for (final id in unread) {
+      await core.storage.updateMessageStatus(widget.contactId, id, MessageStatus.read);
+    }
+    if (unread.isNotEmpty) {
+      core.sendReadReceipts(widget.contactId, unread); // fire-and-forget
     }
   }
 

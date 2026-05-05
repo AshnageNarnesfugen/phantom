@@ -28,7 +28,7 @@ class PhantomApp extends StatefulWidget {
   State<PhantomApp> createState() => _PhantomAppState();
 }
 
-class _PhantomAppState extends State<PhantomApp> {
+class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
   // Starts with defaults; replaced by persisted values in _init().
   ThemeController _themeCtrl = ThemeController();
   static const _secure = FlutterSecureStorage();
@@ -39,8 +39,22 @@ class _PhantomAppState extends State<PhantomApp> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _themeCtrl.addListener(() => setState(() {}));
     _init();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        _core?.onAppPaused();
+      case AppLifecycleState.resumed:
+        _core?.onAppResumed();
+      default:
+        break;
+    }
   }
 
   Future<void> _init() async {
@@ -81,6 +95,7 @@ class _PhantomAppState extends State<PhantomApp> {
   Future<void> _onAccountReady(PhantomCore core, String seedPhrase) async {
     await _secure.write(key: _seedKey, value: seedPhrase);
     if (mounted) setState(() => _core = core);
+    NotificationService.requestPermission();
   }
 
   @override
@@ -110,6 +125,7 @@ class _PhantomAppState extends State<PhantomApp> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _themeCtrl.dispose();
     _core?.dispose();
     super.dispose();
