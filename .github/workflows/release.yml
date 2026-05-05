@@ -31,7 +31,7 @@ jobs:
       - name: Set up Go (for static x86_64 Kubo build)
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26.2'
           cache: true
 
       - name: Get dependencies
@@ -42,15 +42,15 @@ jobs:
 
       - name: Build static x86_64 Kubo binary
         run: |
-          # The official linux-amd64 Kubo release is dynamically linked against
-          # glibc, so /lib64/ld-linux-x86-64.so.2 is required — that path does
-          # not exist in Android (including Waydroid).  Building with
-          # CGO_ENABLED=0 uses Go's internal linker, which produces a truly
-          # static ELF with no PT_INTERP and no libc dependency.
+          # go install doesn't work for Kubo because its go.mod has exclude
+          # directives — clone and build from source instead.
+          # CGO_ENABLED=0 produces a truly static ELF (no glibc / PT_INTERP),
+          # which is required on Android/Waydroid where ld-linux-x86-64 is absent.
+          git clone --depth=1 --branch v0.41.0 \
+            https://github.com/ipfs/kubo.git /tmp/kubo
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go install github.com/ipfs/kubo/cmd/ipfs@v0.41.0
-          cp "$(go env GOPATH)/bin/ipfs" \
-             android/app/src/main/jniLibs/x86_64/libkubo.so
+            go build -o /tmp/ipfs /tmp/kubo/cmd/ipfs
+          cp /tmp/ipfs android/app/src/main/jniLibs/x86_64/libkubo.so
           echo "✓ Static x86_64 kubo: $(du -sh android/app/src/main/jniLibs/x86_64/libkubo.so | cut -f1)"
 
       - name: Build release APK
