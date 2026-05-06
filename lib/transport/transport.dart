@@ -257,11 +257,11 @@ class IpfsTransport implements PhantomTransport {
     }
 
     final uri = Uri.parse('$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
-    final response = await _client.post(
-      uri,
-      body: encryptedEnvelope,
-      headers: {'Content-Type': 'application/octet-stream'},
-    ).timeout(const Duration(seconds: 10));
+    final request = http.MultipartRequest('POST', uri);
+    request.files.add(http.MultipartFile.fromBytes('data', encryptedEnvelope));
+    
+    final streamedResponse = await _client.send(request).timeout(const Duration(seconds: 10));
+    final response = await http.Response.fromStream(streamedResponse);
 
     if (response.statusCode != 200) {
       dbg.log('IPFS: publish HTTP ${response.statusCode} → ${response.body}');

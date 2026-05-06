@@ -3670,11 +3670,10 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
     try {
       final uri = Uri.parse(
           '$_apiBase/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
-      final resp = await _client.post(
-        uri,
-        body: Uint8List.fromList([0xDE, 0xAD]),
-        headers: {'Content-Type': 'application/octet-stream'},
-      ).timeout(const Duration(seconds: 5));
+      final request = http.MultipartRequest('POST', uri);
+      request.files.add(http.MultipartFile.fromBytes('data', [0xDE, 0xAD]));
+      final streamedResp = await _client.send(request).timeout(const Duration(seconds: 5));
+      final resp = await http.Response.fromStream(streamedResp);
       final msg = 'force-ping HTTP ${resp.statusCode}: ${resp.body.isEmpty ? "OK" : resp.body}';
       TransportDebugger.instance.log('DBG: $msg');
     } catch (e) {

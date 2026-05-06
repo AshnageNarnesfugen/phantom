@@ -173,10 +173,10 @@ class PresenceService {
       // First put a small block so Kubo has the CID in its store — some
       // versions of Kubo reject routing/provide for unknown CIDs.
       final putUri = Uri.parse('$_apiUrl/api/v0/block/put');
-      await _client.post(putUri,
-          body: utf8.encode(_myId),
-          headers: {'Content-Type': 'application/octet-stream'})
-          .timeout(const Duration(seconds: 10));
+      final request = http.MultipartRequest('POST', putUri);
+      request.files.add(http.MultipartFile.fromBytes('data', utf8.encode(_myId)));
+      final streamedResp = await _client.send(request).timeout(const Duration(seconds: 10));
+      await http.Response.fromStream(streamedResp);
 
       final provideUri = Uri.parse(
           '$_apiUrl/api/v0/routing/provide?arg=${Uri.encodeComponent(cid)}&recursive=false');
@@ -325,11 +325,9 @@ class PresenceService {
       final topic = _topic(_myId);
       final uri = Uri.parse(
           '$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
-      await _client.post(
-        uri,
-        body: Uint8List.fromList(utf8.encode(online ? '1' : '0')),
-        headers: {'Content-Type': 'application/octet-stream'},
-      ).timeout(const Duration(seconds: 10));
+      final request = http.MultipartRequest('POST', uri);
+      request.files.add(http.MultipartFile.fromBytes('data', utf8.encode(online ? '1' : '0')));
+      await _client.send(request).timeout(const Duration(seconds: 10));
     } catch (_) {}
   }
 
