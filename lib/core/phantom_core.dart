@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:convert';
+import 'package:http/http.dart' as http;
 import 'package:cryptography/cryptography.dart';
 import 'package:meta/meta.dart';
 
@@ -188,6 +189,10 @@ class PhantomCore {
   // ── Contact address ────────────────────────────────────────────────────────
 
   /// Returns the ContactAddress string to share with others so they can add us.
+  ///
+  /// Format: `<base64url_ca>[#<ipfs_peer_id>]`
+  /// The optional '#<ipfs_peer_id>' suffix lets the recipient connect directly
+  /// via circuit relay without relying on DHT provider records.
   Future<String?> getMyContactAddress() async {
     final bundleJson = await storage.getOwnBundle();
     if (bundleJson == null) return null;
@@ -200,7 +205,20 @@ class PhantomCore {
       signature:               bundle.signedPreKeySignature,
       kyber768PublicKeyBytes:  bundle.kyber768PublicKeyBytes,
     );
-    return ca.encode();
+    final caStr = ca.encode();
+    // Append IPFS peer ID so contacts can dial us directly via circuit relay.
+    if (_ipfsApiUrl != null) {
+      try {
+        final resp = await http
+            .post(Uri.parse('$_ipfsApiUrl/api/v0/id'))
+            .timeout(const Duration(seconds: 5));
+        if (resp.statusCode == 200) {
+          final id = jsonDecode(resp.body)['ID'] as String?;
+          if (id != null && id.isNotEmpty) return '$caStr#$id';
+        }
+      } catch (_) {}
+    }
+    return caStr;
   }
 
   // ── Backup ────────────────────────────────────────────────────────────────
@@ -383,24 +401,56 @@ class PhantomCore {
   // ── Contacts ───────────────────────────────────────────────────────────────
 
   /// Add a contact from their ContactAddress string.
+  ///
+  /// Accepts the optional `#<ipfs_peer_id>` suffix produced by
+  /// [getMyContactAddress]. When present the peer ID is stored and used for
+  /// direct circuit-relay connections, bypassing DHT provider records.
   Future<ContactRecord> addContact({
     required String contactAddress,
     String? nickname,
   }) async {
-    final ca     = ContactAddress.decode(contactAddress);
+    // Parse optional IPFS peer ID suffix: '<ca>#<ipfs_peer_id>'
+    String caStr = contactAddress.trim();
+    String? ipfsPeerId;
+    final hashIdx = caStr.lastIndexOf('#');
+    if (hashIdx > 0) {
+      final candidate = caStr.substring(hashIdx + 1).trim();
+      // Only treat it as a peer ID if it looks like a libp2p peer ID.
+      if (candidate.startsWith('12D3Koo') || candidate.startsWith('Qm')) {
+        ipfsPeerId = candidate;
+        caStr = caStr.substring(0, hashIdx);
+      }
+    }
+
+    final ca      = ContactAddress.decode(caStr);
     final contact = ContactRecord(
-      phantomId:               ca.phantomId,
-      nickname:                nickname,
+      phantomId:                ca.phantomId,
+      nickname:                 nickname,
       encryptionPublicKeyBytes: ca.x25519IdentityKey,
       signingPublicKeyBytes:    ca.ed25519SigningKey,
       signedPreKeyBytes:        ca.signedPreKeyBytes,
       signedPreKeyId:           ca.signedPreKeyId,
       signedPreKeySignature:    ca.signature,
       kyber768PublicKeyBytes:   ca.kyber768PublicKeyBytes,
+      ipfsPeerId:               ipfsPeerId,
     );
     await storage.saveContact(contact);
     _presence?.addContacts([contact.phantomId]);
+    if (ipfsPeerId != null) {
+      _presence?.setContactIpfsPeerId(contact.phantomId, ipfsPeerId);
+      _notifyTransportIpfsPeerId(contact.phantomId, ipfsPeerId);
+    }
     return contact;
+  }
+
+  /// Forwards a known IPFS peer ID to the IpfsTransport layer so it can
+  /// bypass DHT provider records and connect directly via circuit relay.
+  void _notifyTransportIpfsPeerId(String contactId, String ipfsPeerId) {
+    for (final t in transport.transports) {
+      if (t is IpfsTransport) {
+        t.setContactIpfsPeerId(contactId, ipfsPeerId);
+      }
+    }
   }
 
   Future<List<ContactRecord>> getContacts() => storage.getAllContacts();
@@ -585,6 +635,13 @@ class PhantomCore {
     final contacts = await storage.getAllContacts();
     _presence = PresenceService(myId, ipfsApiUrl: _ipfsApiUrl);
     await _presence!.start(contacts.map((c) => c.phantomId).toList());
+    // Propagate stored IPFS peer IDs so both layers can connect directly.
+    for (final c in contacts) {
+      if (c.ipfsPeerId != null) {
+        _presence!.setContactIpfsPeerId(c.phantomId, c.ipfsPeerId!);
+        _notifyTransportIpfsPeerId(c.phantomId, c.ipfsPeerId!);
+      }
+    }
   }
 
   // ── Contacts / conversation management ────────────────────────────────────

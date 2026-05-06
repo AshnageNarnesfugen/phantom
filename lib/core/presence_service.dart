@@ -35,6 +35,10 @@ class PresenceService {
   final Map<String, DateTime> _connectAttempts = {};
   static const _reconnectCooldown = Duration(minutes: 5);
 
+  // Known IPFS peer IDs for contacts (from ContactAddress '#<peerId>' suffix).
+  // When populated, _discoverAndConnect uses findpeer directly instead of findprovs.
+  final Map<String, String> _contactIpfsPeerIds = {};
+
   Timer? _heartbeatTimer;
   Timer? _dhtAdvertiseTimer;
   Timer? _dhtDiscoverTimer;
@@ -79,6 +83,11 @@ class PresenceService {
   void addContacts(List<String> contactIds) {
     _subscribeAll(contactIds);
     unawaited(_discoverAll(contactIds));
+  }
+
+  /// Stores the IPFS peer ID for a contact so connection can bypass the DHT.
+  void setContactIpfsPeerId(String contactId, String ipfsPeerId) {
+    _contactIpfsPeerIds[contactId] = ipfsPeerId;
   }
 
   bool isOnline(String contactId) {
@@ -209,9 +218,21 @@ class PresenceService {
     }
   }
 
-  /// Finds a contact's IPFS node via DHT provider records and swarm/connect.
+  /// Finds a contact's IPFS node and connects.
+  ///
+  /// Fast path: if the IPFS peer ID is known (from the contact address) use
+  /// routing/findpeer directly — no DHT provider record walk needed.
+  /// Slow path: fall back to routing/findprovs (DHT provider records).
   Future<void> _discoverAndConnect(String contactId) async {
     if (_disposed) return;
+
+    final knownPeerId = _contactIpfsPeerIds[contactId];
+    if (knownPeerId != null) {
+      debugPrint('[Presence] direct connect via stored peer ID for $contactId');
+      await _connectToPeer(knownPeerId, []);
+      return;
+    }
+
     try {
       final cid = await _phantomCid(contactId);
       final uri = Uri.parse(

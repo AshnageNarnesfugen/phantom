@@ -430,6 +430,11 @@ class ContactRecord {
   final bool isVerified;
   final bool isArchived;
 
+  /// Cached IPFS peer ID for direct circuit-relay connection.
+  /// Populated from the '#<peerId>' suffix in the contact address string.
+  /// Stable across restarts (tied to the IPFS repo identity key).
+  final String? ipfsPeerId;
+
   ContactRecord({
     required this.phantomId,
     this.nickname,
@@ -443,6 +448,7 @@ class ContactRecord {
     int? addedAtUs,
     this.isVerified = false,
     this.isArchived = false,
+    this.ipfsPeerId,
   }) : addedAtUs = addedAtUs ?? DateTime.now().microsecondsSinceEpoch;
 
   /// Private nickname takes priority, then the alias the contact shared, then the short ID.
@@ -465,6 +471,7 @@ class ContactRecord {
         if (kyber768PublicKeyBytes != null)
           'kyber768_pk': base64.encode(kyber768PublicKeyBytes!),
         if (sharedAlias != null) 'shared_alias': sharedAlias,
+        if (ipfsPeerId != null) 'ipfs_peer_id': ipfsPeerId,
       };
 
   static ContactRecord fromJson(Map<String, dynamic> j) => ContactRecord(
@@ -482,6 +489,7 @@ class ContactRecord {
         addedAtUs:                j['added']  as int,
         isVerified:               j['ver']    as bool? ?? false,
         isArchived:               j['arch']   as bool? ?? false,
+        ipfsPeerId:               j['ipfs_peer_id'] as String?,
       );
 
   ContactRecord copyWith({

@@ -72,6 +72,10 @@ class TransportManager {
   List<String> get activeTransportNames =>
       _activeTransports.map((t) => t.name).toList();
 
+  /// All configured transports (active or not). Exposed so callers can reach
+  /// transport-specific APIs (e.g. [IpfsTransport.setContactIpfsPeerId]).
+  List<PhantomTransport> get transports => _transports;
+
   /// True once at least one transport is active.
   bool get isActive => _activeTransports.isNotEmpty;
 
@@ -191,6 +195,17 @@ class IpfsTransport implements PhantomTransport {
   /// Holds the StreamSubscription so we can cancel (close) the HTTP stream
   /// on dispose — avoids accumulating zombie connections.
   final Map<String, StreamSubscription<List<int>>> _crossSubs = {};
+
+  /// Known IPFS peer IDs for contacts, populated from the '#<peerId>' suffix
+  /// in the contact address. When set, _dhtDiscoverAndConnect skips findprovs
+  /// and dials the peer directly via circuit relay.
+  final Map<String, String> _contactIpfsPeerIds = {};
+
+  /// Stores the IPFS peer ID for [contactId] so future publishes can connect
+  /// directly without a DHT provider record walk.
+  void setContactIpfsPeerId(String contactId, String ipfsPeerId) {
+    _contactIpfsPeerIds[contactId] = ipfsPeerId;
+  }
 
   @override
   final String name = 'ipfs-pubsub';
@@ -360,6 +375,35 @@ class IpfsTransport implements PhantomTransport {
   /// message transport can bootstrap independently when presence hasn't run yet.
   Future<bool> _dhtDiscoverAndConnect(String phantomId, TransportDebugger dbg) async {
     final contactTopic = _topicForId(phantomId);
+
+    // Fast path: the contact's IPFS peer ID is known from the contact address.
+    // Use routing/findpeer to get current relay addresses and connect directly,
+    // bypassing the unreliable DHT provider record walk entirely.
+    final knownPeerId = _contactIpfsPeerIds[phantomId];
+    if (knownPeerId != null) {
+      dbg.log('IPFS: direct connect via stored peer ID $knownPeerId');
+      final preExisting = await _verifySwarmConnection(knownPeerId);
+      if (preExisting) {
+        final isContact = await _checkTopicPeers(contactTopic, dbg);
+        if (isContact) {
+          _swarmConnected.add(knownPeerId);
+          dbg.log('IPFS: $knownPeerId pre-connected and subscribed');
+          return true;
+        }
+      }
+      // Fetch current relay addresses via findpeer, then connect.
+      final addrs = await _fetchPeerAddrs(knownPeerId, dbg);
+      final connected = await _connectById(knownPeerId, addrs, dbg);
+      if (connected) {
+        _swarmConnected.add(knownPeerId);
+        // For a known peer, publish even if gossipsub hasn't formed yet —
+        // the mesh will form within seconds of the swarm connection.
+        dbg.log('IPFS: connected to known peer $knownPeerId — publishing');
+        return true;
+      }
+      dbg.log('IPFS: stored peer ID connect failed, falling back to findprovs');
+    }
+
     try {
       final cid = await _phantomCid(phantomId);
       final uri = Uri.parse(
@@ -448,6 +492,23 @@ class IpfsTransport implements PhantomTransport {
       dbg.log('IPFS: DHT discover error: $e');
     }
     return false;
+  }
+
+  /// Fetches current multiaddrs for [peerId] via routing/findpeer.
+  /// Returns an empty list on failure. Prioritises relay addresses.
+  Future<List<String>> _fetchPeerAddrs(String peerId, TransportDebugger dbg) async {
+    try {
+      final r = await _client
+          .post(Uri.parse(
+              '$_apiUrl/api/v0/routing/findpeer?arg=${Uri.encodeComponent(peerId)}'))
+          .timeout(const Duration(seconds: 15));
+      if (r.statusCode == 200) {
+        final addrs = (jsonDecode(r.body)['Addrs'] as List?)?.cast<String>() ?? [];
+        dbg.log('IPFS: findpeer got ${addrs.length} addrs for ${peerId.substring(0, 12)}…');
+        return addrs;
+      }
+    } catch (_) {}
+    return [];
   }
 
   Future<bool> _verifySwarmConnection(String peerId) async {
