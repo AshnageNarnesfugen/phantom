@@ -15,6 +15,7 @@ import 'storage/phantom_storage.dart';
 import 'storage/backup_manager.dart';
 import 'presence_service.dart';
 import 'notification_service.dart';
+import 'transport_debugger.dart';
 import '../transport/transport.dart';
 import '../transport/transport_manager_v2.dart' hide IncomingEnvelope;
 import '../transport/bluetooth/bluetooth_mesh_transport.dart';
@@ -615,20 +616,25 @@ class PhantomCore {
   // ── Incoming bytes ─────────────────────────────────────────────────────────
 
   Future<void> _handleIncomingBytes(Uint8List data) async {
+    final dbg = TransportDebugger.instance;
     try {
       final frame = WireFrame.parse(data);
       if (frame.isInit) {
+        dbg.log('MSG: ← INIT frame (${data.length} bytes, hybrid=${frame.isHybrid})');
+        dbg.log('MSG:   sender = ${frame.senderPhantomId.substring(0, 8)}…');
         await _handleInitFrame(frame);
       } else {
+        dbg.log('MSG: ← MSG frame (${data.length} bytes)');
         await _handleMsgFrame(frame);
       }
-    } catch (_) {
-      // Malformed frame — discard silently
+    } catch (e) {
+      dbg.log('MSG: ✗ frame parse/handle error: $e');
     }
   }
 
   /// Handle an INIT frame: run X3DH respond, create receiver session, decrypt.
   Future<void> _handleInitFrame(ParsedFrame frame) async {
+    final dbg = TransportDebugger.instance;
     final senderIkBytes   = frame.senderIdentityKeyBytes!;
     final senderEkBytes   = frame.senderEphemeralKeyBytes!;
     final senderCaBytes   = frame.senderContactAddressBytes;
@@ -649,6 +655,7 @@ class PhantomCore {
 
     // Known EK → confirmed replay. Use existing session.
     if (storedEkHex != null && storedEkHex == incomingEkHex) {
+      dbg.log('MSG: replay detected (same EK) → trying as MSG');
       await _handleMsgFrame(frame);
       return;
     }
@@ -656,15 +663,22 @@ class PhantomCore {
     // No EK on record yet (cold-start after upgrade) but an active session
     // already exists.  We can't tell if this is a replay or a re-INIT; protect
     // the live session rather than overwriting it with a reset receiver state.
-    if (storedEkHex == null &&
-        (_sessions.containsKey(senderPhantomId) ||
-            await storage.getSessionState(senderPhantomId) != null)) {
+    final hasMemSession    = _sessions.containsKey(senderPhantomId);
+    final hasStoredSession = await storage.getSessionState(senderPhantomId) != null;
+    if (storedEkHex == null && (hasMemSession || hasStoredSession)) {
+      dbg.log('MSG: no stored EK but session exists (mem=$hasMemSession, '
+          'disk=$hasStoredSession) → trying as MSG');
       await _handleMsgFrame(frame);
       return;
     }
 
+    dbg.log('MSG: fresh INIT — running X3DH respond…');
+
     final preKeyStore = await storage.getPreKeyStore();
-    if (preKeyStore == null) return;
+    if (preKeyStore == null) {
+      dbg.log('MSG: ✗ preKeyStore is null — cannot respond to INIT');
+      return;
+    }
 
     // Reconstruct our signed prekey keypair from stored private + public bytes
     final spkPub = SimplePublicKey(
@@ -685,8 +699,10 @@ class PhantomCore {
         theirIdentityKeyBytes:  senderIkBytes,
         theirEphemeralKeyBytes: senderEkBytes,
       );
-    } catch (_) {
-      return; // Bad handshake — discard
+      dbg.log('MSG: X3DH respond OK');
+    } catch (e) {
+      dbg.log('MSG: ✗ X3DH respond failed: $e');
+      return;
     }
 
     // If this is a hybrid frame and we have our Kyber private key, decapsulate
@@ -700,8 +716,10 @@ class PhantomCore {
           _kyberPrivateKeyBytes!,
         );
         sharedSecret = await HybridKEM.combineSecrets(sharedSecret, kyberSecret);
-      } catch (_) {
-        return; // Kyber decapsulation failed — discard
+        dbg.log('MSG: Kyber decapsulation OK');
+      } catch (e) {
+        dbg.log('MSG: ✗ Kyber decapsulation failed: $e');
+        return;
       }
     }
 
@@ -713,6 +731,7 @@ class PhantomCore {
     try {
       final protocol = PhantomProtocol(session);
       final message  = await protocol.decode(frame.payload);
+      dbg.log('MSG: ✓ INIT decrypted OK — type=${message.type.name}');
 
       // Simultaneous re-init tiebreaker: if both sides cleared history and sent
       // INITs at the same time, the side with the larger phantom ID keeps its
@@ -720,6 +739,7 @@ class PhantomCore {
       // The "loser" side's first message is lost but they can resend immediately.
       if (_pendingInitSent.remove(senderPhantomId) &&
           myId.compareTo(senderPhantomId) > 0) {
+        dbg.log('MSG: tiebreaker — dropping incoming INIT (we win)');
         return;
       }
 
@@ -729,6 +749,7 @@ class PhantomCore {
         await storage.saveContact(
           _buildContactFromInit(senderPhantomId, senderIkBytes, senderCaBytes),
         );
+        dbg.log('MSG: auto-saved contact from INIT CA');
       }
 
       // Persist the ephemeral key so future replays of this INIT are detected.
@@ -737,7 +758,9 @@ class PhantomCore {
       await _saveSession(senderPhantomId, session);
 
       await _dispatchIncoming(message, senderPhantomId);
-    } catch (_) {
+      dbg.log('MSG: ✓ dispatched to UI');
+    } catch (e) {
+      dbg.log('MSG: ✗ INIT decrypt failed: $e — trying existing session');
       // X3DH decryption failed — duplicate INIT from a second transport while
       // the primary already advanced the ratchet.  Try existing session.
       if (_sessions.containsKey(senderPhantomId) ||
@@ -800,6 +823,8 @@ class PhantomCore {
   /// failure, preventing ratchet state corruption if header decryption succeeds
   /// on the wrong session before the body MAC fails.
   Future<void> _handleMsgFrame(ParsedFrame frame) async {
+    final dbg = TransportDebugger.instance;
+    dbg.log('MSG: trying ${_sessions.length} session(s) for MSG decrypt');
     for (final entry in List.of(_sessions.entries)) {
       final snapshot = entry.value.takeSnapshot();
       try {
@@ -808,12 +833,15 @@ class PhantomCore {
 
         await _saveSession(entry.key, entry.value);
         await _dispatchIncoming(message, entry.key);
+        dbg.log('MSG: ✓ MSG decrypted via session ${entry.key.substring(0, 8)}');
         return;
-      } catch (_) {
+      } catch (e) {
         _sessions[entry.key] = await RatchetSession.fromJson(snapshot);
+        dbg.log('MSG:   session ${entry.key.substring(0, 8)} failed: $e');
         continue;
       }
     }
+    dbg.log('MSG: ✗ no session could decrypt this MSG frame');
   }
 
   // ── Incoming dispatch ──────────────────────────────────────────────────────
