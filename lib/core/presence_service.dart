@@ -296,26 +296,30 @@ class PresenceService {
         !a.contains('/169.254.') &&
         !a.contains('/fe80:')).toList();
 
-    // Sort: relay addresses first (work through NAT before hole-punch).
+    // Sort: relay addresses first, then local IPs, then others.
     final sorted = [...addresses]..sort((a, b) {
         final aR = a.contains('p2p-circuit') ? 0 : 1;
         final bR = b.contains('p2p-circuit') ? 0 : 1;
-        return aR.compareTo(bR);
+        if (aR != bR) return aR.compareTo(bR);
+        final aL = (a.contains('/192.168.') || a.contains('/10.') || a.contains('/172.')) ? 0 : 1;
+        final bL = (b.contains('/192.168.') || b.contains('/10.') || b.contains('/172.')) ? 0 : 1;
+        return aL.compareTo(bL);
       });
 
     // Try explicit addresses, then fall back to /p2p/<id> (DHT resolution).
     final targets = [
-      ...sorted.take(3).map((a) => '$a/p2p/$peerId'),
+      ...sorted.take(8).map((a) => '$a/p2p/$peerId'),
       if (sorted.isEmpty) '/p2p/$peerId',
     ];
 
     for (final addr in targets) {
       if (_disposed) return;
       try {
-        await _client
+        final r = await _client
             .post(Uri.parse(
                 '$_apiUrl/api/v0/swarm/connect?arg=${Uri.encodeComponent(addr)}'))
             .timeout(const Duration(seconds: 10));
+        if (r.body.contains('success')) break;
       } catch (_) {}
     }
   }
