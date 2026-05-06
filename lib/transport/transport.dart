@@ -359,6 +359,7 @@ class IpfsTransport implements PhantomTransport {
   /// Mirrors the same rendezvous mechanism used by PresenceService so the
   /// message transport can bootstrap independently when presence hasn't run yet.
   Future<bool> _dhtDiscoverAndConnect(String phantomId, TransportDebugger dbg) async {
+    final contactTopic = _topicForId(phantomId);
     try {
       final cid = await _phantomCid(phantomId);
       final uri = Uri.parse(
@@ -379,10 +380,6 @@ class IpfsTransport implements PhantomTransport {
         if (line.trim().isEmpty) continue;
         try {
           final json = jsonDecode(line) as Map<String, dynamic>;
-          // Only process Type 4 — actual provider records.
-          // Other types (1=PeerResponse, 2=FinalPeer, etc.) are intermediate
-          // DHT routing nodes that happen to be near the CID; connecting to
-          // them wastes time and causes log spam.
           final type = json['Type'];
           if (type != null && type != 4) continue;
 
@@ -392,28 +389,44 @@ class IpfsTransport implements PhantomTransport {
             final peerId = peer['ID'] as String?;
             final addrs  = (peer['Addrs'] as List?)?.cast<String>() ?? [];
             if (peerId == null || peerId.isEmpty || addrs.isEmpty) continue;
-            dbg.log('IPFS: DHT provider ${peerId.substring(0, 12)}… — connecting');
-            if (!_swarmConnected.contains(peerId)) {
-              final connected = await _connectById(peerId, addrs, dbg);
-              if (connected) {
+
+            // Log the FULL peer ID so the user can compare against the
+            // contact's "my ID" in the transport debugger.
+            dbg.log('IPFS: DHT provider $peerId — connecting');
+
+            // If ALL swarm/connect calls timeout but the peer is already in
+            // swarm/peers, it was a pre-existing connection established by the
+            // IPFS daemon (likely a relay/bootstrap node). Detect this case by
+            // checking swarm/peers BEFORE we connect.
+            final preExisting = await _verifySwarmConnection(peerId);
+            if (preExisting) {
+              // Check if they're subscribed to the contact's message topic.
+              // The real contact will be subscribed; a relay node won't be.
+              final isRealContact = await _checkTopicPeers(contactTopic, dbg);
+              if (isRealContact) {
+                dbg.log('IPFS: $peerId pre-connected AND subscribed — is the contact');
                 _swarmConnected.add(peerId);
-                return true; // Stop findprovs early if we successfully connected
+                return true;
               }
-            } else {
-               // We thought we were connected. Double check swarm/peers.
-               final isConnected = await _verifySwarmConnection(peerId);
-               if (isConnected) {
-                  dbg.log('IPFS: peer $peerId already verified in swarm/peers');
-                  return true;
-               } else {
-                  // Connection dropped. Remove from cache and dial again.
-                  _swarmConnected.remove(peerId);
-                  final connected = await _connectById(peerId, addrs, dbg);
-                  if (connected) {
-                     _swarmConnected.add(peerId);
-                     return true;
-                  }
-               }
+              dbg.log('IPFS: $peerId already in swarm but pubsub/peers=0 — '
+                  'likely a relay/bootstrap node, not the contact. Skipping.');
+              continue;
+            }
+
+            // Fresh peer — connect, then verify.
+            final connected = await _connectById(peerId, addrs, dbg);
+            if (connected) {
+              _swarmConnected.add(peerId);
+              // Wait briefly for gossipsub subscription exchange after connect.
+              await Future.delayed(const Duration(seconds: 2));
+              final isRealContact = await _checkTopicPeers(contactTopic, dbg);
+              if (isRealContact) {
+                dbg.log('IPFS: $peerId confirmed as contact via gossipsub');
+              } else {
+                dbg.log('IPFS: $peerId connected but contact app may not be '
+                    'subscribed (background/offline) — publishing anyway');
+              }
+              return true;
             }
           }
         } catch (_) {}
