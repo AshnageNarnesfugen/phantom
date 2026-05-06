@@ -61,6 +61,13 @@ class PresenceService {
 
     // DHT rendezvous bootstrap — runs independently of pubsub.
     unawaited(_advertiseOnDht());
+    // AutoRelay takes 30-60s to reserve a public relay. If we only advertise at
+    // t=0, the DHT will only ever learn our (likely un-dialable) public IP.
+    // Burst advertise during startup so the DHT gets our p2p-circuit address.
+    Timer(const Duration(seconds: 15), _advertiseOnDht);
+    Timer(const Duration(seconds: 45), _advertiseOnDht);
+    Timer(const Duration(seconds: 120), _advertiseOnDht);
+    
     // Small delay so the daemon is fully up before we query.
     Timer(const Duration(seconds: 5), () => _discoverAll(contactIds));
     _dhtAdvertiseTimer = Timer.periodic(
