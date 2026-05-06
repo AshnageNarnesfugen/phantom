@@ -247,7 +247,8 @@ class IpfsTransport implements PhantomTransport {
       // the first message is sent before presence has run we do it inline.
       dbg.log('IPFS: trying DHT discovery for $short…');
       await _dhtDiscoverAndConnect(recipientId, dbg);
-      await Future.delayed(const Duration(seconds: 8));
+      // Give GossipSub 4 seconds AFTER the swarm connection has actually established
+      await Future.delayed(const Duration(seconds: 4));
       peers = await _checkTopicPeers(topic);
       dbg.log('IPFS: peer check pass-3 for $short → ${peers ? "✓ peers found" : "✗ still no peers — queuing"}');
     }
@@ -408,7 +409,8 @@ class IpfsTransport implements PhantomTransport {
             dbg.log('IPFS: DHT provider ${peerId.substring(0, 12)}… — connecting');
             if (!_swarmConnected.contains(peerId)) {
               _swarmConnected.add(peerId);
-              unawaited(_connectById(peerId, addrs, dbg));
+              final connected = await _connectById(peerId, addrs, dbg);
+              if (connected) return; // Stop findprovs early if we successfully connected
             }
           }
         } catch (_) {}
@@ -431,7 +433,8 @@ class IpfsTransport implements PhantomTransport {
   }
 
   /// Connects to a peer given its already-decoded peer ID and known multiaddrs.
-  Future<void> _connectById(
+  /// Returns true if at least one address successfully connected.
+  Future<bool> _connectById(
       String peerId, List<String> addrs, TransportDebugger dbg) async {
     // Skip loopback and link-local — connecting to them either fails (can't
     // reach a remote peer via 127.0.0.1) or hits our own daemon (HTTP 500).
@@ -454,7 +457,7 @@ class IpfsTransport implements PhantomTransport {
       '/p2p/$peerId',
     ];
     for (final addr in targets) {
-      if (_disposed) return;
+      if (_disposed) return false;
       try {
         final r = await _client
             .post(Uri.parse(
@@ -462,12 +465,12 @@ class IpfsTransport implements PhantomTransport {
             .timeout(const Duration(seconds: 10));
         final body = r.body;
         dbg.log('IPFS: swarm/connect ${r.statusCode} → ${addr.split('/').take(5).join('/')}… [${body.contains("success") ? "OK" : "FAIL"}]');
-        // Do not break early! A public IP might return "success" but drop immediately due to NAT.
-        // Trying the relay or /p2p/ fallback ensures Kubo has all options.
+        if (body.contains('success')) return true;
       } catch (e) {
         dbg.log('IPFS: swarm/connect error: $e');
       }
     }
+    return false;
   }
 
   /// Connects directly to the IPFS peer that sent us a message so future
@@ -530,6 +533,7 @@ class IpfsTransport implements PhantomTransport {
               .timeout(const Duration(seconds: 10));
           final body = r.body;
           dbg.log('IPFS: swarm/connect ${r.statusCode} to ${addr.split('/').take(5).join('/')} [${body.contains("success") ? "OK" : "FAIL"}]');
+          if (body.contains('success')) return;
         } catch (e) {
           dbg.log('IPFS: swarm/connect error: $e');
         }
