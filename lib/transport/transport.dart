@@ -362,7 +362,7 @@ class IpfsTransport implements PhantomTransport {
       await for (final line in response.stream
           .transform(utf8.decoder)
           .transform(const LineSplitter())) {
-        if (_disposed) return;
+        if (_disposed) return false;
         if (line.trim().isEmpty) continue;
         try {
           final json = jsonDecode(line) as Map<String, dynamic>;
