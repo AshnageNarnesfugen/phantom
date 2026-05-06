@@ -247,7 +247,7 @@ class IpfsTransport implements PhantomTransport {
       // the first message is sent before presence has run we do it inline.
       dbg.log('IPFS: trying DHT discovery for $short…');
       await _dhtDiscoverAndConnect(recipientId, dbg);
-      await Future.delayed(const Duration(seconds: 2));
+      await Future.delayed(const Duration(seconds: 8));
       peers = await _checkTopicPeers(topic);
       dbg.log('IPFS: peer check pass-3 for $short → ${peers ? "✓ peers found" : "✗ still no peers — queuing"}');
     }
@@ -444,11 +444,14 @@ class IpfsTransport implements PhantomTransport {
     final sorted = [...usable]..sort((a, b) {
         final aR = a.contains('p2p-circuit') ? 0 : 1;
         final bR = b.contains('p2p-circuit') ? 0 : 1;
-        return aR.compareTo(bR);
+        if (aR != bR) return aR.compareTo(bR);
+        final aL = (a.contains('/192.168.') || a.contains('/10.') || a.contains('/172.')) ? 0 : 1;
+        final bL = (b.contains('/192.168.') || b.contains('/10.') || b.contains('/172.')) ? 0 : 1;
+        return aL.compareTo(bL);
       });
     final targets = [
-      ...sorted.take(3).map((a) => '$a/p2p/$peerId'),
-      if (sorted.isEmpty) '/p2p/$peerId',
+      ...sorted.take(8).map((a) => '$a/p2p/$peerId'),
+      '/p2p/$peerId',
     ];
     for (final addr in targets) {
       if (_disposed) return;
@@ -457,7 +460,10 @@ class IpfsTransport implements PhantomTransport {
             .post(Uri.parse(
                 '$_apiUrl/api/v0/swarm/connect?arg=${Uri.encodeComponent(addr)}'))
             .timeout(const Duration(seconds: 10));
-        dbg.log('IPFS: swarm/connect ${r.statusCode} → ${addr.split('/').take(5).join('/')}…');
+        final body = r.body;
+        dbg.log('IPFS: swarm/connect ${r.statusCode} → ${addr.split('/').take(5).join('/')}… [${body.contains("success") ? "OK" : "FAIL"}]');
+        // Do not break early! A public IP might return "success" but drop immediately due to NAT.
+        // Trying the relay or /p2p/ fallback ensures Kubo has all options.
       } catch (e) {
         dbg.log('IPFS: swarm/connect error: $e');
       }
@@ -507,10 +513,13 @@ class IpfsTransport implements PhantomTransport {
       final sorted = [...addrs]..sort((a, b) {
           final aR = a.contains('p2p-circuit') ? 0 : 1;
           final bR = b.contains('p2p-circuit') ? 0 : 1;
-          return aR.compareTo(bR);
+          if (aR != bR) return aR.compareTo(bR);
+          final aL = (a.contains('/192.168.') || a.contains('/10.') || a.contains('/172.')) ? 0 : 1;
+          final bL = (b.contains('/192.168.') || b.contains('/10.') || b.contains('/172.')) ? 0 : 1;
+          return aL.compareTo(bL);
         });
 
-      for (final addr in sorted.take(3)) {
+      for (final addr in sorted.take(8)) {
         if (_disposed) return;
         final full = '$addr/p2p/$peerId';
         try {
@@ -519,11 +528,19 @@ class IpfsTransport implements PhantomTransport {
           final r = await _client
               .post(connectUri)
               .timeout(const Duration(seconds: 10));
-          dbg.log('IPFS: swarm/connect ${r.statusCode} to ${addr.split('/').take(5).join('/')}');
+          final body = r.body;
+          dbg.log('IPFS: swarm/connect ${r.statusCode} to ${addr.split('/').take(5).join('/')} [${body.contains("success") ? "OK" : "FAIL"}]');
         } catch (e) {
           dbg.log('IPFS: swarm/connect error: $e');
         }
       }
+      
+      // Always try the smart dialer as fallback
+      try {
+          final r = await _client.post(Uri.parse('$_apiUrl/api/v0/swarm/connect?arg=${Uri.encodeComponent('/p2p/$peerId')}')).timeout(const Duration(seconds: 10));
+          dbg.log('IPFS: swarm/connect to /p2p/$peerId [${r.body.contains("success") ? "OK" : "FAIL"}]');
+      } catch(_) {}
+
     } catch (e) {
       dbg.log('IPFS: _trySwarmConnect error: $e');
     }
