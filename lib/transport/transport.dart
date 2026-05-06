@@ -228,34 +228,23 @@ class IpfsTransport implements PhantomTransport {
 
     dbg.log('IPFS: publish → $short (${encryptedEnvelope.length} bytes)');
 
-    // Check if the recipient's node is in the gossipsub mesh for their topic.
-    // Gossipsub subscription announcements take a few seconds to propagate, so
-    // retry once after a short delay before giving up and queuing for later.
-    var peers = await _checkTopicPeers(topic);
-    dbg.log('IPFS: peer check pass-1 for $short → ${peers ? "✓ peers found" : "✗ no peers"}');
+    // We do NOT use pubsub/peers to check if the peer is ready.
+    // IPFS pubsub/peers only returns peers if the local node is ALSO subscribed to the topic.
+    // Since we only subscribe to our OWN topic, pubsub/peers will ALWAYS return 0 for the recipient's topic.
+    // Instead, we verify the underlying Swarm connection directly.
 
-    if (!peers) {
-      dbg.log('IPFS: waiting 4s for gossipsub propagation…');
-      await Future.delayed(const Duration(seconds: 4));
-      peers = await _checkTopicPeers(topic);
-      dbg.log('IPFS: peer check pass-2 for $short → ${peers ? "✓ peers found" : "✗ still no peers — queuing"}');
+    dbg.log('IPFS: trying DHT discovery for $short…');
+    final connected = await _dhtDiscoverAndConnect(recipientId, dbg);
+    
+    if (!connected) {
+      // NOTE: We queue the message at the app layer if this throws.
+      throw const TransportException('No verified IPFS swarm connection to peer');
     }
 
-    if (!peers) {
-      // Last resort: use the DHT to find the recipient's IPFS peer and
-      // connect directly. PresenceService does this on a timer, but if
-      // the first message is sent before presence has run we do it inline.
-      dbg.log('IPFS: trying DHT discovery for $short…');
-      await _dhtDiscoverAndConnect(recipientId, dbg);
-      // Give GossipSub 4 seconds AFTER the swarm connection has actually established
-      await Future.delayed(const Duration(seconds: 4));
-      peers = await _checkTopicPeers(topic);
-      dbg.log('IPFS: peer check pass-3 for $short → ${peers ? "✓ peers found" : "✗ still no peers — queuing"}');
-    }
-
-    if (!peers) {
-      throw const TransportException('No IPFS pubsub peers on recipient topic');
-    }
+    // Give GossipSub 3 seconds AFTER the swarm connection has actually established
+    // to exchange SUBSCRIBE frames across the new libp2p tunnel.
+    dbg.log('IPFS: waiting 3s for gossipsub propagation…');
+    await Future.delayed(const Duration(seconds: 3));
 
     final uri = Uri.parse('$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
     final request = http.MultipartRequest('POST', uri);
@@ -270,22 +259,6 @@ class IpfsTransport implements PhantomTransport {
           'IPFS publish failed: ${response.statusCode} ${response.body}');
     }
     dbg.log('IPFS: published OK to $short');
-  }
-
-  Future<bool> _checkTopicPeers(String topic) async {
-    try {
-      final uri = Uri.parse(
-          '$_apiUrl/api/v0/pubsub/peers?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
-      final resp = await _client
-          .post(uri)
-          .timeout(const Duration(seconds: 3));
-      if (resp.statusCode != 200) return false;
-      final json  = jsonDecode(resp.body) as Map<String, dynamic>;
-      final peers = (json['Strings'] as List?)?.cast<String>() ?? [];
-      return peers.isNotEmpty;
-    } catch (_) {
-      return false;
-    }
   }
 
   @override
@@ -372,7 +345,7 @@ class IpfsTransport implements PhantomTransport {
   /// Looks up the recipient's IPFS peer via DHT provider records and connects.
   /// Mirrors the same rendezvous mechanism used by PresenceService so the
   /// message transport can bootstrap independently when presence hasn't run yet.
-  Future<void> _dhtDiscoverAndConnect(String phantomId, TransportDebugger dbg) async {
+  Future<bool> _dhtDiscoverAndConnect(String phantomId, TransportDebugger dbg) async {
     try {
       final cid = await _phantomCid(phantomId);
       final uri = Uri.parse(
@@ -383,7 +356,7 @@ class IpfsTransport implements PhantomTransport {
       if (response.statusCode != 200) {
         await response.stream.drain<void>();
         dbg.log('IPFS: findprovs HTTP ${response.statusCode}');
-        return;
+        return false;
       }
 
       await for (final line in response.stream
@@ -408,9 +381,26 @@ class IpfsTransport implements PhantomTransport {
             if (peerId == null || peerId.isEmpty || addrs.isEmpty) continue;
             dbg.log('IPFS: DHT provider ${peerId.substring(0, 12)}… — connecting');
             if (!_swarmConnected.contains(peerId)) {
-              _swarmConnected.add(peerId);
               final connected = await _connectById(peerId, addrs, dbg);
-              if (connected) return; // Stop findprovs early if we successfully connected
+              if (connected) {
+                _swarmConnected.add(peerId);
+                return true; // Stop findprovs early if we successfully connected
+              }
+            } else {
+               // We thought we were connected. Double check swarm/peers.
+               final isConnected = await _verifySwarmConnection(peerId);
+               if (isConnected) {
+                  dbg.log('IPFS: peer $peerId already verified in swarm/peers');
+                  return true;
+               } else {
+                  // Connection dropped. Remove from cache and dial again.
+                  _swarmConnected.remove(peerId);
+                  final connected = await _connectById(peerId, addrs, dbg);
+                  if (connected) {
+                     _swarmConnected.add(peerId);
+                     return true;
+                  }
+               }
             }
           }
         } catch (_) {}
@@ -418,6 +408,23 @@ class IpfsTransport implements PhantomTransport {
     } catch (e) {
       dbg.log('IPFS: DHT discover error: $e');
     }
+    return false;
+  }
+
+  Future<bool> _verifySwarmConnection(String peerId) async {
+      try {
+        final r = await _client.post(Uri.parse('$_apiUrl/api/v0/swarm/peers'))
+            .timeout(const Duration(seconds: 3));
+        if (r.statusCode == 200) {
+          final json = jsonDecode(r.body) as Map<String, dynamic>;
+          final peers = (json['Peers'] as List?) ?? [];
+          return peers.any((p) {
+             final pId = (p as Map)['Peer'];
+             return pId == peerId;
+          });
+        }
+      } catch (_) {}
+      return false;
   }
 
   /// Computes a deterministic CIDv1 (raw, sha2-256) from a Phantom ID.
