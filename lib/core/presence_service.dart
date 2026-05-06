@@ -177,10 +177,20 @@ class PresenceService {
     if (_disposed) return;
     try {
       final cid = await _phantomCid(_myId);
-      // Provide the CID directly — do NOT use block/put first.
-      // Storing the block lets public IPFS nodes download it via bitswap and
-      // re-provide the same CID, creating false-positive providers that
-      // routing/findprovs returns for other Phantom users' queries.
+      // block/put is required: Kubo's routing/provide only announces CIDs that
+      // exist in the local blockstore. Without it the DHT record is never
+      // published and contacts can't find us via findprovs.
+      // Content = 'phantom-peer-v1:<myId>' — its sha2-256 hash equals the
+      // phantom CID, so block/put CID == rendezvous CID exactly.
+      final blockReq = http.MultipartRequest(
+          'POST',
+          Uri.parse('$_apiUrl/api/v0/block/put?mhtype=sha2-256&cid-codec=raw'));
+      blockReq.files.add(http.MultipartFile.fromBytes(
+          'data', utf8.encode('phantom-peer-v1:$_myId')));
+      final blockStream = await _client.send(blockReq)
+          .timeout(const Duration(seconds: 10));
+      await blockStream.stream.drain<void>();
+
       final provideUri = Uri.parse(
           '$_apiUrl/api/v0/routing/provide?arg=${Uri.encodeComponent(cid)}&recursive=false');
       final r = await _client.post(provideUri)

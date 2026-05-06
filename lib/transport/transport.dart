@@ -363,7 +363,7 @@ class IpfsTransport implements PhantomTransport {
     try {
       final cid = await _phantomCid(phantomId);
       final uri = Uri.parse(
-          '$_apiUrl/api/v0/routing/findprovs?arg=${Uri.encodeComponent(cid)}&num-providers=5');
+          '$_apiUrl/api/v0/routing/findprovs?arg=${Uri.encodeComponent(cid)}&num-providers=20');
       final request  = http.Request('POST', uri);
       final response = await _client.send(request)
           .timeout(const Duration(seconds: 20));
@@ -388,7 +388,9 @@ class IpfsTransport implements PhantomTransport {
           for (final peer in responses.cast<Map<String, dynamic>>()) {
             final peerId = peer['ID'] as String?;
             final addrs  = (peer['Addrs'] as List?)?.cast<String>() ?? [];
-            if (peerId == null || peerId.isEmpty || addrs.isEmpty) continue;
+            if (peerId == null || peerId.isEmpty) continue;
+            // Don't skip peers with empty addrs — _connectById falls back to
+            // /p2p/<id> which uses Kubo's DHT smart-dialer to find addresses.
 
             // Log the FULL peer ID so the user can compare against the
             // contact's "my ID" in the transport debugger.
@@ -413,20 +415,31 @@ class IpfsTransport implements PhantomTransport {
               continue;
             }
 
-            // Fresh peer — connect, then verify.
+            // Fresh peer — connect, then verify via gossipsub.
             final connected = await _connectById(peerId, addrs, dbg);
             if (connected) {
               _swarmConnected.add(peerId);
-              // Wait briefly for gossipsub subscription exchange after connect.
-              await Future.delayed(const Duration(seconds: 2));
-              final isRealContact = await _checkTopicPeers(contactTopic, dbg);
-              if (isRealContact) {
-                dbg.log('IPFS: $peerId confirmed as contact via gossipsub');
-              } else {
-                dbg.log('IPFS: $peerId connected but contact app may not be '
-                    'subscribed (background/offline) — publishing anyway');
+              // Poll pubsub/peers for up to 6s. For the real contact,
+              // gossipsub subscription exchange happens within ~1s of
+              // connection (it's part of the libp2p identify protocol).
+              // False providers (public nodes not subscribed to Phantom
+              // topics) will always remain at 0.
+              bool foundContact = false;
+              for (int i = 0; i < 3; i++) {
+                await Future.delayed(const Duration(seconds: 2));
+                if (await _checkTopicPeers(contactTopic, dbg)) {
+                  dbg.log('IPFS: $peerId confirmed as contact via gossipsub');
+                  foundContact = true;
+                  break;
+                }
               }
-              return true;
+              if (foundContact) return true;
+              // No gossipsub after 6s — likely a false provider (public node
+              // that downloaded the rendezvous block via bitswap but isn't
+              // running Phantom). Remove from cache so we retry later.
+              _swarmConnected.remove(peerId);
+              dbg.log('IPFS: $peerId — no gossipsub after 6s, likely false '
+                  'provider. Skipping.');
             }
           }
         } catch (_) {}
