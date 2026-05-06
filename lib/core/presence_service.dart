@@ -172,11 +172,14 @@ class PresenceService {
       final cid = await _phantomCid(_myId);
       // First put a small block so Kubo has the CID in its store — some
       // versions of Kubo reject routing/provide for unknown CIDs.
-      final putUri = Uri.parse('$_apiUrl/api/v0/block/put');
+      final putUri = Uri.parse('$_apiUrl/api/v0/block/put?format=raw&mhtype=sha2-256');
       final request = http.MultipartRequest('POST', putUri);
-      request.files.add(http.MultipartFile.fromBytes('data', utf8.encode(_myId)));
+      request.files.add(http.MultipartFile.fromBytes('data', utf8.encode('phantom-peer-v1:$_myId')));
       final streamedResp = await _client.send(request).timeout(const Duration(seconds: 10));
-      await http.Response.fromStream(streamedResp);
+      final resp = await http.Response.fromStream(streamedResp);
+      if (resp.statusCode != 200) {
+        debugPrint('[Presence] DHT block/put failed: ${resp.statusCode} ${resp.body}');
+      }
 
       final provideUri = Uri.parse(
           '$_apiUrl/api/v0/routing/provide?arg=${Uri.encodeComponent(cid)}&recursive=false');
