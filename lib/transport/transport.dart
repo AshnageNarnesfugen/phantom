@@ -187,6 +187,13 @@ class IpfsTransport implements PhantomTransport {
   bool _disposed = false;
   final Set<String> _swarmConnected = {};
 
+  /// Active cross-subscriptions keyed by topic string.
+  /// When we publish to a recipient, we also subscribe to their topic
+  /// so GossipSub can form a mesh (exchange SUBSCRIBE announcements).
+  /// Each entry holds a keep-alive timer; when it fires the subscription
+  /// is considered stale and removed.
+  final Map<String, Timer> _crossSubs = {};
+
   @override
   final String name = 'ipfs-pubsub';
 
@@ -228,24 +235,32 @@ class IpfsTransport implements PhantomTransport {
 
     dbg.log('IPFS: publish → $short (${encryptedEnvelope.length} bytes)');
 
-    // We do NOT use pubsub/peers to check if the peer is ready.
-    // IPFS pubsub/peers only returns peers if the local node is ALSO subscribed to the topic.
-    // Since we only subscribe to our OWN topic, pubsub/peers will ALWAYS return 0 for the recipient's topic.
-    // Instead, we verify the underlying Swarm connection directly.
+    // ── Step 1: Cross-subscribe to recipient's topic ──────────────────────
+    // GossipSub only forms a mesh between peers that BOTH subscribe to the
+    // same topic. Without this, pubsub/peers returns 0 for the recipient's
+    // topic and the published message goes nowhere.
+    dbg.log('IPFS: cross-subscribing to $short topic…');
+    await _ensureCrossSubscribed(topic, dbg);
 
+    // ── Step 2: DHT discovery + swarm connect ────────────────────────────
     dbg.log('IPFS: trying DHT discovery for $short…');
     final connected = await _dhtDiscoverAndConnect(recipientId, dbg);
     
     if (!connected) {
-      // NOTE: We queue the message at the app layer if this throws.
       throw const TransportException('No verified IPFS swarm connection to peer');
     }
 
-    // Give GossipSub 3 seconds AFTER the swarm connection has actually established
-    // to exchange SUBSCRIBE frames across the new libp2p tunnel.
-    dbg.log('IPFS: waiting 3s for gossipsub propagation…');
-    await Future.delayed(const Duration(seconds: 3));
+    // ── Step 3: Wait for GossipSub mesh formation ────────────────────────
+    // After the swarm connection is up AND we are cross-subscribed, GossipSub
+    // needs time to exchange SUBSCRIBE announcements and build the mesh.
+    // Poll pubsub/peers instead of a blind wait.
+    dbg.log('IPFS: waiting for gossipsub mesh on $short topic…');
+    final hasPeers = await _waitForTopicPeers(topic, dbg);
+    if (!hasPeers) {
+      dbg.log('IPFS: WARNING — no gossipsub peers found for $short, publishing anyway');
+    }
 
+    // ── Step 4: Publish ──────────────────────────────────────────────────
     final uri = Uri.parse('$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
     final request = http.MultipartRequest('POST', uri);
     request.files.add(http.MultipartFile.fromBytes('data', encryptedEnvelope));
@@ -582,9 +597,82 @@ class IpfsTransport implements PhantomTransport {
     }
   }
 
+  // ── Cross-subscription for GossipSub mesh formation ─────────────────────
+
+  /// Opens a subscription to [topic] so that GossipSub announces us as a
+  /// peer on that topic. This is the key mechanism that allows pubsub/peers
+  /// to return >0 for the recipient's topic. The subscription is kept alive
+  /// for 5 minutes and refreshed on each publish to the same recipient.
+  Future<void> _ensureCrossSubscribed(String topic, TransportDebugger dbg) async {
+    // Refresh the keep-alive timer if already subscribed.
+    if (_crossSubs.containsKey(topic)) {
+      _crossSubs[topic]!.cancel();
+      _crossSubs[topic] = Timer(const Duration(minutes: 5), () {
+        _crossSubs.remove(topic);
+        dbg.log('IPFS: cross-sub expired for ${topic.split('/').last.substring(0, 8)}');
+      });
+      return;
+    }
+
+    // Open a pubsub/sub stream to the recipient's topic.
+    // We don't process messages — the act of subscribing is what makes
+    // GossipSub announce us and form the mesh.
+    final uri = Uri.parse(
+      '$_apiUrl/api/v0/pubsub/sub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
+    try {
+      final request = http.Request('POST', uri);
+      final response = await _client.send(request)
+          .timeout(const Duration(seconds: 5));
+      if (response.statusCode == 200) {
+        // Drain the stream in the background (keeps the subscription alive
+        // in the IPFS daemon). The stream closes when the HTTP connection
+        // is interrupted or the daemon shuts down.
+        unawaited(response.stream.drain<void>().catchError((_) {}));
+        dbg.log('IPFS: cross-sub active for ${topic.split('/').last.substring(0, 8)}');
+      } else {
+        dbg.log('IPFS: cross-sub HTTP ${response.statusCode}');
+      }
+    } catch (e) {
+      dbg.log('IPFS: cross-sub error: $e');
+    }
+
+    _crossSubs[topic] = Timer(const Duration(minutes: 5), () {
+      _crossSubs.remove(topic);
+    });
+  }
+
+  /// Polls `pubsub/peers` for up to ~18 seconds until at least one peer
+  /// appears on [topic]. Returns true as soon as a peer is found.
+  Future<bool> _waitForTopicPeers(String topic, TransportDebugger dbg) async {
+    final encodedTopic = _encodeTopic(topic);
+    for (int i = 0; i < 6; i++) {
+      if (_disposed) return false;
+      try {
+        final r = await _client.post(Uri.parse(
+            '$_apiUrl/api/v0/pubsub/peers?arg=${Uri.encodeComponent(encodedTopic)}'))
+            .timeout(const Duration(seconds: 3));
+        if (r.statusCode == 200) {
+          final json = jsonDecode(r.body) as Map<String, dynamic>;
+          final strings = (json['Strings'] as List?) ?? [];
+          if (strings.isNotEmpty) {
+            dbg.log('IPFS: ${strings.length} gossipsub peer(s) on topic');
+            return true;
+          }
+          dbg.log('IPFS: pubsub/peers poll ${i + 1}/6 — 0 peers');
+        }
+      } catch (_) {}
+      await Future.delayed(const Duration(seconds: 3));
+    }
+    return false;
+  }
+
   @override
   Future<void> dispose() async {
     _disposed = true;
+    for (final timer in _crossSubs.values) {
+      timer.cancel();
+    }
+    _crossSubs.clear();
     _client.close();
   }
 }

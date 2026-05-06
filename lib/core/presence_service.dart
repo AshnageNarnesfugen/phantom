@@ -342,7 +342,39 @@ class PresenceService {
              final pId = (p as Map)['Peer'];
              return pId == peerId;
           });
-          if (isConnected) return;
+          if (isConnected) {
+            // Pre-warm GossipSub mesh: cross-subscribe to every contact's
+            // message topic so publish() finds peers immediately.
+            unawaited(_crossSubscribeContactTopics());
+            return;
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
+  /// Cross-subscribes to the message topic of all known contacts.
+  /// This makes our GossipSub announce us as a peer on those topics,
+  /// which is required for pubsub to deliver messages.
+  /// The subscriptions are fire-and-forget; the HTTP streams are drained
+  /// in the background and keep alive until the daemon or client closes.
+  final Set<String> _crossSubbed = {};
+
+  Future<void> _crossSubscribeContactTopics() async {
+    for (final contactId in _subscribed) {
+      if (_disposed) return;
+      final msgTopic = '/phantom/v1/$contactId';
+      if (_crossSubbed.contains(msgTopic)) continue;
+      _crossSubbed.add(msgTopic);
+      try {
+        final uri = Uri.parse(
+          '$_apiUrl/api/v0/pubsub/sub?arg=${Uri.encodeComponent(_encodeTopic(msgTopic))}');
+        final request = http.Request('POST', uri);
+        final response = await _client.send(request)
+            .timeout(const Duration(seconds: 5));
+        if (response.statusCode == 200) {
+          unawaited(response.stream.drain<void>().catchError((_) {}));
+          debugPrint('[Presence] cross-sub active for msg topic ${contactId.substring(0, 8)}');
         }
       } catch (_) {}
     }
