@@ -316,17 +316,34 @@ class PresenceService {
     // Try explicit addresses, then fall back to /p2p/<id> (DHT resolution).
     final targets = [
       ...sorted.take(8).map((a) => '$a/p2p/$peerId'),
-      if (sorted.isEmpty) '/p2p/$peerId',
+      '/p2p/$peerId',
     ];
 
-    for (final addr in targets) {
+    unawaited(Future.wait(targets.map((addr) async {
       if (_disposed) return;
       try {
-        final r = await _client
+        await _client
             .post(Uri.parse(
                 '$_apiUrl/api/v0/swarm/connect?arg=${Uri.encodeComponent(addr)}'))
             .timeout(const Duration(seconds: 10));
-        if (r.body.contains('success')) break;
+      } catch (_) {}
+    })));
+
+    for (int i = 0; i < 5; i++) {
+      if (_disposed) return;
+      await Future.delayed(const Duration(seconds: 2));
+      try {
+        final r = await _client.post(Uri.parse('$_apiUrl/api/v0/swarm/peers'))
+            .timeout(const Duration(seconds: 3));
+        if (r.statusCode == 200) {
+          final json = jsonDecode(r.body) as Map<String, dynamic>;
+          final peers = (json['Peers'] as List?) ?? [];
+          final isConnected = peers.any((p) {
+             final pId = (p as Map)['Peer'];
+             return pId == peerId;
+          });
+          if (isConnected) return;
+        }
       } catch (_) {}
     }
   }

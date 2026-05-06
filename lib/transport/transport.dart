@@ -456,8 +456,10 @@ class IpfsTransport implements PhantomTransport {
       ...sorted.take(8).map((a) => '$a/p2p/$peerId'),
       '/p2p/$peerId',
     ];
-    for (final addr in targets) {
-      if (_disposed) return false;
+
+    // Dial all addresses in parallel. Don't stop at the first fake 'success'.
+    unawaited(Future.wait(targets.map((addr) async {
+      if (_disposed) return;
       try {
         final r = await _client
             .post(Uri.parse(
@@ -465,11 +467,34 @@ class IpfsTransport implements PhantomTransport {
             .timeout(const Duration(seconds: 10));
         final body = r.body;
         dbg.log('IPFS: swarm/connect ${r.statusCode} → ${addr.split('/').take(5).join('/')}… [${body.contains("success") ? "OK" : "FAIL"}]');
-        if (body.contains('success')) return true;
       } catch (e) {
         dbg.log('IPFS: swarm/connect error: $e');
       }
+    })));
+
+    // Verify true connection by polling swarm/peers for up to 10 seconds.
+    for (int i = 0; i < 5; i++) {
+      if (_disposed) return false;
+      await Future.delayed(const Duration(seconds: 2));
+      try {
+        final r = await _client.post(Uri.parse('$_apiUrl/api/v0/swarm/peers'))
+            .timeout(const Duration(seconds: 3));
+        if (r.statusCode == 200) {
+          final json = jsonDecode(r.body) as Map<String, dynamic>;
+          final peers = (json['Peers'] as List?) ?? [];
+          final isConnected = peers.any((p) {
+             final pId = (p as Map)['Peer'];
+             return pId == peerId;
+          });
+          if (isConnected) {
+            dbg.log('IPFS: verified true connection to ${peerId.substring(0, 8)} in swarm/peers');
+            return true;
+          }
+        }
+      } catch (_) {}
     }
+    
+    dbg.log('IPFS: failed to verify connection to ${peerId.substring(0, 8)}');
     return false;
   }
 
