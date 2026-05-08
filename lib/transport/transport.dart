@@ -418,12 +418,7 @@ class IpfsTransport implements PhantomTransport {
 
   static String _topicForId(String phantomId) => '/phantom/v1/$phantomId';
 
-  /// Kubo >= 0.11 requires pubsub topic args to be multibase-encoded.
-  /// We use base64url without padding (multibase prefix 'u').
-  static String _encodeTopic(String topic) {
-    final bytes = utf8.encode(topic);
-    return 'u${base64Url.encode(bytes).replaceAll('=', '')}';
-  }
+  static String _encodeTopic(String topic) => topic;
 
   /// Decodes a multibase-encoded payload from a pubsub response.
   /// Kubo >= 0.11 encodes data with a multibase prefix ('m'=base64, 'u'=base64url).
@@ -829,7 +824,12 @@ class I2PTransport implements PhantomTransport {
     final dbg = TransportDebugger.instance;
     final hostsToTry = [
       host,
-      if (Platform.isAndroid && host == '127.0.0.1') ...['10.0.2.2', '192.168.240.1'],
+      if (Platform.isAndroid && host == '127.0.0.1') ...[
+        '10.0.2.2',      // Emulator host
+        '192.168.240.1', // Waydroid host
+        '192.168.1.1',   // Common router
+        '192.168.0.1',   // Common router
+      ],
     ];
 
     for (final h in hostsToTry) {
