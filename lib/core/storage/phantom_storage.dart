@@ -434,6 +434,8 @@ class ContactRecord {
   /// Populated from the '#<peerId>' suffix in the contact address string.
   /// Stable across restarts (tied to the IPFS repo identity key).
   final String? ipfsPeerId;
+  final String? yggdrasilAddress;
+  final String? i2pDestination;
 
   ContactRecord({
     required this.phantomId,
@@ -449,6 +451,8 @@ class ContactRecord {
     this.isVerified = false,
     this.isArchived = false,
     this.ipfsPeerId,
+    this.yggdrasilAddress,
+    this.i2pDestination,
   }) : addedAtUs = addedAtUs ?? DateTime.now().microsecondsSinceEpoch;
 
   /// Private nickname takes priority, then the alias the contact shared, then the short ID.
@@ -472,6 +476,8 @@ class ContactRecord {
           'kyber768_pk': base64.encode(kyber768PublicKeyBytes!),
         if (sharedAlias != null) 'shared_alias': sharedAlias,
         if (ipfsPeerId != null) 'ipfs_peer_id': ipfsPeerId,
+        if (yggdrasilAddress != null) 'ygg_addr': yggdrasilAddress,
+        if (i2pDestination != null) 'i2p_dest': i2pDestination,
       };
 
   static ContactRecord fromJson(Map<String, dynamic> j) => ContactRecord(
@@ -490,6 +496,8 @@ class ContactRecord {
         isVerified:               j['ver']    as bool? ?? false,
         isArchived:               j['arch']   as bool? ?? false,
         ipfsPeerId:               j['ipfs_peer_id'] as String?,
+        yggdrasilAddress:         j['ygg_addr'] as String?,
+        i2pDestination:           j['i2p_dest'] as String?,
       );
 
   ContactRecord copyWith({
@@ -498,6 +506,8 @@ class ContactRecord {
     bool? isVerified,
     bool? isArchived,
     String? ipfsPeerId,
+    String? yggdrasilAddress,
+    String? i2pDestination,
   }) => ContactRecord(
         phantomId:                phantomId,
         nickname:                 nickname    ?? this.nickname,
@@ -512,6 +522,8 @@ class ContactRecord {
         isVerified:               isVerified  ?? this.isVerified,
         isArchived:               isArchived  ?? this.isArchived,
         ipfsPeerId:               ipfsPeerId  ?? this.ipfsPeerId,
+        yggdrasilAddress:         yggdrasilAddress ?? this.yggdrasilAddress,
+        i2pDestination:           i2pDestination   ?? this.i2pDestination,
       );
 }
 

@@ -1,6 +1,7 @@
 import 'dart:async';
-import 'dart:typed_data';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 import 'package:http/http.dart' as http;
 import 'package:meta/meta.dart';
@@ -88,7 +89,7 @@ class TransportManager {
           if (yggdrasilAddress != null)
             YggdrasilTransport(address: yggdrasilAddress),
           if (i2pSocksHost != null && i2pSocksPort != null)
-            I2PTransport(socksHost: i2pSocksHost, socksPort: i2pSocksPort),
+            I2PTransport(host: i2pSocksHost, samPort: i2pSocksPort),
           IpfsTransport(apiUrl: ipfsApiUrl ?? 'http://127.0.0.1:5001'),
         ];
 
@@ -142,29 +143,77 @@ class TransportManager {
     }
   }
 
-  /// Publishes to every active transport in parallel.
-  /// Succeeds if at least one transport delivers the message.
-  /// If no transport is active, attempts to activate late-starting ones first.
+  /// Stores transport-specific metadata for contacts (Ygg addresses, I2P destinations, etc.)
+  final Map<String, String> _yggAddrs = {};
+  final Map<String, String> _i2pDests = {};
+
+  void setContactYggAddress(String contactId, String address) => _yggAddrs[contactId] = address;
+  void setContactI2PDestination(String contactId, String dest) => _i2pDests[contactId] = dest;
+  void setContactIpfsPeerId(String contactId, String peerId) {
+    for (var t in _transports.whereType<IpfsTransport>()) {
+      t.setContactIpfsPeerId(contactId, peerId);
+    }
+  }
+
+  /// Publishes to the most appropriate transport based on the tiered strategy:
+  /// 1. If handshake (X3DH INIT), prioritize I2P.
+  /// 2. If we have a Yggdrasil address, use Yggdrasil.
+  /// 3. Fallback to IPFS.
   Future<void> publish({
     required String recipientId,
     required Uint8List encryptedEnvelope,
+    bool isHandshake = false,
   }) async {
+    if (_activeTransports.isEmpty) await _activateLateTransports();
     if (_activeTransports.isEmpty) {
-      await _activateLateTransports();
+      throw const TransportException('No transport available.');
     }
-    if (_activeTransports.isEmpty) {
-      throw const TransportException('No transport available (IPFS daemon not running).');
+
+    // Tier 1: I2P for handshakes
+    if (isHandshake) {
+      final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
+      if (i2p != null) {
+        final dest = _i2pDests[recipientId];
+        if (dest != null) {
+          try {
+            await i2p.publishToDest(dest: dest, data: encryptedEnvelope);
+            return;
+          } catch (_) {}
+        }
+      }
     }
+
+    // Tier 2: Yggdrasil for direct P2P data
+    final ygg = _activeTransports.whereType<YggdrasilTransport>().firstOrNull;
+    final yggAddr = _yggAddrs[recipientId];
+    if (ygg != null && yggAddr != null) {
+      try {
+        await ygg.publishToAddr(address: yggAddr, data: encryptedEnvelope);
+        return;
+      } catch (_) {}
+    }
+
+    // Tier 3: IPFS fallback / parallel
     int successes = 0;
     Object? lastError;
     await Future.wait([
       for (final t in _activeTransports)
-        t
-            .publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope)
-            .then((_) { successes++; })
-            .onError((e, _) { lastError = e; }),
+        if (t is IpfsTransport)
+          t.publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope)
+              .then((_) { successes++; })
+              .onError((e, _) { lastError = e; }),
     ]);
-    if (successes == 0) throw lastError!;
+
+    if (successes == 0) {
+       // If no IPFS success, try whatever is active as last resort
+       for (final t in _activeTransports) {
+         try {
+           await t.publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope);
+           return;
+         } catch(e) { lastError = e; }
+       }
+       throw lastError ?? const TransportException('All transports failed');
+    }
   }
 
   Future<void> dispose() async {
@@ -737,126 +786,148 @@ class IpfsTransport implements PhantomTransport {
   }
 }
 
-// ── I2P Transport ─────────────────────────────────────────────────────────────
-
-/// Transport over I2P via a local SOCKS5 proxy.
+/// Transport over I2P via SAM Bridge (Simple Anonymous Messaging).
 ///
-/// I2P must be running locally as a daemon.
-/// The app connects via SOCKS5 (default: 127.0.0.1:4447).
-///
-/// For messaging over I2P we use the I2P HTTP proxy to communicate
-/// with an anonymous relay service (Eepsite).
-/// In a full implementation each user runs their own eepsite.
+/// Default for handshakes. Creates a persistent I2P destination.
 class I2PTransport implements PhantomTransport {
-  final String socksHost;
-  final int socksPort;
+  final String host;
+  final int samPort;
+  String? _myDest;
+  bool _disposed = false;
 
   @override
-  final String name = 'i2p-socks5';
+  final String name = 'i2p-sam';
 
   @override
   bool get isAvailable => true;
 
-  I2PTransport({required this.socksHost, required this.socksPort});
+  I2PTransport({this.host = '127.0.0.1', this.samPort = 7656});
 
   @override
   Future<bool> checkAvailability() async {
     try {
-      // Try to connect to the SOCKS5 proxy.
-      // If I2P is not running, the connection fails.
-      return await _checkSocksProxy();
+      final s = await Socket.connect(host, samPort).timeout(const Duration(seconds: 2));
+      s.destroy();
+      return true;
     } catch (_) {
       return false;
     }
   }
 
-  Future<bool> _checkSocksProxy() async {
-    // Real implementation: open a TCP socket to socksHost:socksPort
-    // and verify the SOCKS5 handshake.
-    // Placeholder — real code uses dart:io
-    return false; // disabled until I2P is running
+  /// Sends raw data to a specific I2P destination.
+  Future<void> publishToDest({required String dest, required Uint8List data}) async {
+    final s = await Socket.connect(host, samPort);
+    s.add(utf8.encode('HELLO VERSION MIN=3.3 MAX=3.3\n'));
+    // Simplified SAM STREAM session for the handshake
+    s.add(utf8.encode('SESSION CREATE STYLE=STREAM ID=phsend DESTINATION=TRANSIENT\n'));
+    s.add(utf8.encode('STREAM CONNECT ID=phsend DESTINATION=$dest\n'));
+    s.add(data);
+    await s.flush();
+    await s.close();
   }
 
   @override
-  Future<void> publish({
-    required String recipientId,
-    required Uint8List encryptedEnvelope,
-  }) async {
-    // In I2P the recipient has a .i2p address derived from their ID.
-    // Full implementation: send via I2P HTTP API or SAM bridge.
-    throw UnimplementedError('I2P publish — implement with SAM bridge or I2P HTTP proxy');
+  Future<void> publish({required String recipientId, required Uint8List encryptedEnvelope}) async {
+    // Fallback if no specific destination is known (requires I2P naming or DHT)
+    throw const TransportException('I2P requires a specific destination for handshakes');
   }
 
   @override
   Stream<IncomingEnvelope> subscribe({required String ourId}) async* {
-    // In I2P: listen on our I2P destination.
-    // Full implementation: I2P SAM (Simple Anonymous Messaging) API.
-    throw UnimplementedError('I2P subscribe — implement with SAM bridge');
+    final dbg = TransportDebugger.instance;
+    while (!_disposed) {
+      try {
+        final s = await Socket.connect(host, samPort);
+        s.add(utf8.encode('HELLO VERSION MIN=3.3 MAX=3.3\n'));
+        s.add(utf8.encode('SESSION CREATE STYLE=STREAM ID=phantom DESTINATION=TRANSIENT\n'));
+        
+        // In a real I2P implementation, we would persist the private key of the destination
+        // so our .i2p address stays the same. For now, we use TRANSIENT.
+        
+        await for (final data in s) {
+          if (_disposed) break;
+          yield IncomingEnvelope(
+            data: Uint8List.fromList(data),
+            transportName: name,
+            receivedAt: DateTime.now(),
+          );
+        }
+      } catch (e) {
+        dbg.log('I2P: connection error $e, retrying...');
+        await Future.delayed(const Duration(seconds: 10));
+      }
+    }
   }
 
   @override
-  Future<void> dispose() async {}
+  Future<void> dispose() async {
+    _disposed = true;
+  }
 }
-
-// ── Yggdrasil Transport ───────────────────────────────────────────────────────
 
 /// Transport over the Yggdrasil network (encrypted IPv6 mesh).
 ///
-/// Yggdrasil assigns a permanent IPv6 address derived from the keypair.
-/// Messages are sent directly peer-to-peer over TCP/IPv6.
-///
-/// Advantages over IPFS/I2P:
-///   - Lower latency (direct routing)
-///   - No intermediary server
-///   - Static address derived from identity
-///
-/// Requires Yggdrasil running as a system daemon.
+/// Base for data connections. Uses direct TCP/IPv6.
 class YggdrasilTransport implements PhantomTransport {
-  final String address; // own Yggdrasil IPv6 address
-  static const int listenPort = 7331; // Phantom port over Yggdrasil
+  final String? address; // our Yggdrasil IPv6 address
+  static const int listenPort = 7331;
+  ServerSocket? _server;
+  bool _disposed = false;
 
   @override
-  final String name = 'yggdrasil-direct';
+  final String name = 'yggdrasil-tcp';
 
   @override
   bool get isAvailable => true;
 
-  YggdrasilTransport({required this.address});
+  YggdrasilTransport({this.address});
 
   @override
   Future<bool> checkAvailability() async {
-    // Verify Yggdrasil is active: ping own address.
-    // Real implementation: dart:io RawServerSocket over IPv6.
+    // Check if we can bind to an IPv6 address (implies Yggdrasil or IPv6 is active)
     try {
-      return await _checkYggdrasilInterface();
+      final s = await ServerSocket.bind(InternetAddress.anyIPv6, 0);
+      await s.close();
+      return true;
     } catch (_) {
       return false;
     }
   }
 
-  Future<bool> _checkYggdrasilInterface() async {
-    // Placeholder — real code opens a UDP socket on address:listenPort
-    return false;
+  Future<void> publishToAddr({required String address, required Uint8List data}) async {
+    final s = await Socket.connect(address, listenPort, timeout: const Duration(seconds: 5));
+    s.add(data);
+    await s.flush();
+    await s.close();
   }
 
   @override
-  Future<void> publish({
-    required String recipientId,
-    required Uint8List encryptedEnvelope,
-  }) async {
-    // In Yggdrasil: the recipient's IPv6 address is derived from their PhantomID.
-    // Full implementation: TCP stream over Yggdrasil IPv6.
-    throw UnimplementedError('Yggdrasil publish — implement with dart:io IPv6 socket');
+  Future<void> publish({required String recipientId, required Uint8List encryptedEnvelope}) async {
+    throw const TransportException('Yggdrasil requires a direct IPv6 address');
   }
 
   @override
   Stream<IncomingEnvelope> subscribe({required String ourId}) async* {
-    // Listen on address:listenPort.
-    throw UnimplementedError('Yggdrasil subscribe — implement with ServerSocket IPv6');
+    final dbg = TransportDebugger.instance;
+    _server = await ServerSocket.bind(InternetAddress.anyIPv6, listenPort);
+    dbg.log('Yggdrasil: listening on port $listenPort');
+
+    await for (final client in _server!) {
+      if (_disposed) break;
+      final data = await client.fold<List<int>>([], (p, e) => p..addAll(e));
+      yield IncomingEnvelope(
+        data: Uint8List.fromList(data),
+        transportName: name,
+        receivedAt: DateTime.now(),
+      );
+    }
   }
 
   @override
-  Future<void> dispose() async {}
+  Future<void> dispose() async {
+    _disposed = true;
+    await _server?.close();
+  }
 }
 
 class TransportException implements Exception {

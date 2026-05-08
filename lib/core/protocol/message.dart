@@ -29,7 +29,8 @@ enum MessageType {
   keyExchange(0x20),
   bundleUpdate(0x21),
   avatarData(0x30),
-  aliasData(0x31);
+  aliasData(0x31),
+  connectivityInfo(0x32);
 
   final int code;
   const MessageType(this.code);
@@ -77,6 +78,19 @@ class PhantomMessage {
       type: MessageType.text,
       content: Uint8List.fromList(utf8.encode(text)),
       replyToId: replyToId,
+    );
+  }
+
+  /// Factory constructor for connectivity metadata exchange.
+  factory PhantomMessage.connectivity({String? yggAddr, String? i2pDest, String? ipfsPeerId}) {
+    final data = {
+      if (yggAddr != null) 'ygg': yggAddr,
+      if (i2pDest != null) 'i2p': i2pDest,
+      if (ipfsPeerId != null) 'ipfs': ipfsPeerId,
+    };
+    return PhantomMessage(
+      type: MessageType.connectivityInfo,
+      content: Uint8List.fromList(utf8.encode(jsonEncode(data))),
     );
   }
 

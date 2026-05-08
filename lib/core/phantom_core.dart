@@ -136,6 +136,7 @@ class PhantomCore {
     core._transportV2 = _buildTransportV2(transport, core.myId);
 
     await core._initKyberKeys(seedPhrase);
+    await core._syncTransportMetadata();
 
     // Re-initialize prekeys if they don't exist yet (e.g. first restore on new device)
     final existing = await PhantomStorage.instance.getPreKeyStore();
@@ -150,6 +151,15 @@ class PhantomCore {
     await core._startTransport();
     await core._startPresence();
     return core;
+  }
+
+  Future<void> _syncTransportMetadata() async {
+    final contacts = await storage.getAllContacts();
+    for (final c in contacts) {
+      if (c.yggdrasilAddress != null) transport.setContactYggAddress(c.phantomId, c.yggdrasilAddress!);
+      if (c.i2pDestination != null) transport.setContactI2PDestination(c.phantomId, c.i2pDestination!);
+      if (c.ipfsPeerId != null) transport.setContactIpfsPeerId(c.phantomId, c.ipfsPeerId!);
+    }
   }
 
   static TransportManager _buildTransport(TransportConfig? config) {
@@ -298,6 +308,9 @@ class PhantomCore {
   }) async {
     final session  = await _getOrCreateSession(recipientId);
     final protocol = PhantomProtocol(session);
+    
+    // Check if this is a new session (handshake)
+    bool isHandshake = session.isNewSession;
 
     // Capture BEFORE encode() calls session.encrypt(), which clears both fields.
     final x3dhEk      = session.pendingX3dhEphemeralKey;
@@ -340,7 +353,7 @@ class PhantomCore {
       status:         MessageStatus.sending,
     );
     // System/protocol messages (avatar, alias) are not part of the chat history.
-    const systemTypes = {MessageType.avatarData, MessageType.aliasData, MessageType.readReceipt};
+    const systemTypes = {MessageType.avatarData, MessageType.aliasData, MessageType.readReceipt, MessageType.connectivityInfo};
     if (!systemTypes.contains(message.type)) {
       await storage.saveMessage(stored);
     }
@@ -358,10 +371,25 @@ class PhantomCore {
             ? MessageStatus.sent
             : MessageStatus.failed;
         await storage.updateMessageStatus(recipientId, message.id, status);
+
+        if (isHandshake) {
+          unawaited(_sendConnectivityInfo(recipientId));
+        }
+
         return stored.copyWith(status: status);
       } else if (_transportAvailable) {
-        await transport.publish(recipientId: recipientId, encryptedEnvelope: wire);
+        await transport.publish(
+          recipientId: recipientId,
+          encryptedEnvelope: wire,
+          isHandshake: isHandshake,
+        );
         await storage.updateMessageStatus(recipientId, message.id, MessageStatus.sent);
+
+        // If it was a handshake, automatically follow up with our connectivity info
+        if (isHandshake) {
+          unawaited(_sendConnectivityInfo(recipientId));
+        }
+
         return stored.copyWith(status: MessageStatus.sent);
       } else {
         await storage.updateMessageStatus(recipientId, message.id, MessageStatus.failed);
@@ -687,6 +715,40 @@ class PhantomCore {
     await storage.saveContact(c.copyWith(isArchived: archived));
   }
 
+  Future<void> _handleIncomingAlias(String contactId, String alias) async {
+    final contact = await storage.getContact(contactId);
+    if (contact == null) return;
+    await storage.saveContact(contact.copyWith(sharedAlias: alias));
+    _notifyContactUpdated(contactId);
+  }
+
+  Future<void> _handleIncomingConnectivity(String contactId, String json) async {
+    try {
+      final data = jsonDecode(json) as Map<String, dynamic>;
+      final contact = await storage.getContact(contactId);
+      if (contact == null) return;
+
+      final updated = contact.copyWith(
+        ipfsPeerId:       data['ipfs'] as String?,
+        yggdrasilAddress: data['ygg']  as String?,
+        i2pDestination:   data['i2p']  as String?,
+      );
+
+      await storage.saveContact(updated);
+      
+      // Update active transport metadata
+      if (updated.yggdrasilAddress != null) transport.setContactYggAddress(contactId, updated.yggdrasilAddress!);
+      if (updated.i2pDestination != null) transport.setContactI2PDestination(contactId, updated.i2pDestination!);
+      if (updated.ipfsPeerId != null) transport.setContactIpfsPeerId(contactId, updated.ipfsPeerId!);
+      
+      _notifyContactUpdated(contactId);
+    } catch (_) {}
+  }
+
+  void _notifyContactUpdated(String contactId) {
+    // Notify UI/Streams if necessary
+  }
+
   /// Clears all messages and the session for a contact, but keeps the contact.
   Future<void> deleteConversation(String contactId) async {
     await storage.clearMessages(contactId);
@@ -701,6 +763,24 @@ class PhantomCore {
   }
 
   // ── Incoming bytes ─────────────────────────────────────────────────────────
+
+  Future<void> _sendConnectivityInfo(String recipientId) async {
+    final ipfsId = await getMyIpfsPeerId();
+    
+    // Try to get our Yggdrasil address if active
+    String? myYgg;
+    final ygg = transport.transports.whereType<YggdrasilTransport>().firstOrNull;
+    if (ygg != null) myYgg = ygg.address;
+
+    final msg = PhantomMessage.connectivity(
+      ipfsPeerId: ipfsId,
+      yggAddr:    myYgg,
+    );
+    final session = await _getOrCreateSession(recipientId);
+    final protocol = PhantomProtocol(session);
+    final envelope = await protocol.encode(msg);
+    await transport.publish(recipientId: recipientId, encryptedEnvelope: envelope);
+  }
 
   Future<void> _handleIncomingBytes(Uint8List data) async {
     final dbg = TransportDebugger.instance;
@@ -946,17 +1026,17 @@ class PhantomCore {
     }
 
     if (message.type == MessageType.aliasData) {
-      final alias = utf8.decode(message.content).trim();
-      if (alias.isNotEmpty) {
-        final contact = await storage.getContact(senderId);
-        if (contact != null) {
-          await storage.saveContact(contact.copyWith(sharedAlias: alias));
-        }
-      }
+      await _handleIncomingAlias(senderId, utf8.decode(message.content));
       _incomingController.add(StoredMessage.fromPhantomMessage(
         msg: message, conversationId: senderId,
         direction: MessageDirection.incoming, status: MessageStatus.delivered,
       ));
+      return;
+    }
+
+    if (message.type == MessageType.connectivityInfo) {
+      await _handleIncomingConnectivity(senderId, utf8.decode(message.content));
+      // Connectivity info doesn't need to be visible in the UI
       return;
     }
 

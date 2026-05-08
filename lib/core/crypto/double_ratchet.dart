@@ -110,10 +110,13 @@ class RatchetSession {
   /// Cleared after first encrypt().
   Uint8List? pendingX3dhEphemeralKey;
 
-  /// Kyber-768 ciphertext for the hybrid INIT frame (sender side only).
   /// Null when the session was established without quantum-resistant KEM.
   /// Cleared after first encrypt().
   Uint8List? pendingKyberCipherBytes;
+
+  /// True only until the very first message is encrypted and sent.
+  /// Used by the transport layer to prioritize handshake-optimized transports.
+  bool isNewSession = false;
 
   RatchetSession._({
     required Uint8List rootKey,
@@ -160,7 +163,8 @@ class RatchetSession {
       .._nextSendingHeaderKey   = nextSendHK    // after first DH ratchet response
       .._nextReceivingHeaderKey = hkBtoA        // to decrypt Bob's first reply
       ..pendingX3dhEphemeralKey  = x3dhEphemeralKeyBytes
-      ..pendingKyberCipherBytes  = kyberCipherBytes;
+      ..pendingKyberCipherBytes  = kyberCipherBytes
+      ..isNewSession = true;
 
     return session;
   }
@@ -206,6 +210,7 @@ class RatchetSession {
     // Clear pending INIT-frame fields after first encrypt
     pendingX3dhEphemeralKey = null;
     pendingKyberCipherBytes = null;
+    isNewSession = false;
 
     final encHeader = await _encryptHeader(header.encode(), _sendingHeaderKey!);
     final nonce     = await _randomNonce();
