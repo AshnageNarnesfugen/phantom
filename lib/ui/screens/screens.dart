@@ -2387,6 +2387,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _myIpfsPeerId;
   String? _ownAvatarPath;
   final _myAliasCtrl = TextEditingController();
+  final _yggdrasilCtrl = TextEditingController();
   static const _secure = FlutterSecureStorage(aOptions: AndroidOptions());
 
   // App-level glass state (independent from chat glass)
@@ -2423,6 +2424,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       core.storage.getSetting<String>('my_alias').then((alias) {
         if (mounted && alias != null) _myAliasCtrl.text = alias;
       });
+      core.storage.getSetting<String>('yggdrasil_address').then((ygg) {
+        if (mounted && ygg != null) _yggdrasilCtrl.text = ygg;
+      });
       _loadGlass(core);
       _refreshStatus();
       _refreshTimer ??= Timer.periodic(const Duration(seconds: 2), (_) => _refreshStatus());
@@ -2448,6 +2452,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void dispose() {
     _refreshTimer?.cancel();
     _myAliasCtrl.dispose();
+    _yggdrasilCtrl.dispose();
     super.dispose();
   }
 
@@ -2956,37 +2961,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Text('leave empty to auto-detect. manually enter if android hides vpn interfaces.',
                     style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
                 const SizedBox(height: 8),
-                FutureBuilder<String?>(
-                  future: core?.storage.getSetting<String>('yggdrasil_address'),
-                  builder: (context, snapshot) {
-                    final ctrl = TextEditingController(text: snapshot.data ?? '');
-                    return TextField(
-                      controller: ctrl,
-                      style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 12),
-                      decoration: InputDecoration(
-                        hintText: 'e.g. 02xx:...',
-                        hintStyle: TextStyle(color: t.textDisabled),
-                        filled: true,
-                        fillColor: t.bgSubtle,
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(t.radiusCard),
-                          borderSide: BorderSide.none,
-                        ),
-                        suffixIcon: IconButton(
-                          icon: Icon(Icons.save, color: t.accentLight, size: 16),
-                          onPressed: () {
-                            core?.setMyYggdrasilAddress(ctrl.text.trim());
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: const Text('yggdrasil address updated', style: TextStyle(fontFamily: 'monospace', fontSize: 12)),
-                                backgroundColor: t.bgSubtle,
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                    );
-                  },
+                TextField(
+                  controller: _yggdrasilCtrl,
+                  style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 12),
+                  decoration: InputDecoration(
+                    hintText: 'e.g. 02xx:...',
+                    hintStyle: TextStyle(color: t.textDisabled),
+                    filled: true,
+                    fillColor: t.bgSubtle,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(t.radiusCard),
+                      borderSide: BorderSide.none,
+                    ),
+                    suffixIcon: IconButton(
+                      icon: Icon(Icons.save, color: t.accentLight, size: 16),
+                      onPressed: () {
+                        core?.setMyYggdrasilAddress(_yggdrasilCtrl.text.trim());
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: const Text('yggdrasil address updated', style: TextStyle(fontFamily: 'monospace', fontSize: 12)),
+                            backgroundColor: t.bgSubtle,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
                 ),
               ],
             ),

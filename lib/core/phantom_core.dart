@@ -226,7 +226,7 @@ class PhantomCore {
 
     // 2. Append Yggdrasil IPv6
     final ygg = transport.transports.whereType<YggdrasilTransport>().firstOrNull;
-    if (ygg != null && ygg.address != null) res += '@${ygg.address}';
+    if (ygg != null && ygg.address != null && ygg.address!.isNotEmpty) res += '@${ygg.address}';
 
     // 3. Append I2P Destination
     final i2p = transport.transports.whereType<I2PTransport>().firstOrNull;

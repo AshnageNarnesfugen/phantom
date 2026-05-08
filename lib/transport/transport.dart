@@ -955,7 +955,7 @@ class YggdrasilTransport implements PhantomTransport {
 
   String? get address => _address;
 
-  void setManualAddress(String ip) => _address = ip;
+  void setManualAddress(String ip) => _address = ip.isEmpty ? null : ip;
 
   YggdrasilTransport({String? address}) : _address = address;
 
