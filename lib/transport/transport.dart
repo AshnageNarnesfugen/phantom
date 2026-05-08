@@ -416,7 +416,7 @@ class IpfsTransport implements PhantomTransport {
     }
   }
 
-  static String _topicForId(String phantomId) => 'ph.v1.$phantomId';
+  static String _topicForId(String phantomId) => phantomId;
 
   static String _encodeTopic(String topic) => topic;
 
@@ -827,8 +827,10 @@ class I2PTransport implements PhantomTransport {
       if (Platform.isAndroid && host == '127.0.0.1') ...[
         '10.0.2.2',      // Emulator host
         '192.168.240.1', // Waydroid host
-        '192.168.1.1',   // Common router
-        '192.168.0.1',   // Common router
+        '172.17.0.1',    // Docker/Waydroid alternative
+        '172.33.0.1',    // Your current Waydroid gateway
+        '192.168.1.1',
+        '192.168.0.1',
       ],
     ];
 

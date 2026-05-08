@@ -246,7 +246,7 @@ class PresenceService {
     return 'f${cidBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join()}';
   }
 
-  static String _topic(String phantomId) => 'ph.prs.v1.$phantomId';
+  static String _topic(String phantomId) => 'prs$phantomId';
   static String _encodeTopic(String topic) => topic;
 
   Future<void> _publishHeartbeat({bool online = true}) async {
