@@ -249,6 +249,17 @@ class PresenceService {
   static String _topic(String phantomId) => '/phantom/prs/v1/$phantomId';
   static String _encodeTopic(String topic) => topic;
 
+  Future<void> _publishHeartbeat({bool online = true}) async {
+    if (_disposed) return;
+    try {
+      final topic = _topic(_myId);
+      final uri = Uri.parse('$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
+      final request = http.MultipartRequest('POST', uri);
+      request.files.add(http.MultipartFile.fromBytes('data', utf8.encode(online ? '1' : '0')));
+      await _client.send(request).timeout(const Duration(seconds: 10));
+    } catch (_) {}
+  }
+
   void dispose() {
     _disposed = true;
     _heartbeatTimer?.cancel();
