@@ -941,7 +941,6 @@ class I2PTransport implements PhantomTransport {
 ///
 /// Base for data connections. Uses direct TCP/IPv6.
 class YggdrasilTransport implements PhantomTransport {
-  final String? address; // our Yggdrasil IPv6 address
   static const int listenPort = 7331;
   ServerSocket? _server;
   bool _disposed = false;
@@ -952,11 +951,38 @@ class YggdrasilTransport implements PhantomTransport {
   @override
   bool get isAvailable => true;
 
-  YggdrasilTransport({this.address});
+  String? _address;
+
+  String? get address => _address;
+
+  YggdrasilTransport({String? address}) : _address = address;
 
   @override
   Future<bool> checkAvailability() async {
-    // Check if we can bind to an IPv6 address (implies Yggdrasil or IPv6 is active)
+    // 1. Auto-detect Yggdrasil IP if not provided
+    if (_address == null) {
+      try {
+        final interfaces = await NetworkInterface.list(type: InternetAddressType.IPv6);
+        for (final interface in interfaces) {
+          // Yggdrasil usually creates a tun interface. We check all interfaces just in case.
+          for (final addr in interface.addresses) {
+            final ip = addr.address.toLowerCase();
+            // Yggdrasil IPs are in the 0200::/7 range, which formats as 2xx: or 3xx:
+            if (ip.startsWith('2') || ip.startsWith('3') || ip.startsWith('02') || ip.startsWith('03')) {
+              // Extremely rough heuristic, but effective for typical mobile setups
+              if (interface.name.contains('tun') || interface.name.contains('ygg')) {
+                _address = ip;
+                TransportDebugger.instance.log('Yggdrasil: auto-detected IP $_address on ${interface.name}');
+                break;
+              }
+            }
+          }
+          if (_address != null) break;
+        }
+      } catch (_) {}
+    }
+
+    // 2. Check if we can bind to an IPv6 address
     try {
       final s = await ServerSocket.bind(InternetAddress.anyIPv6, 0);
       await s.close();
