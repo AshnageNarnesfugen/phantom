@@ -2658,8 +2658,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               child: Text(
                                 _contactAddress!,
                                 style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 10),
-                                maxLines: 3,
-                                overflow: TextOverflow.ellipsis,
+                                maxLines: 5,
+                                softWrap: true,
+                                overflow: TextOverflow.visible,
                               ),
                             ),
                             const SizedBox(width: 8),
@@ -2941,6 +2942,55 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 },
               ),
           ],
+
+          // ── Network ───────────────────────────────────────────
+          _SectionHeader('network', t),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('yggdrasil ipv6 (override)',
+                    style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 14)),
+                const SizedBox(height: 4),
+                Text('leave empty to auto-detect. manually enter if android hides vpn interfaces.',
+                    style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
+                const SizedBox(height: 8),
+                FutureBuilder<String?>(
+                  future: core?.storage.getSetting<String>('yggdrasil_address'),
+                  builder: (context, snapshot) {
+                    final ctrl = TextEditingController(text: snapshot.data ?? '');
+                    return TextField(
+                      controller: ctrl,
+                      style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 12),
+                      decoration: InputDecoration(
+                        hintText: 'e.g. 02xx:...',
+                        hintStyle: TextStyle(color: t.textDisabled),
+                        filled: true,
+                        fillColor: t.bgSubtle,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(t.radiusCard),
+                          borderSide: BorderSide.none,
+                        ),
+                        suffixIcon: IconButton(
+                          icon: Icon(Icons.save, color: t.accentLight, size: 16),
+                          onPressed: () {
+                            core?.setMyYggdrasilAddress(ctrl.text.trim());
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: const Text('yggdrasil address updated', style: TextStyle(fontFamily: 'monospace', fontSize: 12)),
+                                backgroundColor: t.bgSubtle,
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
 
           // ── About ─────────────────────────────────────────────
           _SectionHeader('about', t),

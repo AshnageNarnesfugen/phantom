@@ -138,6 +138,11 @@ class PhantomCore {
     await core._initKyberKeys(seedPhrase);
     await core._syncTransportMetadata();
 
+    final savedYgg = await PhantomStorage.instance.getSetting<String>('yggdrasil_address');
+    if (savedYgg != null) {
+      core.setMyYggdrasilAddress(savedYgg);
+    }
+
     // Re-initialize prekeys if they don't exist yet (e.g. first restore on new device)
     final existing = await PhantomStorage.instance.getPreKeyStore();
     if (existing == null) {
@@ -228,6 +233,15 @@ class PhantomCore {
     if (i2p != null && i2p.myDestination != null) res += '\$${i2p.myDestination}';
 
     return res;
+  }
+
+  /// Manually override the Yggdrasil address if auto-detection fails.
+  Future<void> setMyYggdrasilAddress(String ip) async {
+    await storage.setSetting('yggdrasil_address', ip);
+    final ygg = transport.transports.whereType<YggdrasilTransport>().firstOrNull;
+    if (ygg != null) {
+      ygg.setManualAddress(ip);
+    }
   }
 
   String? _cachedIpfsPeerId;
