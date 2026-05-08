@@ -102,7 +102,7 @@ class PhantomCore {
       storage:  PhantomStorage.instance,
       transport: transport,
     );
-    core._ipfsApiUrl  = transportConfig?.ipfsApiUrl;
+    core._ipfsApiUrl  = transportConfig?.ipfsApiUrl ?? 'http://127.0.0.1:5001';
     core._transportV2 = _buildTransportV2(transport, core.myId);
 
     // Derive Kyber-768 keypair deterministically from the seed phrase.
@@ -132,7 +132,7 @@ class PhantomCore {
       storage:  PhantomStorage.instance,
       transport: transport,
     );
-    core._ipfsApiUrl  = transportConfig?.ipfsApiUrl;
+    core._ipfsApiUrl  = transportConfig?.ipfsApiUrl ?? 'http://127.0.0.1:5001';
     core._transportV2 = _buildTransportV2(transport, core.myId);
 
     await core._initKyberKeys(seedPhrase);
