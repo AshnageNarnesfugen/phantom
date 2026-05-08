@@ -82,14 +82,15 @@ class TransportManager {
 
   TransportManager({
     String? ipfsApiUrl,
-    String? i2pSocksHost,
-    int? i2pSocksPort,
+    String? i2pSamHost,
+    int? i2pSamPort,
     String? yggdrasilAddress,
   }) : _transports = [
-          if (yggdrasilAddress != null)
-            YggdrasilTransport(address: yggdrasilAddress),
-          if (i2pSocksHost != null && i2pSocksPort != null)
-            I2PTransport(host: i2pSocksHost, samPort: i2pSocksPort),
+          YggdrasilTransport(address: yggdrasilAddress),
+          I2PTransport(
+            host: i2pSamHost ?? '127.0.0.1', 
+            samPort: i2pSamPort ?? 7656
+          ),
           IpfsTransport(apiUrl: ipfsApiUrl ?? 'http://127.0.0.1:5001'),
         ];
 
@@ -790,7 +791,7 @@ class IpfsTransport implements PhantomTransport {
 ///
 /// Default for handshakes. Creates a persistent I2P destination.
 class I2PTransport implements PhantomTransport {
-  final String host;
+  String host;
   final int samPort;
   String? _myDest;
   bool _disposed = false;
@@ -807,25 +808,34 @@ class I2PTransport implements PhantomTransport {
 
   @override
   Future<bool> checkAvailability() async {
-    try {
-      final s = await Socket.connect(host, samPort).timeout(const Duration(seconds: 2));
-      s.destroy();
-      return true;
-    } catch (_) {
-      return false;
+    final hostsToTry = [
+      host,
+      if (Platform.isAndroid && host == '127.0.0.1') ...['10.0.2.2', '192.168.240.1'],
+    ];
+
+    for (final h in hostsToTry) {
+      try {
+        final s = await Socket.connect(h, samPort, timeout: const Duration(milliseconds: 500));
+        await s.close();
+        host = h; // Update host to the one that worked
+        return true;
+      } catch (_) {}
     }
+    return false;
   }
 
-  /// Sends raw data to a specific I2P destination.
+  /// Sends raw data to a specific I2P destination using DATAGRAM.
   Future<void> publishToDest({required String dest, required Uint8List data}) async {
-    final s = await Socket.connect(host, samPort);
-    s.add(utf8.encode('HELLO VERSION MIN=3.3 MAX=3.3\n'));
-    // Simplified SAM STREAM session for the handshake
-    s.add(utf8.encode('SESSION CREATE STYLE=STREAM ID=phsend DESTINATION=TRANSIENT\n'));
-    s.add(utf8.encode('STREAM CONNECT ID=phsend DESTINATION=$dest\n'));
-    s.add(data);
-    await s.flush();
-    await s.close();
+    try {
+      final s = await Socket.connect(host, samPort);
+      s.add(utf8.encode('HELLO VERSION MIN=3.3 MAX=3.3\n'));
+      // Use DATAGRAM for faster, more reliable handshakes without full stream overhead
+      s.add(utf8.encode('SESSION CREATE STYLE=DATAGRAM ID=phsend DESTINATION=TRANSIENT\n'));
+      s.add(utf8.encode('DATAGRAM SEND DESTINATION=$dest\n'));
+      s.add(data);
+      await s.flush();
+      await s.close();
+    } catch (_) {}
   }
 
   @override
@@ -841,23 +851,38 @@ class I2PTransport implements PhantomTransport {
       try {
         final s = await Socket.connect(host, samPort);
         s.add(utf8.encode('HELLO VERSION MIN=3.3 MAX=3.3\n'));
-        s.add(utf8.encode('SESSION CREATE STYLE=STREAM ID=phantom DESTINATION=TRANSIENT\n'));
+        s.add(utf8.encode('SESSION CREATE STYLE=DATAGRAM ID=phantom DESTINATION=TRANSIENT\n'));
         
         // Wait for the NAMING REPLY to get our destination
-        // In a full implementation we'd parse the 'DESTINATION' from the session creation response
-        // For now, we'll try to get it via 'NAMING LOOKUP NAME=ME'
         s.add(utf8.encode('NAMING LOOKUP NAME=ME\n'));
         
         await for (final data in s) {
           if (_disposed) break;
+          
+          // Check for SAM control messages (ASCII)
           try {
             final str = utf8.decode(data);
             if (str.contains('NAMING REPLY RESULT=OK NAME=ME VALUE=')) {
               _myDest = str.split('VALUE=').last.trim();
               continue;
             }
+            
+            // Handle DATAGRAM RECEIVED headers
+            if (str.startsWith('DATAGRAM RECEIVED')) {
+              // The message data usually follows after the first newline in the same packet
+              // or the next one. SAM Datagrams are: "DATAGRAM RECEIVED DEST=... SIZE=...\n<data>"
+              final nlIdx = data.indexOf(10); // index of '\n'
+              if (nlIdx != -1 && nlIdx < data.length - 1) {
+                yield IncomingEnvelope(
+                  data: Uint8List.fromList(data.sublist(nlIdx + 1)),
+                  transportName: name,
+                  receivedAt: DateTime.now(),
+                );
+              }
+              continue;
+            }
           } catch (_) {
-            // Binary data (the actual encrypted message), proceed to yield
+            // Binary data or malformed UTF8 - yield as is (fallback)
           }
           
           yield IncomingEnvelope(

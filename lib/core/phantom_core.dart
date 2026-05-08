@@ -165,8 +165,8 @@ class PhantomCore {
   static TransportManager _buildTransport(TransportConfig? config) {
     return TransportManager(
       ipfsApiUrl:       config?.ipfsApiUrl,
-      i2pSocksHost:     config?.i2pSocksHost,
-      i2pSocksPort:     config?.i2pSocksPort,
+      i2pSamHost:       config?.i2pSamHost,
+      i2pSamPort:       config?.i2pSamPort,
       yggdrasilAddress: config?.yggdrasilAddress,
     );
   }
@@ -1164,14 +1164,14 @@ class PhantomCore {
 @immutable
 class TransportConfig {
   final String? ipfsApiUrl;
-  final String? i2pSocksHost;
-  final int?    i2pSocksPort;
+  final String? i2pSamHost;
+  final int?    i2pSamPort;
   final String? yggdrasilAddress;
 
   const TransportConfig({
     this.ipfsApiUrl,
-    this.i2pSocksHost,
-    this.i2pSocksPort,
+    this.i2pSamHost,
+    this.i2pSamPort,
     this.yggdrasilAddress,
   });
 }
