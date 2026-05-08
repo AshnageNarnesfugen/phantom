@@ -230,15 +230,19 @@ class PhantomCore {
     return res;
   }
 
+  String? _cachedIpfsPeerId;
+
   /// Returns our IPFS peer ID if the daemon is reachable.
   Future<String?> getMyIpfsPeerId() async {
+    if (_cachedIpfsPeerId != null) return _cachedIpfsPeerId;
     if (_ipfsApiUrl == null) return null;
     try {
       final resp = await http
           .post(Uri.parse('$_ipfsApiUrl/api/v0/id'))
           .timeout(const Duration(seconds: 3));
       if (resp.statusCode == 200) {
-        return jsonDecode(resp.body)['ID'] as String?;
+        _cachedIpfsPeerId = jsonDecode(resp.body)['ID'] as String?;
+        return _cachedIpfsPeerId;
       }
     } catch (_) {}
     return null;

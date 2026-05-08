@@ -964,22 +964,21 @@ class YggdrasilTransport implements PhantomTransport {
       try {
         final interfaces = await NetworkInterface.list(type: InternetAddressType.IPv6);
         for (final interface in interfaces) {
-          // Yggdrasil usually creates a tun interface. We check all interfaces just in case.
           for (final addr in interface.addresses) {
-            final ip = addr.address.toLowerCase();
-            // Yggdrasil IPs are in the 0200::/7 range, which formats as 2xx: or 3xx:
-            if (ip.startsWith('2') || ip.startsWith('3') || ip.startsWith('02') || ip.startsWith('03')) {
-              // Extremely rough heuristic, but effective for typical mobile setups
-              if (interface.name.contains('tun') || interface.name.contains('ygg')) {
-                _address = ip;
-                TransportDebugger.instance.log('Yggdrasil: auto-detected IP $_address on ${interface.name}');
-                break;
-              }
+            final bytes = addr.rawAddress;
+            // Yggdrasil uses the 0200::/7 subnet.
+            // This means the first byte must be exactly 0x02 or 0x03.
+            if (bytes.length == 16 && (bytes[0] == 0x02 || bytes[0] == 0x03)) {
+              _address = addr.address;
+              TransportDebugger.instance.log('Yggdrasil: auto-detected IP $_address on ${interface.name}');
+              break;
             }
           }
           if (_address != null) break;
         }
-      } catch (_) {}
+      } catch (e) {
+        TransportDebugger.instance.log('Yggdrasil: interface scan failed - $e');
+      }
     }
 
     // 2. Check if we can bind to an IPv6 address
