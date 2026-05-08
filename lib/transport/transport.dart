@@ -99,11 +99,17 @@ class TransportManager {
   /// starting; [publish] will retry via [_activateLateTransports].
   Future<void> initialize({required String ourId}) async {
     _ourId = ourId;
+    final dbg = TransportDebugger.instance;
+    dbg.log('TRANSPORT: initializing for ${ourId.substring(0, 8)}...');
+
     final reachable = await Future.wait(
       _transports.map((t) async {
         try {
-          return await t.checkAvailability() ? t : null;
-        } catch (_) {
+          final ok = await t.checkAvailability();
+          dbg.log('TRANSPORT: ${t.name} availability = $ok');
+          return ok ? t : null;
+        } catch (e) {
+          dbg.log('TRANSPORT: ${t.name} check failed: $e');
           return null;
         }
       }),
@@ -113,10 +119,13 @@ class TransportManager {
       _activeTransports.add(t);
       t.subscribe(ourId: ourId).listen(
         _incomingController.add,
-        onError: (_) {},
+        onError: (e) => dbg.log('TRANSPORT: ${t.name} stream error: $e'),
       );
     }
-    // No throw when empty — [publish] retries late-starting transports.
+    
+    if (_activeTransports.isEmpty) {
+      dbg.log('TRANSPORT: WARNING - no transports active!');
+    }
   }
 
   /// Re-checks any transport that was not available at [initialize] time.
@@ -170,17 +179,23 @@ class TransportManager {
       throw const TransportException('No transport available.');
     }
 
+    final dbg = TransportDebugger.instance;
+
     // Tier 1: I2P for handshakes
     if (isHandshake) {
       final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
-      if (i2p != null) {
-        final dest = _i2pDests[recipientId];
-        if (dest != null) {
-          try {
-            await i2p.publishToDest(dest: dest, data: encryptedEnvelope);
-            return;
-          } catch (_) {}
+      final dest = _i2pDests[recipientId];
+      if (i2p != null && dest != null) {
+        dbg.log('HANDSHAKE: prioritized I2P attempt to ${dest.substring(0, 12)}...');
+        try {
+          await i2p.publishToDest(dest: dest, data: encryptedEnvelope);
+          dbg.log('HANDSHAKE: I2P delivery successful');
+          return; 
+        } catch (e) {
+          dbg.log('HANDSHAKE: I2P failed ($e), falling back...');
         }
+      } else {
+        dbg.log('HANDSHAKE: I2P skipped (active=${i2p != null}, hasDest=${dest != null})');
       }
     }
 
@@ -188,10 +203,13 @@ class TransportManager {
     final ygg = _activeTransports.whereType<YggdrasilTransport>().firstOrNull;
     final yggAddr = _yggAddrs[recipientId];
     if (ygg != null && yggAddr != null) {
+      dbg.log('TRANSPORT: using Yggdrasil for ${recipientId.substring(0, 8)}...');
       try {
         await ygg.publishToAddr(address: yggAddr, data: encryptedEnvelope);
         return;
-      } catch (_) {}
+      } catch (e) {
+        dbg.log('TRANSPORT: Yggdrasil failed ($e)');
+      }
     }
 
     // Tier 3: IPFS fallback / parallel
@@ -808,6 +826,7 @@ class I2PTransport implements PhantomTransport {
 
   @override
   Future<bool> checkAvailability() async {
+    final dbg = TransportDebugger.instance;
     final hostsToTry = [
       host,
       if (Platform.isAndroid && host == '127.0.0.1') ...['10.0.2.2', '192.168.240.1'],
@@ -815,27 +834,34 @@ class I2PTransport implements PhantomTransport {
 
     for (final h in hostsToTry) {
       try {
-        final s = await Socket.connect(h, samPort, timeout: const Duration(milliseconds: 500));
+        dbg.log('I2P: checking SAM bridge at $h:$samPort...');
+        final s = await Socket.connect(h, samPort, timeout: const Duration(milliseconds: 800));
         await s.close();
-        host = h; // Update host to the one that worked
+        host = h; 
+        dbg.log('I2P: SAM bridge found at $h');
         return true;
       } catch (_) {}
     }
+    dbg.log('I2P: no SAM bridge reachable');
     return false;
   }
 
   /// Sends raw data to a specific I2P destination using DATAGRAM.
   Future<void> publishToDest({required String dest, required Uint8List data}) async {
+    final dbg = TransportDebugger.instance;
     try {
+      dbg.log('I2P: sending datagram to ${dest.substring(0, 12)}...');
       final s = await Socket.connect(host, samPort);
       s.add(utf8.encode('HELLO VERSION MIN=3.3 MAX=3.3\n'));
-      // Use DATAGRAM for faster, more reliable handshakes without full stream overhead
       s.add(utf8.encode('SESSION CREATE STYLE=DATAGRAM ID=phsend DESTINATION=TRANSIENT\n'));
       s.add(utf8.encode('DATAGRAM SEND DESTINATION=$dest\n'));
       s.add(data);
       await s.flush();
       await s.close();
-    } catch (_) {}
+      dbg.log('I2P: datagram sent');
+    } catch (e) {
+      dbg.log('I2P: send error: $e');
+    }
   }
 
   @override
@@ -849,13 +875,14 @@ class I2PTransport implements PhantomTransport {
     final dbg = TransportDebugger.instance;
     while (!_disposed) {
       try {
-        final s = await Socket.connect(host, samPort);
+        final dbg = TransportDebugger.instance;
+        dbg.log('I2P: connecting to SAM bridge at $host:$samPort...');
+        final s = await Socket.connect(host, samPort, timeout: const Duration(seconds: 5));
         s.add(utf8.encode('HELLO VERSION MIN=3.3 MAX=3.3\n'));
         s.add(utf8.encode('SESSION CREATE STYLE=DATAGRAM ID=phantom DESTINATION=TRANSIENT\n'));
-        
-        // Wait for the NAMING REPLY to get our destination
         s.add(utf8.encode('NAMING LOOKUP NAME=ME\n'));
         
+        dbg.log('I2P: session created, waiting for destination...');
         await for (final data in s) {
           if (_disposed) break;
           
