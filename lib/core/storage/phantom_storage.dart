@@ -497,6 +497,7 @@ class ContactRecord {
     String? sharedAlias,
     bool? isVerified,
     bool? isArchived,
+    String? ipfsPeerId,
   }) => ContactRecord(
         phantomId:                phantomId,
         nickname:                 nickname    ?? this.nickname,
@@ -510,6 +511,7 @@ class ContactRecord {
         addedAtUs:                addedAtUs,
         isVerified:               isVerified  ?? this.isVerified,
         isArchived:               isArchived  ?? this.isArchived,
+        ipfsPeerId:               ipfsPeerId  ?? this.ipfsPeerId,
       );
 }
 

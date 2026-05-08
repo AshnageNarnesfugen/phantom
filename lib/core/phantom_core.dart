@@ -221,6 +221,20 @@ class PhantomCore {
     return caStr;
   }
 
+  /// Returns our IPFS peer ID if the daemon is reachable.
+  Future<String?> getMyIpfsPeerId() async {
+    if (_ipfsApiUrl == null) return null;
+    try {
+      final resp = await http
+          .post(Uri.parse('$_ipfsApiUrl/api/v0/id'))
+          .timeout(const Duration(seconds: 3));
+      if (resp.statusCode == 200) {
+        return jsonDecode(resp.body)['ID'] as String?;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   // ── Backup ────────────────────────────────────────────────────────────────
 
   /// Export all account data to an encrypted `.phantombak` file.
@@ -408,16 +422,26 @@ class PhantomCore {
   Future<ContactRecord> addContact({
     required String contactAddress,
     String? nickname,
+    String? ipfsPeerId,
   }) async {
-    // Parse optional IPFS peer ID suffix: '<ca>#<ipfs_peer_id>'
     String caStr = contactAddress.trim();
-    String? ipfsPeerId;
-    final hashIdx = caStr.lastIndexOf('#');
-    if (hashIdx > 0) {
-      final candidate = caStr.substring(hashIdx + 1).trim();
-      // Only treat it as a peer ID if it looks like a libp2p peer ID.
-      if (candidate.startsWith('12D3Koo') || candidate.startsWith('Qm')) {
-        ipfsPeerId = candidate;
+    String? finalIpfsPeerId = ipfsPeerId?.trim();
+
+    if (finalIpfsPeerId == null || finalIpfsPeerId.isEmpty) {
+      final hashIdx = caStr.lastIndexOf('#');
+      if (hashIdx > 0) {
+        final candidate = caStr.substring(hashIdx + 1).trim();
+        // Only treat it as a peer ID if it looks like a libp2p peer ID.
+        if (candidate.startsWith('12D3Koo') || candidate.startsWith('Qm')) {
+          finalIpfsPeerId = candidate;
+          caStr = caStr.substring(0, hashIdx);
+        }
+      }
+    } else {
+      // If ipfsPeerId was provided separately, still check if address has one
+      // and strip it so ContactAddress.decode doesn't fail.
+      final hashIdx = caStr.lastIndexOf('#');
+      if (hashIdx > 0) {
         caStr = caStr.substring(0, hashIdx);
       }
     }
@@ -432,15 +456,21 @@ class PhantomCore {
       signedPreKeyId:           ca.signedPreKeyId,
       signedPreKeySignature:    ca.signature,
       kyber768PublicKeyBytes:   ca.kyber768PublicKeyBytes,
-      ipfsPeerId:               ipfsPeerId,
+      ipfsPeerId:               finalIpfsPeerId,
     );
     await storage.saveContact(contact);
     _presence?.addContacts([contact.phantomId]);
-    if (ipfsPeerId != null) {
-      _presence?.setContactIpfsPeerId(contact.phantomId, ipfsPeerId);
-      _notifyTransportIpfsPeerId(contact.phantomId, ipfsPeerId);
+    if (finalIpfsPeerId != null) {
+      _presence?.setContactIpfsPeerId(contact.phantomId, finalIpfsPeerId);
+      _notifyTransportIpfsPeerId(contact.phantomId, finalIpfsPeerId);
     }
     return contact;
+  }
+
+  /// Manually set or update a contact's IPFS peer ID.
+  void setContactIpfsPeerId(String contactId, String ipfsPeerId) {
+    _presence?.setContactIpfsPeerId(contactId, ipfsPeerId);
+    _notifyTransportIpfsPeerId(contactId, ipfsPeerId);
   }
 
   /// Forwards a known IPFS peer ID to the IpfsTransport layer so it can

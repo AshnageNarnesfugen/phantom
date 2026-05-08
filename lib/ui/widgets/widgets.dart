@@ -1612,6 +1612,7 @@ class _NoisePainter extends CustomPainter {
   @override
   bool shouldRepaint(_NoisePainter old) =>
       old.noise != noise || old.strength != strength;
+}
 // ── PhotoEditorScreen ─────────────────────────────────────────────────────────
 //
 // Full-screen photo preview shown before sending a gallery or camera image.
