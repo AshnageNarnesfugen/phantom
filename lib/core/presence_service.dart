@@ -246,7 +246,7 @@ class PresenceService {
     return 'f${cidBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join()}';
   }
 
-  static String _topic(String phantomId) => phantomId;
+  static String _topic(String phantomId) => 'prs$phantomId';
 
   static String _encodeTopic(String topic) {
     return 'u${base64Url.encode(utf8.encode(topic)).replaceAll('=', '')}';

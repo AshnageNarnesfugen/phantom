@@ -210,6 +210,8 @@ class TransportManager {
       } catch (e) {
         dbg.log('TRANSPORT: Yggdrasil failed ($e)');
       }
+    } else {
+      dbg.log('TRANSPORT: Yggdrasil skipped (active=${ygg != null}, hasAddr=${yggAddr != null})');
     }
 
     // Tier 3: IPFS fallback / parallel
@@ -416,7 +418,7 @@ class IpfsTransport implements PhantomTransport {
     }
   }
 
-  static String _topicForId(String phantomId) => phantomId;
+  static String _topicForId(String phantomId) => 'msg$phantomId';
 
   static String _encodeTopic(String topic) {
     return 'u${base64Url.encode(utf8.encode(topic)).replaceAll('=', '')}';
