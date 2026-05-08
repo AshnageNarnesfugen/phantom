@@ -247,7 +247,10 @@ class PresenceService {
   }
 
   static String _topic(String phantomId) => '/phantom/prs/v1/$phantomId';
-  static String _encodeTopic(String topic) => topic;
+  
+  static String _encodeTopic(String topic) {
+    return 'u${base64Url.encode(utf8.encode(topic)).replaceAll('=', '')}';
+  }
 
   Future<void> _publishHeartbeat({bool online = true}) async {
     if (_disposed) return;
