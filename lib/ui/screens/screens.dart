@@ -2424,18 +2424,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
         if (mounted && alias != null) _myAliasCtrl.text = alias;
       });
       _loadGlass(core);
-      _refreshIpfsStatus();
+      _refreshStatus();
+      _refreshTimer ??= Timer.periodic(const Duration(seconds: 2), (_) => _refreshStatus());
     }
   }
 
-  void _refreshIpfsStatus() {
+  Timer? _refreshTimer;
+
+  void _refreshStatus() {
+    final core = CoreProvider.of(context).core;
+    if (core == null || !mounted) return;
+
     IpfsDaemon.instance.status().then((s) {
       if (mounted) setState(() { _ipfsRunning = s.running; _ipfsPeers = s.peers; });
+    });
+
+    core.getMyContactAddress().then((addr) {
+      if (mounted && _contactAddress != addr) setState(() => _contactAddress = addr);
     });
   }
 
   @override
   void dispose() {
+    _refreshTimer?.cancel();
     _myAliasCtrl.dispose();
     super.dispose();
   }
@@ -3027,7 +3038,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   void _showIpfsDiagnostics(BuildContext context, PhantomTokens t) {
-    _refreshIpfsStatus();
+    _refreshStatus();
     final log = IpfsDaemon.instance.daemonLog;
     showDialog(
       context: context,
@@ -3061,7 +3072,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () { Navigator.pop(ctx); _refreshIpfsStatus(); },
+            onPressed: () { Navigator.pop(ctx); _refreshStatus(); },
             child: Text('refresh', style: TextStyle(color: t.accentLight, fontFamily: 'monospace')),
           ),
           TextButton(
