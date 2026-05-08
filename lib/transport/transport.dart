@@ -416,12 +416,9 @@ class IpfsTransport implements PhantomTransport {
     }
   }
 
-  static String _topicForId(String phantomId) => '/phantom/v1/$phantomId';
+  static String _topicForId(String phantomId) => 'ph.v1.$phantomId';
 
-  /// Kubo >= 0.11 requires multibase encoding for topics starting with '/'.
-  static String _encodeTopic(String topic) {
-    return 'u${base64Url.encode(utf8.encode(topic)).replaceAll('=', '')}';
-  }
+  static String _encodeTopic(String topic) => topic;
 
   /// Decodes a multibase-encoded payload from a pubsub response.
   /// Kubo >= 0.11 encodes data with a multibase prefix ('m'=base64, 'u'=base64url).
