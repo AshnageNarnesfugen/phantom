@@ -246,10 +246,10 @@ class PresenceService {
     return 'f${cidBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join()}';
   }
 
-  static String _topic(String phantomId) => '/phantom/prs/v1/$phantomId';
+  static String _topic(String phantomId) => phantomId;
 
   static String _encodeTopic(String topic) {
-    return base64Url.encode(utf8.encode(topic));
+    return 'u${base64Url.encode(utf8.encode(topic)).replaceAll('=', '')}';
   }
 
   Future<void> _publishHeartbeat({bool online = true}) async {

@@ -416,11 +416,10 @@ class IpfsTransport implements PhantomTransport {
     }
   }
 
-  static String _topicForId(String phantomId) => '/phantom/v1/$phantomId';
+  static String _topicForId(String phantomId) => phantomId;
 
-  /// Uses raw Base64URL encoding as required by some Kubo API versions for pubsub topics.
   static String _encodeTopic(String topic) {
-    return base64Url.encode(utf8.encode(topic));
+    return 'u${base64Url.encode(utf8.encode(topic)).replaceAll('=', '')}';
   }
 
   /// Decodes a multibase-encoded payload from a pubsub response.
