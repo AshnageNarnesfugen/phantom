@@ -198,11 +198,9 @@ class PhantomCore {
 
   // ── Contact address ────────────────────────────────────────────────────────
 
-  /// Returns the ContactAddress string to share with others so they can add us.
+  /// Returns the omnichannel ContactAddress string to share with others.
   ///
-  /// Format: `<base64url_ca>[#<ipfs_peer_id>]`
-  /// The optional '#<ipfs_peer_id>' suffix lets the recipient connect directly
-  /// via circuit relay without relying on DHT provider records.
+  /// Format: `<base64url_ca>[#<ipfs_id>][@<ygg_addr>][$<i2p_dest>]`
   Future<String?> getMyContactAddress() async {
     final bundleJson = await storage.getOwnBundle();
     if (bundleJson == null) return null;
@@ -215,20 +213,21 @@ class PhantomCore {
       signature:               bundle.signedPreKeySignature,
       kyber768PublicKeyBytes:  bundle.kyber768PublicKeyBytes,
     );
-    final caStr = ca.encode();
-    // Append IPFS peer ID so contacts can dial us directly via circuit relay.
-    if (_ipfsApiUrl != null) {
-      try {
-        final resp = await http
-            .post(Uri.parse('$_ipfsApiUrl/api/v0/id'))
-            .timeout(const Duration(seconds: 5));
-        if (resp.statusCode == 200) {
-          final id = jsonDecode(resp.body)['ID'] as String?;
-          if (id != null && id.isNotEmpty) return '$caStr#$id';
-        }
-      } catch (_) {}
-    }
-    return caStr;
+    String res = ca.encode();
+
+    // 1. Append IPFS Peer ID
+    final ipfsId = await getMyIpfsPeerId();
+    if (ipfsId != null) res += '#$ipfsId';
+
+    // 2. Append Yggdrasil IPv6
+    final ygg = transport.transports.whereType<YggdrasilTransport>().firstOrNull;
+    if (ygg != null && ygg.address != null) res += '@${ygg.address}';
+
+    // 3. Append I2P Destination
+    final i2p = transport.transports.whereType<I2PTransport>().firstOrNull;
+    if (i2p != null && i2p.myDestination != null) res += '\$${i2p.myDestination}';
+
+    return res;
   }
 
   /// Returns our IPFS peer ID if the daemon is reachable.
@@ -444,9 +443,7 @@ class PhantomCore {
 
   /// Add a contact from their ContactAddress string.
   ///
-  /// Accepts the optional `#<ipfs_peer_id>` suffix produced by
-  /// [getMyContactAddress]. When present the peer ID is stored and used for
-  /// direct circuit-relay connections, bypassing DHT provider records.
+  /// Supports omnichannel addresses: `<base64_ca>[#<ipfs_id>][@<ygg_addr>][$<i2p_dest>]`
   Future<ContactRecord> addContact({
     required String contactAddress,
     String? nickname,
@@ -454,23 +451,26 @@ class PhantomCore {
   }) async {
     String caStr = contactAddress.trim();
     String? finalIpfsPeerId = ipfsPeerId?.trim();
+    String? yggAddr;
+    String? i2pDest;
 
-    if (finalIpfsPeerId == null || finalIpfsPeerId.isEmpty) {
-      final hashIdx = caStr.lastIndexOf('#');
-      if (hashIdx > 0) {
-        final candidate = caStr.substring(hashIdx + 1).trim();
-        // Only treat it as a peer ID if it looks like a libp2p peer ID.
-        if (candidate.startsWith('12D3Koo') || candidate.startsWith('Qm')) {
-          finalIpfsPeerId = candidate;
-          caStr = caStr.substring(0, hashIdx);
-        }
-      }
-    } else {
-      // If ipfsPeerId was provided separately, still check if address has one
-      // and strip it so ContactAddress.decode doesn't fail.
-      final hashIdx = caStr.lastIndexOf('#');
-      if (hashIdx > 0) {
-        caStr = caStr.substring(0, hashIdx);
+    // Parser for omnichannel address: ID#IPFS@YGG$I2P
+    final i2pIdx = caStr.lastIndexOf('\$');
+    if (i2pIdx > 0) {
+      i2pDest = caStr.substring(i2pIdx + 1).trim();
+      caStr = caStr.substring(0, i2pIdx);
+    }
+    final yggIdx = caStr.lastIndexOf('@');
+    if (yggIdx > 0) {
+      yggAddr = caStr.substring(yggIdx + 1).trim();
+      caStr = caStr.substring(0, yggIdx);
+    }
+    final ipfsIdx = caStr.lastIndexOf('#');
+    if (ipfsIdx > 0) {
+      final candidate = caStr.substring(ipfsIdx + 1).trim();
+      if (candidate.startsWith('12D3Koo') || candidate.startsWith('Qm')) {
+        finalIpfsPeerId = candidate;
+        caStr = caStr.substring(0, ipfsIdx);
       }
     }
 
@@ -481,17 +481,21 @@ class PhantomCore {
       encryptionPublicKeyBytes: ca.x25519IdentityKey,
       signingPublicKeyBytes:    ca.ed25519SigningKey,
       signedPreKeyBytes:        ca.signedPreKeyBytes,
-      signedPreKeyId:           ca.signedPreKeyId,
+      signedPreKeyId:          ca.signedPreKeyId,
       signedPreKeySignature:    ca.signature,
       kyber768PublicKeyBytes:   ca.kyber768PublicKeyBytes,
       ipfsPeerId:               finalIpfsPeerId,
+      yggdrasilAddress:         yggAddr,
+      i2pDestination:           i2pDest,
     );
     await storage.saveContact(contact);
+    
+    // Propagate transport metadata immediately
+    if (contact.yggdrasilAddress != null) transport.setContactYggAddress(contact.phantomId, contact.yggdrasilAddress!);
+    if (contact.i2pDestination != null)   transport.setContactI2PDestination(contact.phantomId, contact.i2pDestination!);
+    if (contact.ipfsPeerId != null)       transport.setContactIpfsPeerId(contact.phantomId, contact.ipfsPeerId!);
+
     _presence?.addContacts([contact.phantomId]);
-    if (finalIpfsPeerId != null) {
-      _presence?.setContactIpfsPeerId(contact.phantomId, finalIpfsPeerId);
-      _notifyTransportIpfsPeerId(contact.phantomId, finalIpfsPeerId);
-    }
     return contact;
   }
 

@@ -803,6 +803,8 @@ class I2PTransport implements PhantomTransport {
 
   I2PTransport({this.host = '127.0.0.1', this.samPort = 7656});
 
+  String? get myDestination => _myDest;
+
   @override
   Future<bool> checkAvailability() async {
     try {
@@ -841,11 +843,23 @@ class I2PTransport implements PhantomTransport {
         s.add(utf8.encode('HELLO VERSION MIN=3.3 MAX=3.3\n'));
         s.add(utf8.encode('SESSION CREATE STYLE=STREAM ID=phantom DESTINATION=TRANSIENT\n'));
         
-        // In a real I2P implementation, we would persist the private key of the destination
-        // so our .i2p address stays the same. For now, we use TRANSIENT.
+        // Wait for the NAMING REPLY to get our destination
+        // In a full implementation we'd parse the 'DESTINATION' from the session creation response
+        // For now, we'll try to get it via 'NAMING LOOKUP NAME=ME'
+        s.add(utf8.encode('NAMING LOOKUP NAME=ME\n'));
         
         await for (final data in s) {
           if (_disposed) break;
+          try {
+            final str = utf8.decode(data);
+            if (str.contains('NAMING REPLY RESULT=OK NAME=ME VALUE=')) {
+              _myDest = str.split('VALUE=').last.trim();
+              continue;
+            }
+          } catch (_) {
+            // Binary data (the actual encrypted message), proceed to yield
+          }
+          
           yield IncomingEnvelope(
             data: Uint8List.fromList(data),
             transportName: name,
