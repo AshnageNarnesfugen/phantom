@@ -247,7 +247,11 @@ class PresenceService {
   }
 
   static String _topic(String phantomId) => 'prs$phantomId';
-  static String _encodeTopic(String topic) => topic;
+
+  static String _encodeTopic(String topic) {
+    final hex = utf8.encode(topic).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return 'f$hex';
+  }
 
   Future<void> _publishHeartbeat({bool online = true}) async {
     if (_disposed) return;

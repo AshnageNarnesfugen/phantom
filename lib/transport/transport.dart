@@ -418,7 +418,10 @@ class IpfsTransport implements PhantomTransport {
 
   static String _topicForId(String phantomId) => phantomId;
 
-  static String _encodeTopic(String topic) => topic;
+  static String _encodeTopic(String topic) {
+    final hex = utf8.encode(topic).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return 'f$hex';
+  }
 
   /// Decodes a multibase-encoded payload from a pubsub response.
   /// Kubo >= 0.11 encodes data with a multibase prefix ('m'=base64, 'u'=base64url).
