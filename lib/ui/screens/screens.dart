@@ -1871,7 +1871,6 @@ class _ChatScreenState extends State<ChatScreen> {
   void _showEditContact(PhantomTokens t, PhantomCore? core) async {
     final contact = await core?.storage.getContact(widget.contactId);
     final nickCtrl = TextEditingController(text: contact?.nickname ?? '');
-    final ipfsCtrl = TextEditingController(text: contact?.ipfsPeerId ?? '');
 
     if (!mounted) return;
 
@@ -1889,14 +1888,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
             const SizedBox(height: 8),
             _PhantomField(controller: nickCtrl, hint: 'contact nickname...'),
-            const SizedBox(height: 20),
-            Text('ipfs peer id',
-                style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
-            const SizedBox(height: 4),
-            Text('allows direct connection via relay',
-                style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
-            const SizedBox(height: 8),
-            _PhantomField(controller: ipfsCtrl, hint: '12D3Koo... or Qm...'),
           ],
         ),
         actions: [
@@ -1908,20 +1899,14 @@ class _ChatScreenState extends State<ChatScreen> {
           TextButton(
             onPressed: () async {
               final nick = nickCtrl.text.trim();
-              final ipfs = ipfsCtrl.text.trim();
               if (core != null) {
                 final current = await core.storage.getContact(widget.contactId);
                 if (current != null) {
                   await core.storage.saveContact(
                     current.copyWith(
                       nickname: nick.isEmpty ? null : nick,
-                      ipfsPeerId: ipfs.isEmpty ? null : ipfs,
                     ),
                   );
-                  // Notify core/presence about the updated peer ID
-                  if (ipfs.isNotEmpty) {
-                    core.setContactIpfsPeerId(widget.contactId, ipfs);
-                  }
                 }
               }
               if (ctx.mounted) Navigator.pop(ctx);
@@ -2180,7 +2165,6 @@ class AddContactScreen extends StatefulWidget {
 class _AddContactScreenState extends State<AddContactScreen> {
   final _addressCtrl = TextEditingController();
   final _nickCtrl    = TextEditingController();
-  final _ipfsCtrl    = TextEditingController();
   String? _error;
   bool _loading = false;
 
@@ -2196,18 +2180,6 @@ class _AddContactScreenState extends State<AddContactScreen> {
   @override
   void initState() {
     super.initState();
-    _addressCtrl.addListener(_onAddressChanged);
-  }
-
-  void _onAddressChanged() {
-    final text = _addressCtrl.text.trim();
-    final hashIdx = text.lastIndexOf('#');
-    if (hashIdx > 0) {
-      final candidate = text.substring(hashIdx + 1).trim();
-      if ((candidate.startsWith('12D3Koo') || candidate.startsWith('Qm')) && _ipfsCtrl.text.isEmpty) {
-        _ipfsCtrl.text = candidate;
-      }
-    }
   }
 
   @override
@@ -2243,7 +2215,6 @@ class _AddContactScreenState extends State<AddContactScreen> {
   void dispose() {
     _addressCtrl.dispose();
     _nickCtrl.dispose();
-    _ipfsCtrl.dispose();
     super.dispose();
   }
 
@@ -2257,11 +2228,9 @@ class _AddContactScreenState extends State<AddContactScreen> {
     setState(() { _loading = true; _error = null; });
     try {
       final nick = _nickCtrl.text.trim();
-      final ipfs = _ipfsCtrl.text.trim();
       await core.addContact(
         contactAddress: address,
         nickname: nick.isEmpty ? null : nick,
-        ipfsPeerId: ipfs.isEmpty ? null : ipfs,
       );
       if (mounted) {
         // Show warming-up feedback before popping
@@ -2367,14 +2336,7 @@ class _AddContactScreenState extends State<AddContactScreen> {
                 style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
             const SizedBox(height: 8),
             _PhantomField(controller: _nickCtrl, hint: 'alice'),
-            const SizedBox(height: 20),
-            Text('ipfs peer id (optional)',
-                style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
-            const SizedBox(height: 4),
-            Text('allows direct connection via circuit relay',
-                style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
-            const SizedBox(height: 8),
-            _PhantomField(controller: _ipfsCtrl, hint: '12D3Koo... or Qm...'),
+
             const SizedBox(height: 32),
             _loading
                 ? Center(child: CircularProgressIndicator(color: t.accentLight, strokeWidth: 1))
@@ -2429,10 +2391,8 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   String? _contactAddress;
-  String? _myIpfsPeerId;
   String? _ownAvatarPath;
   final _myAliasCtrl = TextEditingController();
-  final _yggdrasilCtrl = TextEditingController();
   static const _secure = FlutterSecureStorage(aOptions: AndroidOptions());
 
   // App-level glass state (independent from chat glass)
@@ -2460,17 +2420,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
       core.getMyContactAddress().then((addr) {
         if (mounted) setState(() => _contactAddress = addr);
       });
-      core.getMyIpfsPeerId().then((id) {
-        if (mounted) setState(() => _myIpfsPeerId = id);
-      });
       core.storage.getOwnAvatarPath().then((p) {
         if (mounted) setState(() => _ownAvatarPath = p);
       });
       core.storage.getSetting<String>('my_alias').then((alias) {
         if (mounted && alias != null) _myAliasCtrl.text = alias;
-      });
-      core.storage.getSetting<String>('yggdrasil_address').then((ygg) {
-        if (mounted && ygg != null) _yggdrasilCtrl.text = ygg;
       });
       _loadGlass(core);
       _refreshStatus();
@@ -2497,7 +2451,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void dispose() {
     _refreshTimer?.cancel();
     _myAliasCtrl.dispose();
-    _yggdrasilCtrl.dispose();
     super.dispose();
   }
 
@@ -2671,13 +2624,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
                   const SizedBox(height: 6),
                   PhantomIdDisplay(phantomId: core.myId),
-                  if (_myIpfsPeerId != null) ...[
-                    const SizedBox(height: 16),
-                    Text('your ipfs peer id',
-                        style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
-                    const SizedBox(height: 6),
-                    _PeerIdDisplay(peerId: _myIpfsPeerId!, tokens: t),
-                  ],
                 ],
               ),
             ),
@@ -3000,53 +2946,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('yggdrasil ipv6 (override)',
+                Text('transport status',
                     style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 14)),
                 const SizedBox(height: 4),
-                Text('leave empty to auto-detect. manually enter if android hides vpn interfaces.',
+                Text('all transports are auto-configured — no manual setup required',
                     style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
-                const SizedBox(height: 8),
-                TextField(
-                  controller: _yggdrasilCtrl,
-                  style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 12),
-                  decoration: InputDecoration(
-                    hintText: 'e.g. 02xx:...',
-                    hintStyle: TextStyle(color: t.textDisabled),
-                    filled: true,
-                    fillColor: t.bgSubtle,
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(t.radiusCard),
-                      borderSide: BorderSide.none,
-                    ),
-                    suffixIcon: IconButton(
-                      icon: Icon(Icons.save, color: t.accentLight, size: 16),
-                      onPressed: () {
-                        final input = _yggdrasilCtrl.text.trim();
-                        // Empty = auto-detect, non-empty must look like IPv6
-                        if (input.isNotEmpty && !input.contains(':')) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text('invalid ipv6 address',
-                                  style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 12)),
-                              backgroundColor: const Color(0xFFCF6679),
-                            ),
-                          );
-                          return;
-                        }
-                        core?.setMyYggdrasilAddress(input);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
-                            content: Text(
-                              input.isEmpty ? 'yggdrasil: auto-detect enabled' : 'yggdrasil address updated',
-                              style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-                            ),
-                            backgroundColor: t.bgSubtle,
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ),
+                const SizedBox(height: 12),
+                _StatusLine(label: 'ipfs', value: _ipfsRunning == true ? 'running · $_ipfsPeers peers' : 'offline', ok: _ipfsRunning == true, tokens: t),
+                if (core != null) ...[
+                  Builder(builder: (_) {
+                    final ygg = core.transport.transports.whereType<YggdrasilTransport>().firstOrNull;
+                    return _StatusLine(label: 'yggdrasil', value: ygg?.address ?? 'auto-detect', ok: ygg?.address != null, tokens: t);
+                  }),
+                  Builder(builder: (_) {
+                    final i2p = core.transport.transports.whereType<I2PTransport>().firstOrNull;
+                    return _StatusLine(label: 'i2p', value: i2p?.myDestination != null ? 'connected' : 'inactive', ok: i2p?.myDestination != null, tokens: t);
+                  }),
+                ],
               ],
             ),
           ),
@@ -3450,47 +3366,43 @@ class _SettingTile extends StatelessWidget {
 // SHARED WIDGETS (local to screens)
 // ─────────────────────────────────────────────────────────────────────────────
 
-class _PeerIdDisplay extends StatefulWidget {
-  final String peerId;
+class _StatusLine extends StatelessWidget {
+  final String label;
+  final String value;
+  final bool ok;
   final PhantomTokens tokens;
-  const _PeerIdDisplay({required this.peerId, required this.tokens});
-  @override State<_PeerIdDisplay> createState() => _PeerIdDisplayState();
-}
 
-class _PeerIdDisplayState extends State<_PeerIdDisplay> {
-  bool _copied = false;
+  const _StatusLine({required this.label, required this.value, required this.ok, required this.tokens});
+
   @override
   Widget build(BuildContext context) {
-    final t = widget.tokens;
-    return GestureDetector(
-      onTap: () async {
-        await Clipboard.setData(ClipboardData(text: widget.peerId));
-        setState(() => _copied = true);
-        await Future.delayed(const Duration(seconds: 2));
-        if (mounted) setState(() => _copied = false);
-      },
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          color: t.bgSubtle,
-          borderRadius: BorderRadius.circular(t.radiusCard),
-          border: Border.all(color: t.inputBorder, width: 0.5),
-        ),
-        child: Row(
-          children: [
-            Expanded(
-              child: Text(
-                widget.peerId,
-                style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 10),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        children: [
+          Container(
+            width: 6, height: 6,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: ok ? const Color(0xFF4CAF50) : tokens.textDisabled,
             ),
-            const SizedBox(width: 8),
-            Icon(_copied ? Icons.check : Icons.copy_outlined,
-                size: 14, color: _copied ? t.accentLight : t.iconDefault),
-          ],
-        ),
+          ),
+          const SizedBox(width: 10),
+          SizedBox(
+            width: 80,
+            child: Text(label,
+              style: TextStyle(color: tokens.textSecondary, fontFamily: 'monospace', fontSize: 12)),
+          ),
+          Expanded(
+            child: Text(value,
+              style: TextStyle(
+                color: ok ? tokens.accentLight : tokens.textDisabled,
+                fontFamily: 'monospace', fontSize: 12,
+              ),
+              maxLines: 1, overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
       ),
     );
   }

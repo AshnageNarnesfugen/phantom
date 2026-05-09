@@ -486,10 +486,9 @@ class PhantomCore {
   Future<ContactRecord> addContact({
     required String contactAddress,
     String? nickname,
-    String? ipfsPeerId,
   }) async {
     String caStr = contactAddress.trim();
-    String? finalIpfsPeerId = ipfsPeerId?.trim();
+    String? finalIpfsPeerId;
     String? yggAddr;
     String? i2pDest;
 
