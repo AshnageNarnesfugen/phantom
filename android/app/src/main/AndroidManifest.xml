@@ -28,6 +28,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <!-- WakeLock — keep CPU alive for persistent IPFS connections -->
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <!-- Boot completed — restart IPFS daemon on device reboot -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
 
     <!-- APK self-update installer -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
@@ -107,6 +109,16 @@
             android:name=".PhantomMessagingService"
             android:exported="false"
             android:foregroundServiceType="dataSync"/>
+
+        <!-- Restart IPFS daemon on device boot -->
+        <receiver
+            android:name=".IpfsBootReceiver"
+            android:exported="true"
+            android:process=":ipfs">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+            </intent-filter>
+        </receiver>
 
         <!-- FileProvider for APK installation -->
         <provider

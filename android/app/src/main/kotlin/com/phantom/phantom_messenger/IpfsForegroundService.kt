@@ -1,5 +1,6 @@
 package com.phantom.phantom_messenger
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -16,14 +17,14 @@ import android.util.Log
 /**
  * Keeps the bundled Kubo IPFS daemon alive as a persistent foreground service.
  *
- * Key design decisions:
- *   - Uses START_STICKY so Android restarts the service after OOM kills.
- *   - Persists binaryPath/repoPath in SharedPreferences so the daemon can
- *     be re-spawned on sticky restart (where the Intent extras are null).
- *   - Holds a partial WakeLock to prevent the CPU from sleeping and killing
- *     the daemon's network connections.
- *   - onTaskRemoved() does NOT stop the service — Kubo survives app swipe.
- *   - The service only stops when explicitly told via ACTION_STOP.
+ * Survival strategy (multiple layers):
+ *   1. Runs in a separate process (:ipfs) — app swipe only kills main process
+ *   2. stopWithTask="false" — Android doesn't stop service on task removal
+ *   3. onTaskRemoved() re-asserts foreground + schedules restart via AlarmManager
+ *   4. START_STICKY — Android auto-restarts after OOM kill
+ *   5. SharedPreferences persist binary/repo paths for sticky restart
+ *   6. Partial WakeLock keeps CPU alive for network connections
+ *   7. Auto-respawn daemon if it crashes
  */
 class IpfsForegroundService : Service() {
 
@@ -62,13 +63,18 @@ class IpfsForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Log.i(TAG, "onCreate — PID=${android.os.Process.myPid()}")
         ensureNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.i(TAG, "onStartCommand action=${intent?.action} flags=$flags")
+
         when (intent?.action) {
             ACTION_STOP -> {
                 Log.i(TAG, "Received STOP — shutting down daemon")
+                // Clear saved paths so START_STICKY doesn't resurrect us
+                prefs().edit().clear().apply()
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -79,7 +85,7 @@ class IpfsForegroundService : Service() {
                 val repo = intent.getStringExtra(EXTRA_REPO) ?: run {
                     stopSelf(); return START_NOT_STICKY
                 }
-                // Persist paths so START_STICKY re-delivery can restart the daemon
+                // Persist paths for START_STICKY re-delivery and onTaskRemoved restart
                 prefs().edit()
                     .putString(KEY_BINARY, binary)
                     .putString(KEY_REPO, repo)
@@ -90,18 +96,18 @@ class IpfsForegroundService : Service() {
                 if (daemonProcess == null) spawnDaemon(binary, repo)
             }
             else -> {
-                // START_STICKY re-delivery: intent is null or has no action.
-                // Recover saved paths and restart the daemon.
+                // START_STICKY re-delivery or onTaskRemoved restart: intent may be null
+                // or have no action. Recover paths from SharedPreferences.
                 val p = prefs()
                 val binary = p.getString(KEY_BINARY, null)
                 val repo   = p.getString(KEY_REPO, null)
                 if (binary != null && repo != null) {
-                    Log.i(TAG, "Sticky restart — re-spawning daemon")
+                    Log.i(TAG, "Sticky/alarm restart — re-spawning daemon")
                     startForeground(NOTIF_ID, buildNotification("Reconnecting to decentralized network…"))
                     acquireWakeLock()
                     if (daemonProcess == null) spawnDaemon(binary, repo)
                 } else {
-                    Log.w(TAG, "Sticky restart but no saved paths — stopping")
+                    Log.w(TAG, "Restart but no saved paths — stopping")
                     stopSelf()
                     return START_NOT_STICKY
                 }
@@ -112,17 +118,39 @@ class IpfsForegroundService : Service() {
 
     /**
      * Called when the user swipes the app away from Recents.
-     * We do NOT stop the service here — the IPFS daemon must survive app closure
-     * so the GossipSub mesh stays connected and messages arrive instantly on
-     * next app open.
+     *
+     * Layer 1: Re-assert foreground notification (some ROMs drop it)
+     * Layer 2: Schedule an AlarmManager restart in 1 second as a safety net
+     *          in case the OS kills this process anyway.
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.i(TAG, "App removed from recents — daemon stays alive")
-        // Do NOT call stopSelf() or super.onTaskRemoved() with stopWithTask=true
+        Log.i(TAG, "onTaskRemoved — re-asserting foreground + scheduling restart")
+
+        // Re-assert ourselves as foreground so Android doesn't de-prioritize us
+        try {
+            startForeground(NOTIF_ID, buildNotification("Decentralized node active"))
+        } catch (e: Exception) {
+            Log.w(TAG, "startForeground in onTaskRemoved failed: $e")
+        }
+
+        // Schedule a restart via AlarmManager as a safety net
+        try {
+            val restartIntent = Intent(applicationContext, IpfsForegroundService::class.java)
+            // No action → will hit the "else" branch in onStartCommand and use saved prefs
+            val pi = PendingIntent.getService(
+                this, 1, restartIntent,
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            am.set(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 1000, pi)
+            Log.i(TAG, "Restart alarm scheduled for +1s")
+        } catch (e: Exception) {
+            Log.w(TAG, "AlarmManager restart failed: $e")
+        }
     }
 
     override fun onDestroy() {
-        Log.i(TAG, "Service destroyed — killing daemon process")
+        Log.i(TAG, "onDestroy — killing daemon process")
         releaseWakeLock()
         daemonProcess?.destroyForcibly()
         daemonProcess = null
@@ -141,7 +169,7 @@ class IpfsForegroundService : Service() {
             "phantom:ipfs_daemon"
         ).apply {
             setReferenceCounted(false)
-            acquire() // held indefinitely until service stops
+            acquire()
         }
         Log.i(TAG, "WakeLock acquired")
     }
@@ -157,6 +185,7 @@ class IpfsForegroundService : Service() {
     // ── Daemon process ────────────────────────────────────────────────────────
 
     private fun spawnDaemon(binary: String, repo: String) {
+        // Use a non-daemon thread so the JVM doesn't consider exiting
         Thread {
             try {
                 Log.i(TAG, "Spawning daemon: $binary (repo: $repo)")
@@ -170,33 +199,35 @@ class IpfsForegroundService : Service() {
                 val proc = pb.start()
                 daemonProcess = proc
 
-                // Update notification once the API is reachable
+                // Update notification once daemon has had time to start
                 Thread {
                     try {
-                        Thread.sleep(3000) // give daemon time to start
+                        Thread.sleep(3000)
                         updateNotification("Decentralized node active")
                     } catch (_: Exception) {}
                 }.start()
 
-                // Drain output so the pipe buffer never blocks the daemon.
-                proc.inputStream.bufferedReader().forEachLine { /* discard */ }
+                // Drain output so pipe buffer never blocks
+                proc.inputStream.bufferedReader().forEachLine { line ->
+                    Log.d(TAG, line)
+                }
                 val exitCode = proc.waitFor()
                 Log.w(TAG, "Daemon exited with code $exitCode")
             } catch (e: Exception) {
                 Log.e(TAG, "Daemon spawn failed", e)
             } finally {
                 daemonProcess = null
-                // If the daemon dies unexpectedly, try to restart it
+                // Auto-restart if the daemon died but we weren't explicitly stopped
                 val p = prefs()
                 val savedBinary = p.getString(KEY_BINARY, null)
                 val savedRepo   = p.getString(KEY_REPO, null)
-                if (savedBinary != null && savedRepo != null && daemonProcess == null) {
-                    Log.i(TAG, "Daemon died — restarting in 5s")
-                    try { Thread.sleep(5000) } catch (_: Exception) {}
+                if (savedBinary != null && savedRepo != null) {
+                    Log.i(TAG, "Daemon died unexpectedly — restarting in 3s")
+                    try { Thread.sleep(3000) } catch (_: Exception) {}
                     spawnDaemon(savedBinary, savedRepo)
                 }
             }
-        }.also { it.isDaemon = true }.start()
+        }.start() // NOT isDaemon=true — keep the process alive
     }
 
     // ── Notification ──────────────────────────────────────────────────────────
@@ -228,8 +259,10 @@ class IpfsForegroundService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        val nm = getSystemService(NotificationManager::class.java) ?: return
-        nm.notify(NOTIF_ID, buildNotification(text))
+        try {
+            val nm = getSystemService(NotificationManager::class.java) ?: return
+            nm.notify(NOTIF_ID, buildNotification(text))
+        } catch (_: Exception) {}
     }
 
     private fun ensureNotificationChannel() {
