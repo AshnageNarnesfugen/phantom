@@ -962,8 +962,9 @@ class PhantomCore {
     if (storedEkHex == null && (hasMemSession || hasStoredSession)) {
       dbg.log('MSG: no stored EK but session exists (mem=$hasMemSession, '
           'disk=$hasStoredSession) → trying as MSG');
-      await _handleMsgFrame(frame);
-      return;
+      final success = await _handleMsgFrame(frame);
+      if (success) return;
+      dbg.log('MSG: ✗ decryption as MSG failed, falling back to process as fresh INIT');
     }
 
     dbg.log('MSG: fresh INIT — running X3DH respond…');
@@ -1116,7 +1117,7 @@ class PhantomCore {
   /// Each attempt snapshots the session state before trying and restores it on
   /// failure, preventing ratchet state corruption if header decryption succeeds
   /// on the wrong session before the body MAC fails.
-  Future<void> _handleMsgFrame(ParsedFrame frame) async {
+  Future<bool> _handleMsgFrame(ParsedFrame frame) async {
     final dbg = TransportDebugger.instance;
     dbg.log('MSG: trying ${_sessions.length} session(s) for MSG decrypt');
     for (final entry in List.of(_sessions.entries)) {
@@ -1128,7 +1129,7 @@ class PhantomCore {
         await _saveSession(entry.key, entry.value);
         await _dispatchIncoming(message, entry.key);
         dbg.log('MSG: ✓ MSG decrypted via session ${entry.key.substring(0, 8)}');
-        return;
+        return true;
       } catch (e) {
         _sessions[entry.key] = await RatchetSession.fromJson(snapshot);
         dbg.log('MSG:   session ${entry.key.substring(0, 8)} failed: $e');
@@ -1136,6 +1137,7 @@ class PhantomCore {
       }
     }
     dbg.log('MSG: ✗ no session could decrypt this MSG frame');
+    return false;
   }
 
   // ── Incoming dispatch ──────────────────────────────────────────────────────
