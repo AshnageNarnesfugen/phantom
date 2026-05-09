@@ -207,10 +207,10 @@ class RatchetSession {
     );
     _sendingN++;
 
-    // Clear pending INIT-frame fields after first encrypt
-    pendingX3dhEphemeralKey = null;
-    pendingKyberCipherBytes = null;
-    isNewSession = false;
+    // We no longer clear pending INIT-frame fields here. We keep sending
+    // INIT frames for all messages until the remote party replies (which
+    // triggers _dhRatchet and clears them there). This guarantees session
+    // establishment even if the first few messages are dropped.
 
     final encHeader = await _encryptHeader(header.encode(), _sendingHeaderKey!);
     final nonce     = await _randomNonce();
@@ -284,6 +284,11 @@ class RatchetSession {
     _sendingN = 0;
     _receivingN = 0;
     _dhRemotePublicKey = theirNewDhPublicKey;
+    
+    // Remote party has replied, we no longer need to embed INIT keys.
+    pendingX3dhEphemeralKey = null;
+    pendingKyberCipherBytes = null;
+    isNewSession = false;
 
     // Receiving ratchet step
     final dhOutputReceive = await _dh(_dhSendingKP, theirNewDhPublicKey);

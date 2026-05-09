@@ -46,7 +46,7 @@ class PhantomCore {
   // Tracks contacts to whom we just sent an INIT frame in this session.
   // Used as a tiebreaker when both sides re-init simultaneously (simultaneous
   // clear-history): the side with the larger phantom ID keeps its sender session.
-  final Set<String> _pendingInitSent = {};
+
 
   /// Kyber-768 key pair held in memory for quantum-resistant session setup.
   /// Derived deterministically from the seed phrase — not persisted to disk.
@@ -328,13 +328,13 @@ class PhantomCore {
     final session  = await _getOrCreateSession(recipientId);
     final protocol = PhantomProtocol(session);
     
-    // Check if this is a new session (handshake)
-    bool isHandshake = session.isNewSession;
+    // Check if this is a new session (handshake) by seeing if we still need
+    // to embed our ephemeral keys.
+    bool isHandshake = session.pendingX3dhEphemeralKey != null;
 
     // Capture BEFORE encode() calls session.encrypt(), which clears both fields.
     final x3dhEk      = session.pendingX3dhEphemeralKey;
     final kyberCipher = session.pendingKyberCipherBytes;
-    if (x3dhEk != null) _pendingInitSent.add(recipientId);
     final envelopeBytes = await protocol.encode(message);
 
     // Wrap in INIT frame on the first message (includes our full ContactAddress
@@ -399,7 +399,8 @@ class PhantomCore {
               : MessageStatus.failed;
           await storage.updateMessageStatus(recipientId, message.id, status);
 
-          if (isHandshake) {
+          if (isHandshake && status == MessageStatus.sent) {
+
             unawaited(_sendConnectivityInfo(recipientId));
           }
 
@@ -412,8 +413,8 @@ class PhantomCore {
           );
           await storage.updateMessageStatus(recipientId, message.id, MessageStatus.sent);
 
-          // If it was a handshake, automatically follow up with our connectivity info
           if (isHandshake) {
+
             unawaited(_sendConnectivityInfo(recipientId));
           }
 
@@ -564,7 +565,7 @@ class PhantomCore {
   /// received our INIT and the session is stuck.
   Future<void> resetSession(String contactId) async {
     _sessions.remove(contactId);
-    _pendingInitSent.remove(contactId);
+
     await storage.deleteSessionState(contactId);
     TransportDebugger.instance.log('SESSION: reset for ${contactId.substring(0, 8)} — next message will re-handshake');
   }
@@ -1026,8 +1027,8 @@ class PhantomCore {
       // INITs at the same time, the side with the larger phantom ID keeps its
       // sender session so both end up with a compatible sender/receiver pair.
       // The "loser" side's first message is lost but they can resend immediately.
-      if (_pendingInitSent.remove(senderPhantomId) &&
-          myId.compareTo(senderPhantomId) > 0) {
+      if (myId.compareTo(senderPhantomId) > 0 &&
+          _sessions[senderPhantomId]?.pendingX3dhEphemeralKey != null) {
         dbg.log('MSG: tiebreaker — dropping incoming INIT (we win)');
         return;
       }
