@@ -285,6 +285,66 @@ class IpfsTransport implements PhantomTransport {
     _contactIpfsPeerIds[contactId] = ipfsPeerId;
   }
 
+  // ── Retry queue ─────────────────────────────────────────────────────────
+  /// Messages that were published with 0 GossipSub peers (i.e. dropped into
+  /// the void). The background retry loop republishes them once the mesh forms.
+  final Map<String, List<Uint8List>> _retryQueue = {};
+  bool _retryLoopRunning = false;
+
+  /// Starts the background retry loop if not already running.
+  void _ensureRetryLoop() {
+    if (_retryLoopRunning) return;
+    _retryLoopRunning = true;
+    unawaited(_runRetryLoop());
+  }
+
+  /// Background loop: every 5 seconds, check each queued recipient's topic.
+  /// When GossipSub peers > 0, republish all queued messages for that contact.
+  Future<void> _runRetryLoop() async {
+    final dbg = TransportDebugger.instance;
+    while (!_disposed) {
+      await Future.delayed(const Duration(seconds: 5));
+      if (_retryQueue.isEmpty) continue;
+
+      for (final recipientId in List.of(_retryQueue.keys)) {
+        final topic = _topicForId(recipientId);
+        final short = recipientId.substring(0, 8);
+        final hasPeers = await _checkTopicPeers(topic, dbg, silent: true);
+        if (!hasPeers) {
+          // Still no mesh — try to force reconnect
+          await _dhtDiscoverAndConnect(recipientId, dbg);
+          continue;
+        }
+
+        // Mesh is alive! Drain the queue for this recipient.
+        final msgs = _retryQueue.remove(recipientId);
+        if (msgs == null || msgs.isEmpty) continue;
+        dbg.log('IPFS: ✓ gossipsub mesh formed for $short — flushing ${msgs.length} queued message(s)');
+        for (final envelope in msgs) {
+          try {
+            await _rawPublish(topic, envelope, dbg);
+            dbg.log('IPFS: retry-published ${envelope.length} bytes to $short');
+          } catch (e) {
+            dbg.log('IPFS: retry-publish failed: $e');
+          }
+        }
+      }
+    }
+    _retryLoopRunning = false;
+  }
+
+  /// Raw HTTP publish — no discovery, no mesh check, just send.
+  Future<void> _rawPublish(String topic, Uint8List data, TransportDebugger dbg) async {
+    final uri = Uri.parse('$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
+    final request = http.MultipartRequest('POST', uri);
+    request.files.add(http.MultipartFile.fromBytes('data', data));
+    final streamedResponse = await _client.send(request).timeout(const Duration(seconds: 10));
+    final response = await http.Response.fromStream(streamedResponse);
+    if (response.statusCode != 200) {
+      throw TransportException('IPFS publish failed: ${response.statusCode} ${response.body}');
+    }
+  }
+
   @override
   final String name = 'ipfs-pubsub';
 
@@ -339,20 +399,13 @@ class IpfsTransport implements PhantomTransport {
     await _ensureCrossSubscribed(topic, dbg);
 
     // ── Step 2: DHT discovery + swarm connect (best-effort) ──────────────
-    // For handshakes, this is critical. For regular messages, this is
-    // opportunistic — we ALWAYS publish to the topic regardless.
     dbg.log('IPFS: trying DHT discovery for $short…');
     final connected = await _dhtDiscoverAndConnect(recipientId, dbg);
 
-    if (!connected && isHandshake) {
-      // For handshakes, fail hard — no point sending INIT to an empty mesh
-      throw const TransportException('No verified IPFS swarm connection to peer');
-    }
-
     // ── Step 3: Wait for GossipSub mesh formation ────────────────────────
+    bool hasPeers = false;
     if (connected) {
-      final maxWaitSecs = isHandshake ? 15 : 3;
-      bool hasPeers = false;
+      final maxWaitSecs = isHandshake ? 15 : 5;
       for (int i = 0; i < maxWaitSecs; i++) {
         hasPeers = await _checkTopicPeers(topic, dbg);
         if (hasPeers) break;
@@ -360,27 +413,26 @@ class IpfsTransport implements PhantomTransport {
           await Future.delayed(const Duration(seconds: 1));
         }
       }
-      if (!hasPeers && isHandshake) {
-        dbg.log('IPFS: ⚠ gossipsub mesh NOT formed after ${maxWaitSecs}s — publishing anyway (best-effort)');
+      if (!hasPeers) {
+        dbg.log('IPFS: ⚠ gossipsub mesh NOT formed after ${maxWaitSecs}s — publishing best-effort + queuing for retry');
       }
     } else {
-      dbg.log('IPFS: peer not verified in swarm, publishing to topic anyway (best-effort)');
+      dbg.log('IPFS: peer not in swarm — publishing best-effort + queuing for retry');
     }
 
-    // ── Step 4: Publish — ALWAYS execute for non-handshake messages ──────
-    final uri = Uri.parse('$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
-    final request = http.MultipartRequest('POST', uri);
-    request.files.add(http.MultipartFile.fromBytes('data', encryptedEnvelope));
-    
-    final streamedResponse = await _client.send(request).timeout(const Duration(seconds: 10));
-    final response = await http.Response.fromStream(streamedResponse);
-
-    if (response.statusCode != 200) {
-      dbg.log('IPFS: publish HTTP ${response.statusCode} → ${response.body}');
-      throw TransportException(
-          'IPFS publish failed: ${response.statusCode} ${response.body}');
-    }
+    // ── Step 4: Publish ──────────────────────────────────────────────────
+    await _rawPublish(topic, encryptedEnvelope, dbg);
     dbg.log('IPFS: published OK to $short');
+
+    // ── Step 5: If mesh was empty, queue for automatic retry ─────────────
+    // When gossipsub peers=0 the message was accepted by our local Kubo but
+    // never actually forwarded to anyone. Queue it so the retry loop can
+    // republish once the mesh forms (usually 30-90s after app restart).
+    if (!hasPeers) {
+      _retryQueue.putIfAbsent(recipientId, () => []).add(Uint8List.fromList(encryptedEnvelope));
+      dbg.log('IPFS: queued message for retry (${_retryQueue[recipientId]!.length} pending for $short)');
+      _ensureRetryLoop();
+    }
   }
 
   @override
@@ -857,14 +909,16 @@ class IpfsTransport implements PhantomTransport {
 
   /// Single-shot check for gossipsub peers on [topic]. Does not spin — the
   /// caller publishes regardless of the result.
-  Future<bool> _checkTopicPeers(String topic, TransportDebugger dbg) async {
+  /// When [silent] is true, skip the debug log (used by the retry loop to
+  /// avoid spamming logs every 5 seconds).
+  Future<bool> _checkTopicPeers(String topic, TransportDebugger dbg, {bool silent = false}) async {
     try {
       final r = await _client.post(Uri.parse(
           '$_apiUrl/api/v0/pubsub/peers?arg=${Uri.encodeComponent(_encodeTopic(topic))}'))
           .timeout(const Duration(seconds: 3));
       if (r.statusCode == 200) {
         final strings = (jsonDecode(r.body)['Strings'] as List?) ?? [];
-        dbg.log('IPFS: gossipsub peers on topic: ${strings.length}');
+        if (!silent) dbg.log('IPFS: gossipsub peers on topic: ${strings.length}');
         return strings.isNotEmpty;
       }
     } catch (_) {}
