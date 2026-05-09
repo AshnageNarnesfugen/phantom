@@ -1655,6 +1655,12 @@ class _ChatScreenState extends State<ChatScreen> {
                   Navigator.pop(context);
                   _showGlassSettings(context, t, core);
                 }),
+              _MenuItem(icon: Icons.electrical_services_outlined, label: 'revive connection', tokens: t,
+                onTap: () async {
+                  Navigator.pop(context);
+                  if (core == null) return;
+                  _showReviveDialog(context, t, core, widget.contactId);
+                }),
               _MenuItem(icon: Icons.sync_outlined, label: 'reset session', tokens: t,
                 onTap: () async {
                   Navigator.pop(context);
@@ -1687,6 +1693,18 @@ class _ChatScreenState extends State<ChatScreen> {
             ],
           ),
         ),
+      ),
+    );
+  }
+  void _showReviveDialog(
+      BuildContext context, PhantomTokens t, PhantomCore core, String contactId) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => _ReviveDialog(
+        contactId: contactId,
+        core: core,
+        t: t,
       ),
     );
   }
@@ -4711,6 +4729,184 @@ class _ViewerAction extends StatelessWidget {
                   fontFamily: 'monospace',
                   fontSize: 11)),
         ],
+      ),
+    );
+  }
+}
+
+// ── Revive Connection Dialog ──────────────────────────────────────────────────
+
+class _ReviveDialog extends StatefulWidget {
+  final String contactId;
+  final PhantomCore core;
+  final PhantomTokens t;
+
+  const _ReviveDialog({
+    required this.contactId,
+    required this.core,
+    required this.t,
+  });
+
+  @override
+  _ReviveDialogState createState() => _ReviveDialogState();
+}
+
+class _ReviveDialogState extends State<_ReviveDialog> with SingleTickerProviderStateMixin {
+  String _status = 'starting…';
+  bool _finished = false;
+  bool _success = false;
+  late AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat();
+    _startRevive();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _startRevive() async {
+    await for (final status in widget.core.reviveConnection(widget.contactId)) {
+      if (!mounted) break;
+      if (status == 'success') {
+        setState(() {
+          _status = 'connection revived!';
+          _finished = true;
+          _success = true;
+        });
+        Future.delayed(const Duration(seconds: 2), () {
+          if (mounted) Navigator.pop(context);
+        });
+        break;
+      } else if (status == 'failed') {
+        setState(() {
+          _status = 'revive failed';
+          _finished = true;
+          _success = false;
+        });
+        break;
+      } else {
+        setState(() {
+          _status = status;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = widget.t;
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 40),
+      child: Container(
+        padding: const EdgeInsets.all(24),
+        decoration: BoxDecoration(
+          color: t.bgSurface,
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(color: t.divider, width: 0.5),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.5),
+              blurRadius: 20,
+              offset: const Offset(0, 10),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (!_finished)
+              RotationTransition(
+                turns: _controller,
+                child: Container(
+                  width: 60, height: 60,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    gradient: LinearGradient(
+                      colors: [t.accentLight, t.accentLight.withValues(alpha: 0)],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(2),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: t.bgSurface,
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(Icons.electrical_services_outlined,
+                          color: t.accentLight, size: 28),
+                    ),
+                  ),
+                ),
+              )
+            else
+              Container(
+                width: 60, height: 60,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: _success ? const Color(0xFF4CAF50).withValues(alpha: 0.1) : const Color(0xFFCF6679).withValues(alpha: 0.1),
+                ),
+                child: Icon(
+                  _success ? Icons.check_circle_outline : Icons.error_outline,
+                  color: _success ? const Color(0xFF4CAF50) : const Color(0xFFCF6679),
+                  size: 40,
+                ),
+              ),
+            const SizedBox(height: 24),
+            Text(
+              'Reviving Connection',
+              style: TextStyle(
+                color: t.textPrimary,
+                fontFamily: 'monospace',
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _status,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: t.textDisabled,
+                fontFamily: 'monospace',
+                fontSize: 13,
+              ),
+            ),
+            if (_finished && !_success) ...[
+              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity,
+                child: TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  style: TextButton.styleFrom(
+                    backgroundColor: t.bgBase,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: Text(
+                    'close',
+                    style: TextStyle(
+                      color: t.textPrimary,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

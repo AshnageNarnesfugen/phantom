@@ -592,6 +592,135 @@ class PhantomCore {
     }
   }
 
+  /// Aggressively revive the connection to [contactId].
+  ///
+  /// This method performs a deep reconnection sequence:
+  ///   1. Disconnect from the peer's IPFS node
+  ///   2. Re-subscribe to their topic (fresh GossipSub GRAFT)
+  ///   3. Reconnect via DHT + circuit relay
+  ///   4. Poll for GossipSub mesh formation (up to 90 seconds)
+  ///   5. Once mesh is alive, reset session and send fresh handshake
+  ///
+  /// Yields status strings so the UI can show a loading animation.
+  /// The last yielded value is either 'success' or 'failed'.
+  Stream<String> reviveConnection(String contactId) async* {
+    final dbg = TransportDebugger.instance;
+    final short = contactId.substring(0, 8);
+    final ipfsApiUrl = _ipfsApiUrl ?? 'http://127.0.0.1:5001';
+    final client = http.Client();
+
+    dbg.log('REVIVE: starting for $short');
+    yield 'Disconnecting from peer…';
+
+    // Step 1: Force disconnect from the peer
+    try {
+      final knownPeerId = _getContactIpfsPeerId(contactId);
+      if (knownPeerId != null) {
+        await client.post(Uri.parse(
+            '$ipfsApiUrl/api/v0/swarm/disconnect?arg=/p2p/$knownPeerId'))
+            .timeout(const Duration(seconds: 5));
+        dbg.log('REVIVE: disconnected from $knownPeerId');
+      }
+    } catch (_) {}
+    await Future.delayed(const Duration(seconds: 2));
+
+    // Step 2: Kill all existing cross-subscriptions and re-subscribe
+    yield 'Re-subscribing to topic…';
+    for (final t in transport.transports) {
+      if (t is IpfsTransport) {
+        final topic = 'msg$contactId';
+        await t.forceResubscribePublic(topic);
+      }
+    }
+    await Future.delayed(const Duration(seconds: 1));
+
+    // Step 3: Force reconnect via swarm/connect
+    yield 'Reconnecting to peer…';
+    try {
+      final knownPeerId = _getContactIpfsPeerId(contactId);
+      if (knownPeerId != null) {
+        await client.post(Uri.parse(
+            '$ipfsApiUrl/api/v0/swarm/connect?arg=/p2p/$knownPeerId'))
+            .timeout(const Duration(seconds: 10));
+        dbg.log('REVIVE: reconnected to $knownPeerId');
+      }
+    } catch (_) {}
+
+    // Step 4: Poll for GossipSub mesh formation — up to 90 seconds
+    yield 'Waiting for GossipSub mesh…';
+    final topic = 'msg$contactId';
+    final encodedTopic = 'u${base64Url.encode(utf8.encode(topic)).replaceAll('=', '')}';
+    bool meshFormed = false;
+
+    for (int i = 0; i < 45; i++) {
+      await Future.delayed(const Duration(seconds: 2));
+      try {
+        final r = await client.post(Uri.parse(
+            '$ipfsApiUrl/api/v0/pubsub/peers?arg=${Uri.encodeComponent(encodedTopic)}'))
+            .timeout(const Duration(seconds: 3));
+        if (r.statusCode == 200) {
+          final strings = (jsonDecode(r.body)['Strings'] as List?) ?? [];
+          if (strings.isNotEmpty) {
+            meshFormed = true;
+            dbg.log('REVIVE: ✓ gossipsub mesh formed! (${strings.length} peer(s))');
+            break;
+          }
+        }
+      } catch (_) {}
+
+      // Every 10 seconds, force re-subscribe + reconnect
+      if (i % 5 == 4) {
+        yield 'Retrying connection (${i * 2}s)…';
+        for (final t in transport.transports) {
+          if (t is IpfsTransport) {
+            await t.forceResubscribePublic(topic);
+          }
+        }
+        try {
+          final knownPeerId = _getContactIpfsPeerId(contactId);
+          if (knownPeerId != null) {
+            await client.post(Uri.parse(
+                '$ipfsApiUrl/api/v0/swarm/connect?arg=/p2p/$knownPeerId'))
+                .timeout(const Duration(seconds: 10));
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (!meshFormed) {
+      dbg.log('REVIVE: ✗ failed — gossipsub mesh never formed after 90s');
+      yield 'failed';
+      client.close();
+      return;
+    }
+
+    // Step 5: Mesh is alive! Reset session and send handshake
+    yield 'Sending handshake…';
+    await resetSession(contactId);
+    try {
+      await _sendPhantomMessage(
+        recipientId: contactId,
+        message: PhantomMessage(type: MessageType.text, content: utf8.encode('[connection revived]')),
+      );
+      dbg.log('REVIVE: ✓ handshake sent successfully');
+      yield 'success';
+    } catch (e) {
+      dbg.log('REVIVE: handshake send failed: $e');
+      yield 'failed';
+    }
+    client.close();
+  }
+
+  /// Get the known IPFS peer ID for a contact, or null.
+  String? _getContactIpfsPeerId(String contactId) {
+    for (final t in transport.transports) {
+      if (t is IpfsTransport) {
+        return t.getContactIpfsPeerId(contactId);
+      }
+    }
+    return null;
+  }
+
   /// Pre-warm the transport layer for a newly added contact:
   /// 1. Cross-subscribe to their message topic (GossipSub mesh formation)
   /// 2. Trigger DHT discovery + swarm connect

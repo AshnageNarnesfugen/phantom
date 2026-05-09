@@ -285,6 +285,17 @@ class IpfsTransport implements PhantomTransport {
     _contactIpfsPeerIds[contactId] = ipfsPeerId;
   }
 
+  /// Returns the stored IPFS peer ID for [contactId], or null.
+  String? getContactIpfsPeerId(String contactId) =>
+      _contactIpfsPeerIds[contactId];
+
+  /// Public wrapper for [_forceResubscribe] — used by the "Revive Connection"
+  /// feature to kill stale GossipSub state and force a fresh GRAFT.
+  Future<void> forceResubscribePublic(String topic) async {
+    final dbg = TransportDebugger.instance;
+    await _forceResubscribe(topic, dbg);
+  }
+
   // ── Retry queue ─────────────────────────────────────────────────────────
   /// Messages that were published with 0 GossipSub peers (i.e. dropped into
   /// the void). The background retry loop republishes them once the mesh forms.
