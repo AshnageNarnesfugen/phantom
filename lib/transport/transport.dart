@@ -165,10 +165,9 @@ class TransportManager {
     }
   }
 
-  /// Publishes to the most appropriate transport based on the tiered strategy:
-  /// 1. If handshake (X3DH INIT), prioritize I2P.
-  /// 2. If we have a Yggdrasil address, use Yggdrasil.
-  /// 3. Fallback to IPFS.
+  /// Publishes the message over ALL available transports SIMULTANEOUSLY.
+  /// Whichever network is fastest will trigger the Double Ratchet decryption first.
+  /// Slower networks will deliver a duplicate packet that the MessageStore will safely ignore.
   Future<void> publish({
     required String recipientId,
     required Uint8List encryptedEnvelope,
@@ -180,60 +179,67 @@ class TransportManager {
     }
 
     final dbg = TransportDebugger.instance;
+    final futures = <Future<void>>[];
 
-    // Tier 1: I2P for handshakes
-    if (isHandshake) {
-      final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
-      final dest = _i2pDests[recipientId];
-      if (i2p != null && dest != null) {
-        dbg.log('HANDSHAKE: prioritized I2P attempt to ${dest.substring(0, 12)}...');
+    // 1. I2P
+    final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
+    final dest = _i2pDests[recipientId];
+    if (i2p != null && dest != null) {
+      futures.add(() async {
+        dbg.log('TRANSPORT: firing I2P to ${dest.substring(0, 12)}...');
         try {
           await i2p.publishToDest(dest: dest, data: encryptedEnvelope);
-          dbg.log('HANDSHAKE: I2P delivery successful');
-          return; 
+          dbg.log('TRANSPORT: I2P delivery successful');
         } catch (e) {
-          dbg.log('HANDSHAKE: I2P failed ($e), falling back...');
+          dbg.log('TRANSPORT: I2P failed ($e)');
+          rethrow;
         }
-      } else {
-        dbg.log('HANDSHAKE: I2P skipped (active=${i2p != null}, hasDest=${dest != null})');
-      }
+      }());
     }
 
-    // Tier 2: Yggdrasil for direct P2P data
+    // 2. Yggdrasil
     final ygg = _activeTransports.whereType<YggdrasilTransport>().firstOrNull;
     final yggAddr = _yggAddrs[recipientId];
     if (ygg != null && yggAddr != null) {
-      dbg.log('TRANSPORT: using Yggdrasil for ${recipientId.substring(0, 8)}...');
-      try {
-        await ygg.publishToAddr(address: yggAddr, data: encryptedEnvelope);
-        return;
-      } catch (e) {
-        dbg.log('TRANSPORT: Yggdrasil failed ($e)');
-      }
-    } else {
-      dbg.log('TRANSPORT: Yggdrasil skipped (active=${ygg != null}, hasAddr=${yggAddr != null})');
+      futures.add(() async {
+        dbg.log('TRANSPORT: firing Yggdrasil to ${recipientId.substring(0, 8)}...');
+        try {
+          await ygg.publishToAddr(address: yggAddr, data: encryptedEnvelope);
+          dbg.log('TRANSPORT: Yggdrasil delivery successful');
+        } catch (e) {
+          dbg.log('TRANSPORT: Yggdrasil failed ($e)');
+          rethrow;
+        }
+      }());
     }
 
-    // Tier 3: IPFS fallback / parallel
-    int successes = 0;
-    Object? lastError;
-    await Future.wait([
-      for (final t in _activeTransports)
-        if (t is IpfsTransport)
-          t.publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope)
-              .then((_) { successes++; })
-              .onError((e, _) { lastError = e; }),
-    ]);
+    // 3. IPFS
+    final ipfsList = _activeTransports.whereType<IpfsTransport>();
+    for (final ipfs in ipfsList) {
+      futures.add(() async {
+        dbg.log('TRANSPORT: firing IPFS PubSub for ${recipientId.substring(0, 8)}...');
+        try {
+          await ipfs.publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope);
+          dbg.log('TRANSPORT: IPFS delivery successful');
+        } catch (e) {
+          dbg.log('TRANSPORT: IPFS failed ($e)');
+          rethrow;
+        }
+      }());
+    }
 
-    if (successes == 0) {
-       // If no IPFS success, try whatever is active as last resort
-       for (final t in _activeTransports) {
-         try {
-           await t.publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope);
-           return;
-         } catch(e) { lastError = e; }
-       }
-       throw lastError ?? const TransportException('All transports failed');
+    if (futures.isEmpty) {
+      throw const TransportException('No valid transport target for recipient.');
+    }
+
+    // Wait for all transports to finish (either success or fail)
+    final results = await Future.wait(
+      futures.map((f) => f.then((_) => true).catchError((_) => false))
+    );
+
+    // If EVERY single transport failed, throw an error to fallback to Bluetooth/Storage.
+    if (!results.any((success) => success)) {
+      throw const TransportException('All simultaneous transport layers failed.');
     }
   }
 
