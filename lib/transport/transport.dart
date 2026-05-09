@@ -993,10 +993,16 @@ class YggdrasilTransport implements PhantomTransport {
         try {
           final res = await Process.run('ip', ['-6', 'addr']);
           if (res.exitCode == 0) {
-            final regex = RegExp(r'inet6\s+(0[23][0-9a-fA-F:]+)/\d+');
+            // IPv6 might omit the leading zero, so 0200:: becomes 200::
+            final regex = RegExp(r'inet6\s+(0?[23][0-9a-fA-F]{0,2}:[0-9a-fA-F:]+)/\d+');
             final match = regex.firstMatch(res.stdout.toString());
             if (match != null && match.groupCount >= 1) {
-              _address = match.group(1);
+              // Re-add the leading zero if it was omitted to maintain standardization
+              var detectedIp = match.group(1)!;
+              if (detectedIp.startsWith('2') || detectedIp.startsWith('3')) {
+                detectedIp = '0$detectedIp';
+              }
+              _address = detectedIp;
               TransportDebugger.instance.log('Yggdrasil: auto-detected IP $_address via native scan');
             }
           }
