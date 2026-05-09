@@ -26,6 +26,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
     <!-- Foreground service — IPFS daemon (data sync over network) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <!-- WakeLock — keep CPU alive for persistent IPFS connections -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
     <!-- APK self-update installer -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
@@ -93,6 +95,7 @@
         <service
             android:name=".IpfsForegroundService"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="dataSync"/>
 
         <!-- Message receiver — keeps the Dart isolate alive so ntfy delivers

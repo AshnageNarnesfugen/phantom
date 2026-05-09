@@ -47,6 +47,16 @@ class IpfsDaemon {
     try {
       _logBuf.clear();
 
+      // ── Fast path: daemon already alive from persistent service ─────────
+      // If the user swiped the app away but the foreground service kept Kubo
+      // running, the API will respond immediately.  Skip all init work.
+      final alreadyRunning = await _waitForApi(seconds: 1);
+      if (alreadyRunning) {
+        _logBuf.writeln('[init] daemon already running (persistent service) — reusing');
+        debugPrint('[IpfsDaemon] API already up — skipping spawn');
+        return;
+      }
+
       final libDir = await _ch.invokeMethod<String>('getNativeLibDir') ?? '';
       final binary = '$libDir/libkubo.so';
 
@@ -78,7 +88,7 @@ class IpfsDaemon {
       await _initRepoIfNeeded(binary, repoPath);
       _logBuf.writeln('[init] repo ready');
 
-      // Attempt to start the foreground service (preferred — survives backgrounding).
+      // Attempt to start the foreground service (preferred — survives app kill).
       bool serviceStarted = false;
       try {
         await _ch.invokeMethod<void>('startService', {
