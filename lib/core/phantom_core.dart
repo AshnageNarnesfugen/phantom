@@ -414,8 +414,10 @@ class PhantomCore {
           await storage.updateMessageStatus(recipientId, message.id, MessageStatus.sent);
 
           if (isHandshake) {
-
+            final dbg = TransportDebugger.instance;
+            dbg.log('DBG: before _sendConnectivityInfo, session.pendingX3dhEk is null? ${session.pendingX3dhEphemeralKey == null}');
             unawaited(_sendConnectivityInfo(recipientId));
+            dbg.log('DBG: after unawaited, session.pendingX3dhEk is null? ${session.pendingX3dhEphemeralKey == null}');
           }
 
           return stored.copyWith(status: MessageStatus.sent);
