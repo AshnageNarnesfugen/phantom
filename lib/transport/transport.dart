@@ -361,8 +361,7 @@ class IpfsTransport implements PhantomTransport {
         }
       }
       if (!hasPeers && isHandshake) {
-        dbg.log('IPFS: ⚠ gossipsub mesh NOT formed after ${maxWaitSecs}s — throwing to queue INIT');
-        throw const TransportException('GossipSub mesh not formed, peer likely offline');
+        dbg.log('IPFS: ⚠ gossipsub mesh NOT formed after ${maxWaitSecs}s — publishing anyway (best-effort)');
       }
     } else {
       dbg.log('IPFS: peer not verified in swarm, publishing to topic anyway (best-effort)');
