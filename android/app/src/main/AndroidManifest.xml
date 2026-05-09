@@ -91,10 +91,13 @@
             android:name="io.flutter.embedding.android.EnableImpeller"
             android:value="true" />
 
-        <!-- IPFS daemon — survives app backgrounding via a foreground service -->
+        <!-- IPFS daemon — runs in a SEPARATE process (:ipfs) so it survives
+             when the user swipes the app from recent tasks. Same technique
+             used by YouTube Music, Spotify, etc. for persistent playback. -->
         <service
             android:name=".IpfsForegroundService"
             android:exported="false"
+            android:process=":ipfs"
             android:stopWithTask="false"
             android:foregroundServiceType="dataSync"/>
 
