@@ -405,6 +405,12 @@ class IpfsTransport implements PhantomTransport {
           continue;
         }
 
+        // Start the global pulse circuit if not already started
+        if (!_pulseCircuitStarted) {
+          _pulseCircuitStarted = true;
+          unawaited(_runPulseCircuit(dbg));
+        }
+
         dbg.log('IPFS: subscription stream open');
         await for (final line in response.stream
             .transform(utf8.decoder)
@@ -439,6 +445,42 @@ class IpfsTransport implements PhantomTransport {
         dbg.log('IPFS: subscription error: $e — retrying in 10s');
         if (!_disposed) await Future.delayed(const Duration(seconds: 10));
       }
+    }
+  }
+
+  bool _pulseCircuitStarted = false;
+
+  /// Runs a global heartbeat circuit to keep circuit relay connections and
+  /// GossipSub meshes alive across the network (inspired by disco-chat).
+  Future<void> _runPulseCircuit(TransportDebugger dbg) async {
+    final topic = 'phantom-pulse-circuit';
+    final encTopic = _encodeTopic(topic);
+    final subUri = Uri.parse('$_apiUrl/api/v0/pubsub/sub?arg=${Uri.encodeComponent(encTopic)}');
+    final pubUri = Uri.parse('$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(encTopic)}');
+
+    // Subscribe in the background to receive pulses (keeps the stream open)
+    unawaited(() async {
+      while (!_disposed) {
+        try {
+          final req = http.Request('POST', subUri);
+          final resp = await _client.send(req);
+          if (resp.statusCode == 200) {
+            await resp.stream.drain<void>();
+          }
+        } catch (_) {}
+        if (!_disposed) await Future.delayed(const Duration(seconds: 5));
+      }
+    }());
+
+    // Publish a pulse every 15 seconds
+    while (!_disposed) {
+      try {
+        final payload = utf8.encode(DateTime.now().millisecondsSinceEpoch.toString());
+        final req = http.MultipartRequest('POST', pubUri);
+        req.files.add(http.MultipartFile.fromBytes('data', payload));
+        await _client.send(req).timeout(const Duration(seconds: 5));
+      } catch (_) {}
+      if (!_disposed) await Future.delayed(const Duration(seconds: 15));
     }
   }
 
