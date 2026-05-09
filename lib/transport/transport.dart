@@ -216,6 +216,8 @@ class TransportManager {
     // 3. IPFS
     final ipfsList = _activeTransports.whereType<IpfsTransport>();
     for (final ipfs in ipfsList) {
+      // Signal handshake mode so IPFS waits for GossipSub mesh formation
+      if (isHandshake) ipfs.markNextPublishAsHandshake();
       futures.add(() async {
         dbg.log('TRANSPORT: firing IPFS PubSub for ${recipientId.substring(0, 8)}...');
         try {
@@ -313,6 +315,12 @@ class IpfsTransport implements PhantomTransport {
     return false;
   }
 
+  /// If true, the next publish call will wait for GossipSub mesh formation.
+  bool _nextPublishIsHandshake = false;
+
+  /// Mark the next publish as a handshake so it waits for the mesh.
+  void markNextPublishAsHandshake() => _nextPublishIsHandshake = true;
+
   @override
   Future<void> publish({
     required String recipientId,
@@ -321,8 +329,10 @@ class IpfsTransport implements PhantomTransport {
     final dbg   = TransportDebugger.instance;
     final topic = _topicForId(recipientId);
     final short = recipientId.substring(0, 8);
+    final isHandshake = _nextPublishIsHandshake;
+    _nextPublishIsHandshake = false;
 
-    dbg.log('IPFS: publish → $short (${encryptedEnvelope.length} bytes)');
+    dbg.log('IPFS: publish → $short (${encryptedEnvelope.length} bytes, handshake=$isHandshake)');
 
     // ── Step 1: Cross-subscribe to recipient's topic ──────────────────────
     // GossipSub only forms a mesh between peers that BOTH subscribe to the
@@ -339,13 +349,23 @@ class IpfsTransport implements PhantomTransport {
       throw const TransportException('No verified IPFS swarm connection to peer');
     }
 
-    // ── Step 3: Quick gossipsub peer check (informational only) ─────────
-    // Gossipsub mesh formation can lag behind the swarm connection by several
-    // seconds. We check once for logging but publish regardless — gossipsub
-    // will deliver via eager-push to directly connected peers even without a
-    // fully formed mesh.
-    final hasPeers = await _checkTopicPeers(topic, dbg);
-    if (!hasPeers) {
+    // ── Step 3: Wait for GossipSub mesh formation ────────────────────────
+    // For handshake INIT frames this is CRITICAL — if we publish before the
+    // mesh forms, the message goes to /dev/null and the session never
+    // establishes. Poll pubsub/peers for up to 15s on handshake, 3s on MSG.
+    final maxWaitSecs = isHandshake ? 15 : 3;
+    bool hasPeers = false;
+    for (int i = 0; i < maxWaitSecs; i++) {
+      hasPeers = await _checkTopicPeers(topic, dbg);
+      if (hasPeers) break;
+      if (i < maxWaitSecs - 1) {
+        dbg.log('IPFS: waiting for gossipsub mesh ($short) [${i + 1}/${maxWaitSecs}s]…');
+        await Future.delayed(const Duration(seconds: 1));
+      }
+    }
+    if (!hasPeers && isHandshake) {
+      dbg.log('IPFS: ⚠ gossipsub mesh NOT formed after ${maxWaitSecs}s — publishing anyway (may fail)');
+    } else if (!hasPeers) {
       dbg.log('IPFS: gossipsub mesh not yet formed for $short — publishing anyway');
     }
 
@@ -457,21 +477,16 @@ class IpfsTransport implements PhantomTransport {
       dbg.log('IPFS: direct connect via stored peer ID $knownPeerId');
       final preExisting = await _verifySwarmConnection(knownPeerId);
       if (preExisting) {
-        final isContact = await _checkTopicPeers(contactTopic, dbg);
-        if (isContact) {
-          _swarmConnected.add(knownPeerId);
-          dbg.log('IPFS: $knownPeerId pre-connected and subscribed');
-          return true;
-        }
+        _swarmConnected.add(knownPeerId);
+        dbg.log('IPFS: $knownPeerId already in swarm — ready');
+        return true;
       }
       // Fetch current relay addresses via findpeer, then connect.
       final addrs = await _fetchPeerAddrs(knownPeerId, dbg);
       final connected = await _connectById(knownPeerId, addrs, dbg);
       if (connected) {
         _swarmConnected.add(knownPeerId);
-        // For a known peer, publish even if gossipsub hasn't formed yet —
-        // the mesh will form within seconds of the swarm connection.
-        dbg.log('IPFS: connected to known peer $knownPeerId — publishing');
+        dbg.log('IPFS: connected to known peer $knownPeerId — ready');
         return true;
       }
       dbg.log('IPFS: stored peer ID connect failed, falling back to findprovs');
@@ -637,8 +652,10 @@ class IpfsTransport implements PhantomTransport {
       '/p2p/$peerId',
     ];
 
-    // Dial all addresses in parallel. Don't stop at the first fake 'success'.
-    unawaited(Future.wait(targets.map((addr) async {
+    // Dial all addresses in parallel and AWAIT results so we know when to
+    // start verifying. Previous fire-and-forget caused verification to
+    // race ahead of the actual connection attempts.
+    await Future.wait(targets.map((addr) async {
       if (_disposed) return;
       try {
         final r = await _client
@@ -650,12 +667,12 @@ class IpfsTransport implements PhantomTransport {
       } catch (e) {
         dbg.log('IPFS: swarm/connect error: $e');
       }
-    })));
+    }));
 
     // Verify true connection by polling swarm/peers for up to 10 seconds.
     for (int i = 0; i < 5; i++) {
       if (_disposed) return false;
-      await Future.delayed(const Duration(seconds: 2));
+      if (i > 0) await Future.delayed(const Duration(seconds: 2));
       try {
         final r = await _client.post(Uri.parse('$_apiUrl/api/v0/swarm/peers'))
             .timeout(const Duration(seconds: 3));
@@ -945,9 +962,11 @@ class I2PTransport implements PhantomTransport {
 
 /// Transport over the Yggdrasil network (encrypted IPv6 mesh).
 ///
-/// Base for data connections. Uses direct TCP/IPv6.
+/// Uses direct TCP/IPv6 with length-prefixed framing:
+///   [4-byte big-endian length][payload]
 class YggdrasilTransport implements PhantomTransport {
   static const int listenPort = 7331;
+  static const int _maxPayloadBytes = 1024 * 1024; // 1 MB safety cap
   ServerSocket? _server;
   bool _disposed = false;
 
@@ -993,16 +1012,13 @@ class YggdrasilTransport implements PhantomTransport {
         try {
           final res = await Process.run('ip', ['-6', 'addr']);
           if (res.exitCode == 0) {
-            // IPv6 might omit the leading zero, so 0200:: becomes 200::
-            final regex = RegExp(r'inet6\s+(0?[23][0-9a-fA-F]{0,2}:[0-9a-fA-F:]+)/\d+');
+            // Strict match for Yggdrasil 0200::/7 — first byte must be 0x02 or 0x03.
+            // In IPv6 text, that's 02xx: or 03xx: (with optional leading-zero omission).
+            // We require the full 4-char first group to avoid matching 2001:, 2a02:, etc.
+            final regex = RegExp(r'inet6\s+(0[23][0-9a-fA-F]{2}:[0-9a-fA-F:]+)/\d+');
             final match = regex.firstMatch(res.stdout.toString());
             if (match != null && match.groupCount >= 1) {
-              // Re-add the leading zero if it was omitted to maintain standardization
-              var detectedIp = match.group(1)!;
-              if (detectedIp.startsWith('2') || detectedIp.startsWith('3')) {
-                detectedIp = '0$detectedIp';
-              }
-              _address = detectedIp;
+              _address = match.group(1)!;
               TransportDebugger.instance.log('Yggdrasil: auto-detected IP $_address via native scan');
             }
           }
@@ -1020,11 +1036,27 @@ class YggdrasilTransport implements PhantomTransport {
     }
   }
 
+  /// Sends [data] to [address] with a 4-byte big-endian length prefix.
+  /// The receiver reads exactly [length] bytes then closes — no ambiguity.
   Future<void> publishToAddr({required String address, required Uint8List data}) async {
-    final s = await Socket.connect(address, listenPort, timeout: const Duration(seconds: 5));
-    s.add(data);
-    await s.flush();
-    await s.close();
+    final dbg = TransportDebugger.instance;
+    dbg.log('Yggdrasil: connecting to $address:$listenPort (${data.length} bytes)');
+    
+    Socket? s;
+    try {
+      s = await Socket.connect(address, listenPort, timeout: const Duration(seconds: 5));
+      // Write 4-byte big-endian length header
+      final header = ByteData(4)..setUint32(0, data.length, Endian.big);
+      s.add(header.buffer.asUint8List());
+      s.add(data);
+      await s.flush();
+      dbg.log('Yggdrasil: sent ${data.length} bytes to $address');
+    } catch (e) {
+      dbg.log('Yggdrasil: send failed to $address — $e');
+      rethrow;
+    } finally {
+      try { await s?.close(); } catch (_) {}
+    }
   }
 
   @override
@@ -1033,20 +1065,102 @@ class YggdrasilTransport implements PhantomTransport {
   }
 
   @override
-  Stream<IncomingEnvelope> subscribe({required String ourId}) async* {
+  Stream<IncomingEnvelope> subscribe({required String ourId}) {
     final dbg = TransportDebugger.instance;
-    _server = await ServerSocket.bind(InternetAddress.anyIPv6, listenPort);
-    dbg.log('Yggdrasil: listening on port $listenPort');
+    final controller = StreamController<IncomingEnvelope>();
 
-    await for (final client in _server!) {
-      if (_disposed) break;
-      final data = await client.fold<List<int>>([], (p, e) => p..addAll(e));
-      yield IncomingEnvelope(
-        data: Uint8List.fromList(data),
+    () async {
+      // Retry bind up to 3 times with delay if the port is busy (e.g. quick restart)
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        try {
+          _server = await ServerSocket.bind(InternetAddress.anyIPv6, listenPort);
+          dbg.log('Yggdrasil: listening on port $listenPort');
+          break;
+        } catch (e) {
+          if (attempt == 3) {
+            dbg.log('Yggdrasil: ✗ failed to bind port $listenPort after 3 attempts: $e');
+            await controller.close();
+            return;
+          }
+          dbg.log('Yggdrasil: port $listenPort busy, retrying in ${attempt * 2}s (attempt $attempt/3)');
+          await Future.delayed(Duration(seconds: attempt * 2));
+        }
+      }
+
+      if (_server == null) {
+        await controller.close();
+        return;
+      }
+
+      await for (final client in _server!) {
+        if (_disposed) break;
+        // Handle each connection concurrently so a stalled peer doesn't
+        // block the server from accepting other connections.
+        unawaited(_handleClient(client, dbg).then((envelope) {
+          if (envelope != null && !controller.isClosed) {
+            controller.add(envelope);
+          }
+        }).catchError((_) {}));
+      }
+      await controller.close();
+    }();
+
+    return controller.stream;
+  }
+
+  /// Read a single length-prefixed message from [client] with a timeout.
+  /// Returns null if the read fails or times out.
+  Future<IncomingEnvelope?> _handleClient(Socket client, TransportDebugger dbg) async {
+    try {
+      final data = await _readLengthPrefixed(client)
+          .timeout(const Duration(seconds: 30));
+      if (data == null || data.isEmpty) return null;
+      dbg.log('Yggdrasil: received ${data.length} bytes from ${client.remoteAddress.address}');
+      return IncomingEnvelope(
+        data: data,
         transportName: name,
         receivedAt: DateTime.now(),
       );
+    } catch (e) {
+      dbg.log('Yggdrasil: client read error: $e');
+      return null;
+    } finally {
+      try { client.close(); } catch (_) {}
     }
+  }
+
+  /// Reads a 4-byte big-endian length header, then exactly that many payload bytes.
+  /// Falls back to reading all-until-close for backward compatibility with
+  /// senders that don't send a length prefix (pre-fix versions).
+  Future<Uint8List?> _readLengthPrefixed(Socket socket) async {
+    final allBytes = <int>[];
+    await for (final chunk in socket) {
+      allBytes.addAll(chunk);
+      // Once we have at least the 4-byte header, check payload size
+      if (allBytes.length >= 4) {
+        final view = ByteData.sublistView(Uint8List.fromList(allBytes.sublist(0, 4)));
+        final payloadLen = view.getUint32(0, Endian.big);
+        // Sanity check: reject absurdly large payloads
+        if (payloadLen > _maxPayloadBytes) {
+          return null; // Malformed or attack
+        }
+        if (allBytes.length >= 4 + payloadLen) {
+          return Uint8List.fromList(allBytes.sublist(4, 4 + payloadLen));
+        }
+      }
+    }
+    // Socket closed before we got the full payload.
+    // Backward compatibility: if there's no valid length prefix,
+    // treat the entire buffer as the payload (old-style framing).
+    if (allBytes.length > 4) {
+      final view = ByteData.sublistView(Uint8List.fromList(allBytes.sublist(0, 4)));
+      final maybeLen = view.getUint32(0, Endian.big);
+      if (maybeLen == allBytes.length - 4) {
+        return Uint8List.fromList(allBytes.sublist(4));
+      }
+    }
+    // Old-style: no length prefix, entire buffer is the message
+    return allBytes.isNotEmpty ? Uint8List.fromList(allBytes) : null;
   }
 
   @override

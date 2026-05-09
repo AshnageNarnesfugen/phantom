@@ -193,10 +193,12 @@ class PhantomCore {
       internetPublish: ({
         required String recipientId,
         required Uint8List encryptedEnvelope,
+        bool isHandshake = false,
       }) =>
           v1.publish(
             recipientId:       recipientId,
             encryptedEnvelope: encryptedEnvelope,
+            isHandshake:       isHandshake,
           ),
     );
   }
@@ -377,45 +379,64 @@ class PhantomCore {
 
     // Try v2 transport first (BLE mesh + internet with fallback + store-and-forward).
     // Fall back to v1 (internet-only) if v2 is not wired.
-    try {
-      if (_transportV2 != null) {
-        final result = await _transportV2!.publish(
-          recipientId:        recipientId,
-          fullMessageId:      message.id,
-          encryptedEnvelope:  wire,
-        );
-        final status = (result.success || result.queued)
-            ? MessageStatus.sent
-            : MessageStatus.failed;
-        await storage.updateMessageStatus(recipientId, message.id, status);
+    //
+    // For handshake INIT frames, retry up to 3 times with exponential backoff.
+    // The INIT is the most critical message — without it the session never
+    // establishes. Retries give the GossipSub mesh time to form.
+    final maxAttempts = isHandshake ? 3 : 1;
 
-        if (isHandshake) {
-          unawaited(_sendConnectivityInfo(recipientId));
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        if (_transportV2 != null) {
+          final result = await _transportV2!.publish(
+            recipientId:        recipientId,
+            fullMessageId:      message.id,
+            encryptedEnvelope:  wire,
+            isHandshake:        isHandshake,
+          );
+          final status = (result.success || result.queued)
+              ? MessageStatus.sent
+              : MessageStatus.failed;
+          await storage.updateMessageStatus(recipientId, message.id, status);
+
+          if (isHandshake) {
+            unawaited(_sendConnectivityInfo(recipientId));
+          }
+
+          return stored.copyWith(status: status);
+        } else if (_transportAvailable) {
+          await transport.publish(
+            recipientId: recipientId,
+            encryptedEnvelope: wire,
+            isHandshake: isHandshake,
+          );
+          await storage.updateMessageStatus(recipientId, message.id, MessageStatus.sent);
+
+          // If it was a handshake, automatically follow up with our connectivity info
+          if (isHandshake) {
+            unawaited(_sendConnectivityInfo(recipientId));
+          }
+
+          return stored.copyWith(status: MessageStatus.sent);
+        } else {
+          await storage.updateMessageStatus(recipientId, message.id, MessageStatus.failed);
+          return stored.copyWith(status: MessageStatus.failed);
         }
-
-        return stored.copyWith(status: status);
-      } else if (_transportAvailable) {
-        await transport.publish(
-          recipientId: recipientId,
-          encryptedEnvelope: wire,
-          isHandshake: isHandshake,
-        );
-        await storage.updateMessageStatus(recipientId, message.id, MessageStatus.sent);
-
-        // If it was a handshake, automatically follow up with our connectivity info
-        if (isHandshake) {
-          unawaited(_sendConnectivityInfo(recipientId));
+      } catch (e) {
+        final dbg = TransportDebugger.instance;
+        if (isHandshake && attempt < maxAttempts) {
+          final delaySecs = 3 * attempt; // 3s, 6s, 9s
+          dbg.log('MSG: handshake attempt $attempt/$maxAttempts failed, retrying in ${delaySecs}s…');
+          await Future.delayed(Duration(seconds: delaySecs));
+          continue;
         }
-
-        return stored.copyWith(status: MessageStatus.sent);
-      } else {
-        await storage.updateMessageStatus(recipientId, message.id, MessageStatus.failed);
-        return stored.copyWith(status: MessageStatus.failed);
+        dbg.log('MSG: send failed after $attempt attempt(s): $e');
       }
-    } catch (_) {
-      await storage.updateMessageStatus(recipientId, message.id, MessageStatus.failed);
-      return stored.copyWith(status: MessageStatus.failed);
     }
+
+    // All attempts exhausted
+    await storage.updateMessageStatus(recipientId, message.id, MessageStatus.failed);
+    return stored.copyWith(status: MessageStatus.failed);
   }
 
   /// Builds the raw ContactAddress bytes for inclusion in INIT frames.
@@ -514,6 +535,12 @@ class PhantomCore {
     if (contact.ipfsPeerId != null)       transport.setContactIpfsPeerId(contact.phantomId, contact.ipfsPeerId!);
 
     _presence?.addContacts([contact.phantomId]);
+
+    // Pre-warm: trigger DHT discovery + cross-subscription in the background
+    // so the GossipSub mesh starts forming BEFORE the user sends their first
+    // message. This dramatically improves handshake success rate.
+    unawaited(_prewarmContactTransport(contact.phantomId));
+
     return contact;
   }
 
@@ -530,6 +557,45 @@ class PhantomCore {
       if (t is IpfsTransport) {
         t.setContactIpfsPeerId(contactId, ipfsPeerId);
       }
+    }
+  }
+
+  /// Pre-warm the transport layer for a newly added contact:
+  /// 1. Cross-subscribe to their message topic (GossipSub mesh formation)
+  /// 2. Trigger DHT discovery + swarm connect
+  /// 3. Re-advertise ourselves on the DHT so they can find us
+  /// All operations are fire-and-forget — failures are silently logged.
+  Future<void> _prewarmContactTransport(String contactId) async {
+    final dbg = TransportDebugger.instance;
+    dbg.log('PREWARM: starting for ${contactId.substring(0, 8)}…');
+    try {
+      for (final t in transport.transports) {
+        if (t is IpfsTransport) {
+          // Cross-subscribe to their message topic so GossipSub mesh
+          // starts forming before the first message is sent.
+          final topic = 'msg$contactId';
+          final encodedTopic = 'u${base64Url.encode(utf8.encode(topic)).replaceAll('=', '')}';
+          try {
+            final uri = Uri.parse('${_ipfsApiUrl ?? "http://127.0.0.1:5001"}/api/v0/pubsub/sub?arg=${Uri.encodeComponent(encodedTopic)}');
+            final request = http.Request('POST', uri);
+            final response = await http.Client().send(request)
+                .timeout(const Duration(seconds: 5));
+            if (response.statusCode == 200) {
+              // Keep the subscription open in background (auto-closed on dispose)
+              response.stream.listen(null, onError: (_) {}, cancelOnError: false);
+              dbg.log('PREWARM: cross-subscribed to ${contactId.substring(0, 8)} topic');
+            }
+          } catch (e) {
+            dbg.log('PREWARM: cross-sub error: $e');
+          }
+        }
+      }
+
+      // Trigger DHT re-advertisement so the contact can find us via findprovs
+      _presence?.publishOnline();
+      dbg.log('PREWARM: done for ${contactId.substring(0, 8)}');
+    } catch (e) {
+      dbg.log('PREWARM: error: $e');
     }
   }
 
@@ -794,9 +860,15 @@ class PhantomCore {
     final ygg = transport.transports.whereType<YggdrasilTransport>().firstOrNull;
     if (ygg != null) myYgg = ygg.address;
 
+    // Try to get our I2P destination if active
+    String? myI2p;
+    final i2p = transport.transports.whereType<I2PTransport>().firstOrNull;
+    if (i2p != null) myI2p = i2p.myDestination;
+
     final msg = PhantomMessage.connectivity(
       ipfsPeerId: ipfsId,
       yggAddr:    myYgg,
+      i2pDest:    myI2p,
     );
     final session = await _getOrCreateSession(recipientId);
     final protocol = PhantomProtocol(session);

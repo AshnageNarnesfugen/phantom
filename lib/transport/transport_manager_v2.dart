@@ -24,11 +24,10 @@ class TransportManagerV2 {
   final BluetoothMeshTransport _btMesh;
   final MessageStore _store;
 
-  // Internet transport (from the original TransportManager)
-  // Represented as a callback to avoid re-implementing everything
   final Future<void> Function({
     required String recipientId,
     required Uint8List encryptedEnvelope,
+    bool isHandshake,
   })? _internetPublish;
 
   TransportMode _mode = TransportMode.offline;
@@ -52,6 +51,7 @@ class TransportManagerV2 {
     Future<void> Function({
       required String recipientId,
       required Uint8List encryptedEnvelope,
+      bool isHandshake,
     })? internetPublish,
   })  : _btMesh = btMesh,
         _store = store,
@@ -99,6 +99,7 @@ class TransportManagerV2 {
     required String recipientId,
     required String fullMessageId,
     required Uint8List encryptedEnvelope,
+    bool isHandshake = false,
   }) async {
     switch (_mode) {
       case TransportMode.internet:
@@ -106,6 +107,7 @@ class TransportManagerV2 {
           await _internetPublish?.call(
             recipientId: recipientId,
             encryptedEnvelope: encryptedEnvelope,
+            isHandshake: isHandshake,
           );
           return SendResult.sent(via: TransportSource.internet);
         } catch (e) {

@@ -1295,6 +1295,24 @@ class _ChatScreenState extends State<ChatScreen> {
                 await core?.deleteMessage(widget.contactId, msg.id);
                 if (mounted) setState(() => _messages?.removeWhere((m) => m.id == msg.id));
               }),
+          if (isOut && msg.status == MessageStatus.failed)
+            _MenuItem(icon: Icons.refresh_outlined, label: 'retry', tokens: t,
+              onTap: () async {
+                Navigator.pop(ctx);
+                if (core == null) return;
+                final text = msg.type == MessageType.text ? msg.textContent : null;
+                if (text == null) return;
+                // Delete the failed message and resend as new
+                await core.deleteMessage(widget.contactId, msg.id);
+                if (!mounted) return;
+                setState(() => _messages?.removeWhere((m) => m.id == msg.id));
+                await core.sendMessage(
+                  recipientId: widget.contactId,
+                  text: text,
+                  replyToId: msg.replyToId,
+                );
+                if (mounted) _loadMessages(core);
+              }),
           const SizedBox(height: 16),
         ],
       ),
@@ -2245,7 +2263,34 @@ class _AddContactScreenState extends State<AddContactScreen> {
         nickname: nick.isEmpty ? null : nick,
         ipfsPeerId: ipfs.isEmpty ? null : ipfs,
       );
-      if (mounted) Navigator.pop(context);
+      if (mounted) {
+        // Show warming-up feedback before popping
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          backgroundColor: PhantomTheme.tokensOf(context).bgSurface,
+          content: Row(
+            children: [
+              SizedBox(
+                width: 14, height: 14,
+                child: CircularProgressIndicator(
+                  strokeWidth: 1.5,
+                  color: PhantomTheme.tokensOf(context).accentLight,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                'warming up connection…',
+                style: TextStyle(
+                  color: PhantomTheme.tokensOf(context).textSecondary,
+                  fontFamily: 'monospace',
+                  fontSize: 13,
+                ),
+              ),
+            ],
+          ),
+          duration: const Duration(seconds: 3),
+        ));
+        Navigator.pop(context);
+      }
     } on InvalidPhantomIdException catch (e) {
       if (mounted) setState(() { _error = e.message; _loading = false; });
     } catch (_) {
@@ -2976,10 +3021,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     suffixIcon: IconButton(
                       icon: Icon(Icons.save, color: t.accentLight, size: 16),
                       onPressed: () {
-                        core?.setMyYggdrasilAddress(_yggdrasilCtrl.text.trim());
+                        final input = _yggdrasilCtrl.text.trim();
+                        // Empty = auto-detect, non-empty must look like IPv6
+                        if (input.isNotEmpty && !input.contains(':')) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text('invalid ipv6 address',
+                                  style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 12)),
+                              backgroundColor: const Color(0xFFCF6679),
+                            ),
+                          );
+                          return;
+                        }
+                        core?.setMyYggdrasilAddress(input);
                         ScaffoldMessenger.of(context).showSnackBar(
                           SnackBar(
-                            content: const Text('yggdrasil address updated', style: TextStyle(fontFamily: 'monospace', fontSize: 12)),
+                            content: Text(
+                              input.isEmpty ? 'yggdrasil: auto-detect enabled' : 'yggdrasil address updated',
+                              style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                            ),
                             backgroundColor: t.bgSubtle,
                           ),
                         );
@@ -3552,6 +3612,8 @@ class _TransportStatusSheet extends StatefulWidget {
 class _TransportStatusSheetState extends State<_TransportStatusSheet> {
   StreamSubscription<TransportMode>? _sub;
   TransportStatus? _status;
+  int _ipfsSwarmPeers = 0;
+  bool _ipfsRunning = false;
 
   @override
   void initState() {
@@ -3560,7 +3622,34 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
     _sub = widget.core?.transportModeChanges.listen((_) {
       if (mounted) setState(() => _status = widget.core?.transportStatus);
     });
+    _fetchIpfsStatus();
   }
+
+  Future<void> _fetchIpfsStatus() async {
+    try {
+      final s = await IpfsDaemon.instance.status();
+      if (mounted) {
+        setState(() {
+          _ipfsRunning = s.running;
+          _ipfsSwarmPeers = s.peers;
+        });
+      }
+    } catch (_) {}
+
+    // Also probe Yggdrasil and I2P from the transport manager
+    final core = widget.core;
+    if (core != null && mounted) {
+      final ygg = core.transport.transports.whereType<YggdrasilTransport>().firstOrNull;
+      final i2p = core.transport.transports.whereType<I2PTransport>().firstOrNull;
+      setState(() {
+        _yggAddress = ygg?.address;
+        _i2pActive = i2p?.myDestination != null;
+      });
+    }
+  }
+
+  String? _yggAddress;
+  bool _i2pActive = false;
 
   @override
   void dispose() {
@@ -3617,6 +3706,26 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
             ],
           ),
           const SizedBox(height: 20),
+          _TransportRow(
+            label: 'ipfs node',
+            value: _ipfsRunning ? 'running' : 'offline',
+            tokens: t,
+          ),
+          _TransportRow(
+            label: 'swarm peers',
+            value: '$_ipfsSwarmPeers',
+            tokens: t,
+          ),
+          _TransportRow(
+            label: 'yggdrasil',
+            value: _yggAddress != null ? _yggAddress!.substring(0, _yggAddress!.length.clamp(0, 16)) : 'inactive',
+            tokens: t,
+          ),
+          _TransportRow(
+            label: 'i2p',
+            value: _i2pActive ? 'active' : 'inactive',
+            tokens: t,
+          ),
           _TransportRow(label: 'bluetooth mesh', value: s?.btMeshState == true ? 'active' : 'inactive', tokens: t),
           _TransportRow(label: 'bt peers nearby', value: '${s?.btPeerCount ?? 0}', tokens: t),
           _TransportRow(label: 'queued messages', value: '${s?.pendingMessages ?? 0}', tokens: t),
@@ -3624,7 +3733,9 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
           Text(
             s?.mode == TransportMode.offline
                 ? '// no transport available — messages will be queued and delivered when a connection is established'
-                : '// messages are being routed via $modeLabel',
+                : _ipfsSwarmPeers > 0
+                    ? '// messages are being routed via $modeLabel · ipfs mesh ready'
+                    : '// messages are being routed via $modeLabel · ipfs mesh warming up',
             style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 10, height: 1.6),
           ),
         ],
@@ -3893,6 +4004,53 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
     await _runAutoStatus();
   }
 
+  Future<void> _fetchYggStatus() async {
+    final dbg = TransportDebugger.instance;
+    final core = widget.core;
+    dbg.log('DBG: ── Yggdrasil status ──');
+
+    if (core == null) {
+      dbg.log('DBG: core not available');
+      return;
+    }
+
+    final ygg = core.transport.transports.whereType<YggdrasilTransport>().firstOrNull;
+    if (ygg == null) {
+      dbg.log('DBG: Yggdrasil transport not instantiated');
+      return;
+    }
+
+    dbg.log('DBG: Yggdrasil address: ${ygg.address ?? "(none — auto-detect pending)"}');
+    dbg.log('DBG: Yggdrasil available: ${ygg.isAvailable}');
+
+    // Check if it's in the active transports
+    final isActive = core.transport.transports.contains(ygg);
+    dbg.log('DBG: Yggdrasil in transport list: $isActive');
+
+    // Check contacts with Ygg addresses
+    final contacts = await core.getContacts();
+    final withYgg = contacts.where((c) => c.yggdrasilAddress != null);
+    if (withYgg.isEmpty) {
+      dbg.log('DBG: no contacts have Yggdrasil addresses');
+    } else {
+      for (final c in withYgg) {
+        dbg.log('DBG: ${c.displayName} → ygg ${c.yggdrasilAddress}');
+      }
+    }
+
+    // Test IPv6 binding
+    try {
+      final testSock = await ServerSocket.bind(InternetAddress.anyIPv6, 0);
+      dbg.log('DBG: IPv6 bind test OK (port ${testSock.port})');
+      await testSock.close();
+    } catch (e) {
+      dbg.log('DBG: ⚠ IPv6 bind test FAILED: $e');
+    }
+
+    dbg.log('DBG: ── end Yggdrasil status ──');
+    if (mounted) setState(() {});
+  }
+
   // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
@@ -3964,6 +4122,17 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
             ),
             const SizedBox(width: 8),
             if (widget.core != null) ...[
+              _StatusChip(
+                label: 'ygg',
+                value: widget.core!.transport.transports
+                    .whereType<YggdrasilTransport>()
+                    .firstOrNull?.address?.substring(0, 8) ?? 'off',
+                ok: widget.core!.transport.transports
+                    .whereType<YggdrasilTransport>()
+                    .firstOrNull?.address != null,
+                tokens: t,
+              ),
+              const SizedBox(width: 8),
               for (final e in _contactPeers.entries) ...[
                 _StatusChip(
                   label: e.key.substring(0, 6),
@@ -3994,6 +4163,7 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
             _DbgButton(label: 'topics', tokens: t, onTap: _fetchTopics),
             _DbgButton(label: 'contact peers', tokens: t, onTap: _fetchContactPeers),
             _DbgButton(label: 'my sub?', tokens: t, onTap: _checkMySubTopic),
+            _DbgButton(label: 'ygg status', tokens: t, onTap: _fetchYggStatus),
             _DbgButton(label: 'restart daemon', tokens: t, danger: true, onTap: _restartDaemon),
             _DbgButton(label: 'flush queue', tokens: t, accent: true, onTap: _flushQueue),
             if (widget.core != null)
@@ -4034,10 +4204,14 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
           final line = _log[i];
           final isErr  = line.contains('FAIL') || line.contains('ERR') || line.contains('✗');
           final isWarn = line.contains('⚠') || line.contains('no peers');
-          final isOk   = line.contains('✓') || line.contains('OK');
+          final isOk   = line.contains('✓') || line.contains('OK') || line.contains('ready');
+          final isHandshake = line.contains('handshake') || line.contains('PREWARM');
+          final isMesh = line.contains('gossipsub mesh') || line.contains('waiting for');
           final color  = isErr  ? const Color(0xFFCF6679)
                        : isWarn ? const Color(0xFFFFB74D)
                        : isOk   ? const Color(0xFF4CAF50)
+                       : isHandshake ? const Color(0xFF81D4FA)
+                       : isMesh ? const Color(0xFFCE93D8)
                        : t.textSecondary;
           return Text(
             line,

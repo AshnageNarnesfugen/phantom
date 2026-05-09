@@ -557,12 +557,14 @@ class _StatusIcon extends StatelessWidget {
       MessageStatus.sent      => (Icons.check, 11.0),
       MessageStatus.delivered => (Icons.done_all, 11.0),
       MessageStatus.read      => (Icons.done_all, 11.0),
-      MessageStatus.failed    => (Icons.error_outline, 11.0),
+      MessageStatus.failed    => (Icons.error_outline, 13.0),
     };
 
-    final iconColor = status == MessageStatus.read
-        ? PhantomTheme.tokensOf(context).accentLight
-        : color;
+    final iconColor = switch (status) {
+      MessageStatus.read   => PhantomTheme.tokensOf(context).accentLight,
+      MessageStatus.failed => const Color(0xFFCF6679),
+      _                    => color,
+    };
 
     return Icon(icon, size: size, color: iconColor);
   }
