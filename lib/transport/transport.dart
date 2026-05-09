@@ -987,6 +987,21 @@ class YggdrasilTransport implements PhantomTransport {
       } catch (e) {
         TransportDebugger.instance.log('Yggdrasil: interface scan failed - $e');
       }
+
+      // Fallback: Aggressive OS-level routing table scan (bypasses Android VPN hiding)
+      if (_address == null && (Platform.isAndroid || Platform.isLinux)) {
+        try {
+          final res = await Process.run('ip', ['-6', 'addr']);
+          if (res.exitCode == 0) {
+            final regex = RegExp(r'inet6\s+(0[23][0-9a-fA-F:]+)/\d+');
+            final match = regex.firstMatch(res.stdout.toString());
+            if (match != null && match.groupCount >= 1) {
+              _address = match.group(1);
+              TransportDebugger.instance.log('Yggdrasil: auto-detected IP $_address via native scan');
+            }
+          }
+        } catch (_) {}
+      }
     }
 
     // 2. Check if we can bind to an IPv6 address
