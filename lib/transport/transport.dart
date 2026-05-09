@@ -335,41 +335,39 @@ class IpfsTransport implements PhantomTransport {
     dbg.log('IPFS: publish → $short (${encryptedEnvelope.length} bytes, handshake=$isHandshake)');
 
     // ── Step 1: Cross-subscribe to recipient's topic ──────────────────────
-    // GossipSub only forms a mesh between peers that BOTH subscribe to the
-    // same topic. Without this, pubsub/peers returns 0 for the recipient's
-    // topic and the published message goes nowhere.
     dbg.log('IPFS: cross-subscribing to $short topic…');
     await _ensureCrossSubscribed(topic, dbg);
 
-    // ── Step 2: DHT discovery + swarm connect ────────────────────────────
+    // ── Step 2: DHT discovery + swarm connect (best-effort) ──────────────
+    // For handshakes, this is critical. For regular messages, this is
+    // opportunistic — we ALWAYS publish to the topic regardless.
     dbg.log('IPFS: trying DHT discovery for $short…');
     final connected = await _dhtDiscoverAndConnect(recipientId, dbg);
-    
-    if (!connected) {
+
+    if (!connected && isHandshake) {
+      // For handshakes, fail hard — no point sending INIT to an empty mesh
       throw const TransportException('No verified IPFS swarm connection to peer');
     }
 
     // ── Step 3: Wait for GossipSub mesh formation ────────────────────────
-    // For handshake INIT frames this is CRITICAL — if we publish before the
-    // mesh forms, the message goes to /dev/null and the session never
-    // establishes. Poll pubsub/peers for up to 15s on handshake, 3s on MSG.
-    final maxWaitSecs = isHandshake ? 15 : 3;
-    bool hasPeers = false;
-    for (int i = 0; i < maxWaitSecs; i++) {
-      hasPeers = await _checkTopicPeers(topic, dbg);
-      if (hasPeers) break;
-      if (i < maxWaitSecs - 1) {
-        dbg.log('IPFS: waiting for gossipsub mesh ($short) [${i + 1}/${maxWaitSecs}s]…');
-        await Future.delayed(const Duration(seconds: 1));
+    if (connected) {
+      final maxWaitSecs = isHandshake ? 15 : 3;
+      bool hasPeers = false;
+      for (int i = 0; i < maxWaitSecs; i++) {
+        hasPeers = await _checkTopicPeers(topic, dbg);
+        if (hasPeers) break;
+        if (i < maxWaitSecs - 1) {
+          await Future.delayed(const Duration(seconds: 1));
+        }
       }
-    }
-    if (!hasPeers && isHandshake) {
-      dbg.log('IPFS: ⚠ gossipsub mesh NOT formed after ${maxWaitSecs}s — publishing anyway (may fail)');
-    } else if (!hasPeers) {
-      dbg.log('IPFS: gossipsub mesh not yet formed for $short — publishing anyway');
+      if (!hasPeers && isHandshake) {
+        dbg.log('IPFS: ⚠ gossipsub mesh NOT formed after ${maxWaitSecs}s — publishing anyway');
+      }
+    } else {
+      dbg.log('IPFS: peer not verified in swarm, publishing to topic anyway (best-effort)');
     }
 
-    // ── Step 4: Publish ──────────────────────────────────────────────────
+    // ── Step 4: Publish — ALWAYS execute for non-handshake messages ──────
     final uri = Uri.parse('$_apiUrl/api/v0/pubsub/pub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
     final request = http.MultipartRequest('POST', uri);
     request.files.add(http.MultipartFile.fromBytes('data', encryptedEnvelope));
@@ -521,29 +519,29 @@ class IpfsTransport implements PhantomTransport {
             final peerId = peer['ID'] as String?;
             final addrs  = (peer['Addrs'] as List?)?.cast<String>() ?? [];
             if (peerId == null || peerId.isEmpty) continue;
-            // Don't skip peers with empty addrs — _connectById falls back to
-            // /p2p/<id> which uses Kubo's DHT smart-dialer to find addresses.
 
-            // Log the FULL peer ID so the user can compare against the
-            // contact's "my ID" in the transport debugger.
             dbg.log('IPFS: DHT provider $peerId — connecting');
 
-            // If ALL swarm/connect calls timeout but the peer is already in
-            // swarm/peers, it was a pre-existing connection established by the
-            // IPFS daemon (likely a relay/bootstrap node). Detect this case by
-            // checking swarm/peers BEFORE we connect.
             final preExisting = await _verifySwarmConnection(peerId);
             if (preExisting) {
-              // Check if they're subscribed to the contact's message topic.
-              // The real contact will be subscribed; a relay node won't be.
-              final isRealContact = await _checkTopicPeers(contactTopic, dbg);
+              // Peer is in swarm — check if they're also on the gossipsub mesh.
+              // Relay connections can take 10-30s for gossipsub to form, so
+              // don't skip immediately. Poll for up to 10s.
+              bool isRealContact = await _checkTopicPeers(contactTopic, dbg);
+              if (!isRealContact) {
+                dbg.log('IPFS: $peerId in swarm, waiting for gossipsub mesh…');
+                for (int i = 0; i < 5; i++) {
+                  await Future.delayed(const Duration(seconds: 2));
+                  isRealContact = await _checkTopicPeers(contactTopic, dbg);
+                  if (isRealContact) break;
+                }
+              }
               if (isRealContact) {
-                dbg.log('IPFS: $peerId pre-connected AND subscribed — is the contact');
+                dbg.log('IPFS: $peerId confirmed as contact via gossipsub');
                 _swarmConnected.add(peerId);
                 return true;
               }
-              dbg.log('IPFS: $peerId already in swarm but pubsub/peers=0 — '
-                  'likely a relay/bootstrap node, not the contact. Skipping.');
+              dbg.log('IPFS: $peerId in swarm but no gossipsub after 10s — continuing search');
               continue;
             }
 
@@ -551,13 +549,9 @@ class IpfsTransport implements PhantomTransport {
             final connected = await _connectById(peerId, addrs, dbg);
             if (connected) {
               _swarmConnected.add(peerId);
-              // Poll pubsub/peers for up to 6s. For the real contact,
-              // gossipsub subscription exchange happens within ~1s of
-              // connection (it's part of the libp2p identify protocol).
-              // False providers (public nodes not subscribed to Phantom
-              // topics) will always remain at 0.
+              // Poll pubsub/peers for up to 12s for relay connections.
               bool foundContact = false;
-              for (int i = 0; i < 3; i++) {
+              for (int i = 0; i < 6; i++) {
                 await Future.delayed(const Duration(seconds: 2));
                 if (await _checkTopicPeers(contactTopic, dbg)) {
                   dbg.log('IPFS: $peerId confirmed as contact via gossipsub');
@@ -566,12 +560,8 @@ class IpfsTransport implements PhantomTransport {
                 }
               }
               if (foundContact) return true;
-              // No gossipsub after 6s — likely a false provider (public node
-              // that downloaded the rendezvous block via bitswap but isn't
-              // running Phantom). Remove from cache so we retry later.
               _swarmConnected.remove(peerId);
-              dbg.log('IPFS: $peerId — no gossipsub after 6s, likely false '
-                  'provider. Skipping.');
+              dbg.log('IPFS: $peerId — no gossipsub after 12s, likely false provider. Skipping.');
             }
           }
         } catch (_) {}
