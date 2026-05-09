@@ -15,6 +15,7 @@ class TransportDebugger {
   List<String>   get entries => List.unmodifiable(_entries);
 
   void log(String msg) {
+    if (!kDebugMode) return;
     final now = DateTime.now();
     final ts  = '${_p(now.hour)}:${_p(now.minute)}:${_p(now.second)}.${_p2(now.millisecond ~/ 10)}';
     final line = '[$ts] $msg';

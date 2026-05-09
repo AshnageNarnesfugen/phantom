@@ -16,6 +16,12 @@ import 'package:meta/meta.dart';
 
 const int _maxSkip = 1000;
 
+/// After this many sent messages without a reply, stop embedding the X3DH
+/// ephemeral / Kyber ciphertext in outgoing INIT frames. The receiver must
+/// have already processed the first INIT; further re-sends of those keys are
+/// pure overhead and increase fingerprintability.
+const int _maxInitResends = 50;
+
 const _kdfRkInfo  = 'phantom-ratchet-root-key';
 const _kdfCkInfo  = 'phantom-ratchet-chain-key';
 const _kdfMkInfo  = 'phantom-ratchet-message-key';
@@ -114,6 +120,11 @@ class RatchetSession {
   /// Cleared after first encrypt().
   Uint8List? pendingKyberCipherBytes;
 
+  /// Non-null when the X3DH initiator consumed a one-time prekey from the
+  /// remote pool. Embedded in INIT_OPK frames so the responder knows which
+  /// of its OPKs to use for DH4. Cleared after the DH ratchet completes.
+  int? pendingOpkId;
+
   /// True only until the very first message is encrypted and sent.
   /// Used by the transport layer to prioritize handshake-optimized transports.
   bool isNewSession = false;
@@ -138,6 +149,7 @@ class RatchetSession {
     required Uint8List remotePublicKey,
     Uint8List? x3dhEphemeralKeyBytes,
     Uint8List? kyberCipherBytes,
+    int? opkId,
   }) async {
     final dhKP     = await X25519().newKeyPair();
     final dhKPData = await dhKP.extract();
@@ -164,6 +176,7 @@ class RatchetSession {
       .._nextReceivingHeaderKey = hkBtoA        // to decrypt Bob's first reply
       ..pendingX3dhEphemeralKey  = x3dhEphemeralKeyBytes
       ..pendingKyberCipherBytes  = kyberCipherBytes
+      ..pendingOpkId             = opkId
       ..isNewSession = true;
 
     return session;
@@ -207,10 +220,16 @@ class RatchetSession {
     );
     _sendingN++;
 
-    // We no longer clear pending INIT-frame fields here. We keep sending
-    // INIT frames for all messages until the remote party replies (which
-    // triggers _dhRatchet and clears them there). This guarantees session
-    // establishment even if the first few messages are dropped.
+    // Keep embedding INIT keys until either the remote replies (which triggers
+    // _dhRatchet and clears them) OR we have already retransmitted them
+    // [_maxInitResends] times. After that we stop padding outgoing frames with
+    // material the receiver has had ample chance to ingest.
+    if (_sendingN > _maxInitResends) {
+      pendingX3dhEphemeralKey = null;
+      pendingKyberCipherBytes = null;
+      pendingOpkId = null;
+      isNewSession = false;
+    }
 
     final encHeader = await _encryptHeader(header.encode(), _sendingHeaderKey!);
     final nonce     = await _randomNonce();
@@ -288,6 +307,7 @@ class RatchetSession {
     // Remote party has replied, we no longer need to embed INIT keys.
     pendingX3dhEphemeralKey = null;
     pendingKyberCipherBytes = null;
+    pendingOpkId = null;
     isNewSession = false;
 
     // Receiving ratchet step
@@ -521,6 +541,7 @@ class RatchetSession {
       'nrhk':      _nextReceivingHeaderKey != null ? _hexOf(_nextReceivingHeaderKey!) : null,
       'x3dh_ek':    pendingX3dhEphemeralKey != null ? _hexOf(pendingX3dhEphemeralKey!) : null,
       'kyber_cipher': pendingKyberCipherBytes != null ? _hexOf(pendingKyberCipherBytes!) : null,
+      'opk_id': pendingOpkId,
       'sk': Map.fromEntries(_skippedKeys.entries.map((e) => MapEntry(e.key, {
         'ek': _hexOf(e.value.encKey),
         'hk': _hexOf(e.value.headerKey),
@@ -548,6 +569,7 @@ class RatchetSession {
       'nrhk': _nextReceivingHeaderKey != null ? _hexOf(_nextReceivingHeaderKey!) : null,
       'x3dh_ek':      pendingX3dhEphemeralKey  != null ? _hexOf(pendingX3dhEphemeralKey!)  : null,
       'kyber_cipher': pendingKyberCipherBytes   != null ? _hexOf(pendingKyberCipherBytes!)   : null,
+      'opk_id': pendingOpkId,
       'sk': _skippedKeys.map((k, v) => MapEntry(k, {
         'ek': _hexOf(v.encKey),
         'hk': _hexOf(v.headerKey),
@@ -579,6 +601,7 @@ class RatchetSession {
     session._nextReceivingHeaderKey = j['nrhk'] != null ? _unhexOf(j['nrhk'] as String) : null;
     session.pendingX3dhEphemeralKey = j['x3dh_ek']      != null ? _unhexOf(j['x3dh_ek']      as String) : null;
     session.pendingKyberCipherBytes = j['kyber_cipher'] != null ? _unhexOf(j['kyber_cipher'] as String) : null;
+    session.pendingOpkId            = j['opk_id'] as int?;
 
     final skMap = j['sk'] as Map? ?? {};
     for (final entry in skMap.entries) {

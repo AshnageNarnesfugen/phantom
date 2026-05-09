@@ -44,9 +44,14 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
-# Signing — never commit keystores or key.properties
+# Signing — never commit keystores, certificates, or private keys
 *.jks
 *.keystore
+*.pem
+*.p12
+*.pfx
+*.der
+phantom-release.b64
 android/key.properties
 
 # Android Gradle build cache

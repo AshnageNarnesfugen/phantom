@@ -21,9 +21,10 @@ import 'package:bs58check/bs58check.dart' as bs58check;
 ///
 /// The PhantomEnvelope is always opaque (encrypted + MACed).
 
-const int _kInit       = 0x49; // 'I'
-const int _kHybridInit = 0x48; // 'H'
-const int _kMsg        = 0x4D; // 'M'
+const int _kInit          = 0x49; // 'I'
+const int _kHybridInit    = 0x48; // 'H'
+const int _kHybridInitOpk = 0x47; // 'G' — hybrid INIT carrying a one-time prekey id
+const int _kMsg           = 0x4D; // 'M'
 
 class WireFrame {
   const WireFrame._();
@@ -79,6 +80,44 @@ class WireFrame {
     return buf.toBytes();
   }
 
+  /// Hybrid INIT carrying a one-time prekey id consumed by the responder.
+  ///
+  /// Format: [1='G'][32 IK][32 EK][2 kyber_len][kyber][2 CA_len][CA][4 opk_id][payload]
+  static Uint8List wrapHybridInitWithOpk({
+    required Uint8List senderIdentityKeyBytes,
+    required Uint8List senderEphemeralKeyBytes,
+    required Uint8List kyberCipherBytes,
+    required Uint8List senderContactAddressBytes,
+    required int opkId,
+    required Uint8List envelopeBytes,
+  }) {
+    assert(senderIdentityKeyBytes.length  == 32);
+    assert(senderEphemeralKeyBytes.length == 32);
+    assert(opkId >= 0 && opkId <= 0xFFFFFFFF);
+
+    final kyberLen = kyberCipherBytes.length;
+    final caLen    = senderContactAddressBytes.length;
+
+    final buf = BytesBuilder();
+    buf.addByte(_kHybridInitOpk);
+    buf.add(senderIdentityKeyBytes);
+    buf.add(senderEphemeralKeyBytes);
+
+    final klBuf = ByteData(2)..setUint16(0, kyberLen, Endian.big);
+    buf.add(klBuf.buffer.asUint8List());
+    buf.add(kyberCipherBytes);
+
+    final caLenBuf = ByteData(2)..setUint16(0, caLen, Endian.big);
+    buf.add(caLenBuf.buffer.asUint8List());
+    buf.add(senderContactAddressBytes);
+
+    final opkBuf = ByteData(4)..setUint32(0, opkId, Endian.big);
+    buf.add(opkBuf.buffer.asUint8List());
+
+    buf.add(envelopeBytes);
+    return buf.toBytes();
+  }
+
   static Uint8List wrapMsg({required Uint8List envelopeBytes}) {
     final out = Uint8List(1 + envelopeBytes.length);
     out[0] = _kMsg;
@@ -107,8 +146,9 @@ class WireFrame {
         payload:                   Uint8List.fromList(bytes.sublist(230)),
       );
 
-    } else if (type == _kHybridInit) {
-      // [1='H'][32 IK][32 EK][2 kyber_len][kyber][2 CA_len][CA][payload]
+    } else if (type == _kHybridInit || type == _kHybridInitOpk) {
+      // 'H': [1][32 IK][32 EK][2 kyber_len][kyber][2 CA_len][CA][payload]
+      // 'G': [1][32 IK][32 EK][2 kyber_len][kyber][2 CA_len][CA][4 opk_id][payload]
       const base = 1 + 32 + 32; // 65
       if (bytes.length < base + 4) {
         throw FrameException('HYBRID_INIT frame too short: ${bytes.length}');
@@ -129,8 +169,18 @@ class WireFrame {
       if (bytes.length < offset + caLen) {
         throw const FrameException('HYBRID_INIT ContactAddress truncated');
       }
-      final ca      = Uint8List.fromList(bytes.sublist(offset, offset + caLen));
-      offset       += caLen;
+      final ca = Uint8List.fromList(bytes.sublist(offset, offset + caLen));
+      offset  += caLen;
+
+      int? opkId;
+      if (type == _kHybridInitOpk) {
+        if (bytes.length < offset + 4) {
+          throw const FrameException('HYBRID_INIT_OPK opk_id truncated');
+        }
+        opkId = bd.getUint32(offset, Endian.big);
+        offset += 4;
+      }
+
       final payload = Uint8List.fromList(bytes.sublist(offset));
 
       return ParsedFrame._(
@@ -140,6 +190,7 @@ class WireFrame {
         senderEphemeralKeyBytes:   Uint8List.fromList(bytes.sublist(33, 65)),
         kyberCipherBytes:          kyberCipher,
         senderContactAddressBytes: ca,
+        opkId:                     opkId,
         payload:                   payload,
       );
 
@@ -162,10 +213,12 @@ class ParsedFrame {
   final bool isHybrid;
   final Uint8List? senderIdentityKeyBytes;
   final Uint8List? senderEphemeralKeyBytes;
-  /// Raw ContactAddress bytes (v1=165 B, v2=1349 B). Present on INIT frames only.
+  /// Raw ContactAddress bytes (v1=165 B, v2=1349 B, v3=1413 B). Present on INIT frames only.
   final Uint8List? senderContactAddressBytes;
   /// Kyber-768 ciphertext (1088 bytes). Present on HYBRID_INIT frames only.
   final Uint8List? kyberCipherBytes;
+  /// One-time prekey id consumed for X3DH DH4. Present on HYBRID_INIT_OPK only.
+  final int? opkId;
   final Uint8List payload;
 
   ParsedFrame._({
@@ -175,6 +228,7 @@ class ParsedFrame {
     this.senderEphemeralKeyBytes,
     this.senderContactAddressBytes,
     this.kyberCipherBytes,
+    this.opkId,
     required this.payload,
   });
 

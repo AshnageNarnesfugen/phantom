@@ -19,11 +19,14 @@ class BackupManager {
 
   /// Serialize and encrypt all account data to a transferable backup blob.
   ///
-  /// Returns the path of the written file.
+  /// Returns the path of the written file. By default writes to the app's
+  /// private documents directory. Set [useExternalStorage] to true to write
+  /// to shared external storage (visible to other apps with READ_EXTERNAL_STORAGE).
   static Future<String> exportBackup({
     required PhantomStorage storage,
     required String seedPhrase,
     required String phantomId,
+    bool useExternalStorage = false,
   }) async {
     final contacts = await storage.getAllContacts();
 
@@ -58,7 +61,7 @@ class BackupManager {
     final plaintext = Uint8List.fromList(utf8.encode(jsonEncode(payload)));
     final encrypted = await _encrypt(plaintext, seedPhrase);
 
-    final dir  = await _backupDir();
+    final dir  = await _backupDir(useExternal: useExternalStorage);
     final file = File('${dir.path}/$_fileName');
     await file.writeAsBytes(encrypted, flush: true);
     return file.path;
@@ -115,28 +118,33 @@ class BackupManager {
   }
 
   /// Returns the backup file if it exists in the expected location, else null.
+  /// Checks the documents dir first, then external storage.
   static Future<File?> findBackupFile() async {
-    try {
-      final path = await backupFilePath();
-      final file = File(path);
-      if (await file.exists()) return file;
-    } catch (_) {}
+    for (final useExt in [false, true]) {
+      try {
+        final path = await backupFilePath(useExternalStorage: useExt);
+        final file = File(path);
+        if (await file.exists()) return file;
+      } catch (_) {}
+    }
     return null;
   }
 
   /// Full path where the backup file will be written / looked for.
-  static Future<String> backupFilePath() async {
-    final dir = await _backupDir();
+  static Future<String> backupFilePath({bool useExternalStorage = false}) async {
+    final dir = await _backupDir(useExternal: useExternalStorage);
     return '${dir.path}/$_fileName';
   }
 
   // ── Internals ──────────────────────────────────────────────────────────────
 
-  static Future<Directory> _backupDir() async {
-    try {
-      final ext = await getExternalStorageDirectory();
-      if (ext != null) return ext;
-    } catch (_) {}
+  static Future<Directory> _backupDir({bool useExternal = false}) async {
+    if (useExternal) {
+      try {
+        final ext = await getExternalStorageDirectory();
+        if (ext != null) return ext;
+      } catch (_) {}
+    }
     return getApplicationDocumentsDirectory();
   }
 

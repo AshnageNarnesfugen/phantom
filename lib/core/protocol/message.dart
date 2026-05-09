@@ -10,7 +10,9 @@ import '../crypto/double_ratchet.dart';
 /// Privacy guarantees:
 ///   - No sender in the envelope (sealed sender)
 ///   - No real timestamps (±5 min noise)
-///   - Fixed 1 KB block padding — all messages are the same size on the wire
+///   - 1 KB block padding — message length is always a multiple of 1 KB so
+///     small messages within the same KB-class look identical on the wire.
+///     Note: large payloads (e.g. images) still reveal an approximate size class.
 ///   - No session metadata in the wire format
 ///   - Envelope MAC via ChaCha20-Poly1305 AEAD (covers header + ciphertext)
 
@@ -30,7 +32,8 @@ enum MessageType {
   bundleUpdate(0x21),
   avatarData(0x30),
   aliasData(0x31),
-  connectivityInfo(0x32);
+  connectivityInfo(0x32),
+  preKeyShare(0x33);
 
   final int code;
   const MessageType(this.code);

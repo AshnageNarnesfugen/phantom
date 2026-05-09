@@ -43,6 +43,11 @@ class PreKeyBundle {
   /// that have been initialised with quantum-resistant key generation.
   final Uint8List? kyber768PublicKeyBytes;
 
+  /// Optional Ed25519 signature over [identityKeyBytes] using [signingKeyBytes].
+  /// Present in CA v3 — proves the bundle's signing key vouches for the X25519
+  /// identity key, closing the gap left by deriving PhantomID from IK alone.
+  final Uint8List? identityKeySignature;
+
   const PreKeyBundle({
     required this.identityKeyBytes,
     required this.signingKeyBytes,
@@ -51,6 +56,7 @@ class PreKeyBundle {
     required this.signedPreKeySignature,
     required this.oneTimePreKeys,
     this.kyber768PublicKeyBytes,
+    this.identityKeySignature,
   });
 
   Map<String, dynamic> toJson() => {
@@ -64,6 +70,8 @@ class PreKeyBundle {
             .toList(),
         if (kyber768PublicKeyBytes != null)
           'kyber768_pk': _hex(kyber768PublicKeyBytes!),
+        if (identityKeySignature != null)
+          'ik_sig': _hex(identityKeySignature!),
       };
 
   static PreKeyBundle fromJson(Map<String, dynamic> j) => PreKeyBundle(
@@ -81,6 +89,9 @@ class PreKeyBundle {
         kyber768PublicKeyBytes: j['kyber768_pk'] != null
             ? _unhex(j['kyber768_pk'] as String)
             : null,
+        identityKeySignature: j['ik_sig'] != null
+            ? _unhex(j['ik_sig'] as String)
+            : null,
       );
 }
 
@@ -95,6 +106,13 @@ class PreKeyBundle {
 ///   [1 version=0x02][32 x25519_ik][32 ed25519_sk][32 spk][4 spk_id][64 sig]
 ///   [1184 kyber768_pk]
 ///
+/// Wire format v3 — adds Ed25519 signature over IK (1413 bytes):
+///   [1 version=0x03][32 x25519_ik][32 ed25519_sk][32 spk][4 spk_id][64 spk_sig]
+///   [1184 kyber768_pk][64 ik_sig]
+///   ik_sig = Ed25519_sign(x25519_ik, ed25519_sk_priv) — proves common control
+///   of the X25519 identity key and the Ed25519 signing key. PhantomID still
+///   derives from x25519_ik so the binding is bidirectional.
+///
 /// The PhantomID is DERIVED from x25519_ik so it is not stored separately.
 @immutable
 class ContactAddress {
@@ -105,9 +123,12 @@ class ContactAddress {
   final Uint8List signature;              // 64 bytes
   /// Kyber-768 public key (1184 bytes). Null for v1 addresses.
   final Uint8List? kyber768PublicKeyBytes;
+  /// Ed25519 signature over [x25519IdentityKey]. Non-null for v3 addresses.
+  final Uint8List? identityKeySignature;
 
   static const _v1Len = 165;
   static const _v2Len = 1349; // 165 + 1184
+  static const _v3Len = 1413; // 1349 + 64
 
   const ContactAddress({
     required this.x25519IdentityKey,
@@ -116,6 +137,7 @@ class ContactAddress {
     required this.signedPreKeyId,
     required this.signature,
     this.kyber768PublicKeyBytes,
+    this.identityKeySignature,
   });
 
   /// PhantomID derived from the X25519 identity key.
@@ -134,10 +156,23 @@ class ContactAddress {
         signedPreKeySignature:  signature,
         oneTimePreKeys:         const [],
         kyber768PublicKeyBytes: kyber768PublicKeyBytes,
+        identityKeySignature:   identityKeySignature,
       );
 
   String encode() {
-    if (kyber768PublicKeyBytes != null) {
+    if (kyber768PublicKeyBytes != null && identityKeySignature != null) {
+      // v3: 1413 bytes
+      final buf = ByteData(_v3Len);
+      buf.setUint8(0, 0x03);
+      _setBytes(buf, 1,    x25519IdentityKey,        32);
+      _setBytes(buf, 33,   ed25519SigningKey,         32);
+      _setBytes(buf, 65,   signedPreKeyBytes,         32);
+      buf.setUint32(97, signedPreKeyId, Endian.big);
+      _setBytes(buf, 101,  signature,                 64);
+      _setBytes(buf, 165,  kyber768PublicKeyBytes!, 1184);
+      _setBytes(buf, 1349, identityKeySignature!,    64);
+      return base64Url.encode(buf.buffer.asUint8List()).replaceAll('=', '');
+    } else if (kyber768PublicKeyBytes != null) {
       // v2: 1349 bytes
       final buf = ByteData(_v2Len);
       buf.setUint8(0, 0x02);
@@ -188,11 +223,41 @@ class ContactAddress {
           signature:                Uint8List.fromList(bytes.sublist(101,  165)),
           kyber768PublicKeyBytes:   Uint8List.fromList(bytes.sublist(165, 1349)),
         );
+      } else if (version == 0x03 && bytes.length >= _v3Len) {
+        final addr = ContactAddress(
+          x25519IdentityKey:       Uint8List.fromList(bytes.sublist(1,    33)),
+          ed25519SigningKey:        Uint8List.fromList(bytes.sublist(33,   65)),
+          signedPreKeyBytes:        Uint8List.fromList(bytes.sublist(65,   97)),
+          signedPreKeyId:           view.getUint32(97, Endian.big),
+          signature:                Uint8List.fromList(bytes.sublist(101,  165)),
+          kyber768PublicKeyBytes:   Uint8List.fromList(bytes.sublist(165, 1349)),
+          identityKeySignature:     Uint8List.fromList(bytes.sublist(1349, 1413)),
+        );
+        // Reject up front if the IK signature does not bind the SK to the IK.
+        // The verification is async so it lives on the awaitable verify() helper —
+        // callers (addContact / _buildContactFromInit) are expected to call it.
+        return addr;
       } else {
         throw const FormatException('Unknown ContactAddress version');
       }
     } catch (e) {
       throw InvalidPhantomIdException('Invalid contact address: $e');
+    }
+  }
+
+  /// Returns true if the [identityKeySignature] correctly binds [ed25519SigningKey]
+  /// to [x25519IdentityKey]. Returns true when the address has no ik_sig (v1/v2) so
+  /// existing contacts continue to work.
+  Future<bool> verifyIdentityBinding() async {
+    if (identityKeySignature == null) return true;
+    try {
+      final pub = SimplePublicKey(ed25519SigningKey, type: KeyPairType.ed25519);
+      return await Ed25519().verify(
+        x25519IdentityKey,
+        signature: Signature(identityKeySignature!, publicKey: pub),
+      );
+    } catch (_) {
+      return false;
     }
   }
 

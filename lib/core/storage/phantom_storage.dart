@@ -193,6 +193,58 @@ class PhantomStorage {
     await savePreKeyStore(store.withoutOneTimePreKey(id));
   }
 
+  // ── Remote OPK pool (per-contact, piggy-backed via preKeyShare) ──────────────
+  // Caches recent X25519 public OPKs advertised by [contactId]. The initiator
+  // pops one when starting a fresh session and embeds its id in the INIT_OPK
+  // frame; the responder looks the id up in its local OPK private pool.
+  // Bounded so a misbehaving contact cannot grow storage indefinitely.
+
+  static const _remoteOpkCacheSize = 5;
+
+  Future<List<({int id, Uint8List pub, int rxAtUs})>> getRemoteOpks(String contactId) async {
+    final raw = await getSetting<List<dynamic>>('opks_$contactId');
+    if (raw == null) return const [];
+    return raw.map((e) {
+      final m = Map<String, dynamic>.from(e as Map);
+      return (
+        id: m['id'] as int,
+        pub: base64.decode(m['pub'] as String),
+        rxAtUs: m['rx'] as int,
+      );
+    }).toList();
+  }
+
+  Future<void> _saveRemoteOpks(
+      String contactId, List<({int id, Uint8List pub, int rxAtUs})> list) async {
+    final encoded = list
+        .map((e) => {
+              'id':  e.id,
+              'pub': base64.encode(e.pub),
+              'rx':  e.rxAtUs,
+            })
+        .toList();
+    await setSetting('opks_$contactId', encoded);
+  }
+
+  Future<void> addRemoteOpk(String contactId, int id, Uint8List pub) async {
+    final list = await getRemoteOpks(contactId);
+    list.removeWhere((e) => e.id == id); // dedupe
+    list.add((id: id, pub: pub, rxAtUs: DateTime.now().microsecondsSinceEpoch));
+    while (list.length > _remoteOpkCacheSize) {
+      list.removeAt(0);
+    }
+    await _saveRemoteOpks(contactId, list);
+  }
+
+  /// Returns and removes the newest cached OPK for [contactId], or null.
+  Future<({int id, Uint8List pub})?> popRemoteOpk(String contactId) async {
+    final list = await getRemoteOpks(contactId);
+    if (list.isEmpty) return null;
+    final picked = list.removeLast();
+    await _saveRemoteOpks(contactId, list);
+    return (id: picked.id, pub: picked.pub);
+  }
+
   // ── Own public bundle ────────────────────────────────────────────────────────
 
   Future<void> saveOwnBundle(Map<String, dynamic> bundleJson) async {
@@ -261,15 +313,44 @@ class PhantomStorage {
   }
 
   // ── INIT replay detection ─────────────────────────────────────────────────────
-  // Stores the hex of the last X3DH ephemeral key we accepted for each contact.
-  // When an INIT arrives with the SAME ephemeral key it is an ntfy replay —
-  // the existing session must not be overwritten.
+  // Stores the hex of recent X3DH ephemeral keys we have accepted for each
+  // contact (bounded LRU, newest last). When an INIT arrives with an EK in
+  // the cache it is treated as a replay and the existing session is preserved.
+  // Bounded so a malicious sender cannot grow storage indefinitely.
 
-  Future<String?> getLastInitEkHex(String contactId) =>
-      getSetting<String>('init_ek_$contactId');
+  static const _initEkCacheSize = 16;
 
-  Future<void> setLastInitEkHex(String contactId, String ekHex) =>
-      setSetting('init_ek_$contactId', ekHex);
+  /// Returns the most recent EK hex (or null). Kept for backwards compatibility.
+  Future<String?> getLastInitEkHex(String contactId) async {
+    final list = await _getInitEkList(contactId);
+    return list.isEmpty ? null : list.last;
+  }
+
+  /// True if [ekHex] has been observed in the recent INIT cache for [contactId].
+  Future<bool> isKnownInitEk(String contactId, String ekHex) async {
+    final list = await _getInitEkList(contactId);
+    return list.contains(ekHex);
+  }
+
+  /// Records an accepted INIT EK in the bounded LRU cache.
+  Future<void> setLastInitEkHex(String contactId, String ekHex) async {
+    final list = await _getInitEkList(contactId);
+    list.remove(ekHex); // dedupe + move to end (most recent)
+    list.add(ekHex);
+    while (list.length > _initEkCacheSize) {
+      list.removeAt(0);
+    }
+    await setSetting('init_ek_list_$contactId', list);
+  }
+
+  Future<List<String>> _getInitEkList(String contactId) async {
+    final raw = await getSetting<List<dynamic>>('init_ek_list_$contactId');
+    if (raw != null) return raw.map((e) => e as String).toList();
+    // Migrate legacy single-value 'init_ek_<id>' setting if present.
+    final legacy = await getSetting<String>('init_ek_$contactId');
+    if (legacy != null) return [legacy];
+    return [];
+  }
 
   Future<String> getWallpaperFit(String? contactId) async {
     final key = contactId == null ? 'wp_fit_global' : 'wp_fit_$contactId';
@@ -426,6 +507,11 @@ class ContactRecord {
   /// quantum-resistant session establishment (ContactAddress v2).
   final Uint8List? kyber768PublicKeyBytes;
 
+  /// Ed25519 signature over [encryptionPublicKeyBytes] using
+  /// [signingPublicKeyBytes]. Present only when the contact was added via a
+  /// CA v3 address (or an INIT carrying one).
+  final Uint8List? identityKeySignature;
+
   final int addedAtUs;
   final bool isVerified;
   final bool isArchived;
@@ -447,6 +533,7 @@ class ContactRecord {
     required this.signedPreKeyId,
     required this.signedPreKeySignature,
     this.kyber768PublicKeyBytes,
+    this.identityKeySignature,
     int? addedAtUs,
     this.isVerified = false,
     this.isArchived = false,
@@ -474,6 +561,8 @@ class ContactRecord {
         'arch':   isArchived,
         if (kyber768PublicKeyBytes != null)
           'kyber768_pk': base64.encode(kyber768PublicKeyBytes!),
+        if (identityKeySignature != null)
+          'ik_sig': base64.encode(identityKeySignature!),
         if (sharedAlias != null) 'shared_alias': sharedAlias,
         if (ipfsPeerId != null) 'ipfs_peer_id': ipfsPeerId,
         if (yggdrasilAddress != null) 'ygg_addr': yggdrasilAddress,
@@ -491,6 +580,9 @@ class ContactRecord {
         signedPreKeySignature:    base64.decode((j['sig'] as String?) ?? base64.encode(Uint8List(64))),
         kyber768PublicKeyBytes:   j['kyber768_pk'] != null
             ? base64.decode(j['kyber768_pk'] as String)
+            : null,
+        identityKeySignature:     j['ik_sig'] != null
+            ? base64.decode(j['ik_sig'] as String)
             : null,
         addedAtUs:                j['added']  as int,
         isVerified:               j['ver']    as bool? ?? false,
@@ -518,6 +610,7 @@ class ContactRecord {
         signedPreKeyId:           signedPreKeyId,
         signedPreKeySignature:    signedPreKeySignature,
         kyber768PublicKeyBytes:   kyber768PublicKeyBytes,
+        identityKeySignature:     identityKeySignature,
         addedAtUs:                addedAtUs,
         isVerified:               isVerified  ?? this.isVerified,
         isArchived:               isArchived  ?? this.isArchived,
@@ -535,12 +628,28 @@ class PreKeyStore {
   final int signedPreKeyId;
   final Map<int, Uint8List> oneTimePreKeyPrivates;
 
+  /// Microseconds-since-epoch the active SPK was generated. Used by the rotation
+  /// scheduler in `PhantomCore._maybeRotateSignedPreKey`.
+  final int signedPreKeyCreatedAtUs;
+
+  /// Previous SPK kept around for a grace period so INITs encrypted to the old
+  /// SPK still decrypt after rotation. All four fields are non-null together.
+  final Uint8List? previousSignedPreKeyPrivate;
+  final Uint8List? previousSignedPreKeyPublic;
+  final int? previousSignedPreKeyId;
+  final int? previousSignedPreKeyRetiredAtUs;
+
   const PreKeyStore({
     required this.signedPreKeyPrivate,
     required this.signedPreKeyPublic,
     required this.signedPreKeyId,
     required this.oneTimePreKeyPrivates,
-  });
+    int? signedPreKeyCreatedAtUs,
+    this.previousSignedPreKeyPrivate,
+    this.previousSignedPreKeyPublic,
+    this.previousSignedPreKeyId,
+    this.previousSignedPreKeyRetiredAtUs,
+  }) : signedPreKeyCreatedAtUs = signedPreKeyCreatedAtUs ?? 0;
 
   PreKeyStore withoutOneTimePreKey(int id) {
     final updated = Map<int, Uint8List>.from(oneTimePreKeyPrivates)..remove(id);
@@ -549,6 +658,11 @@ class PreKeyStore {
       signedPreKeyPublic:   signedPreKeyPublic,
       signedPreKeyId:       signedPreKeyId,
       oneTimePreKeyPrivates: updated,
+      signedPreKeyCreatedAtUs:        signedPreKeyCreatedAtUs,
+      previousSignedPreKeyPrivate:    previousSignedPreKeyPrivate,
+      previousSignedPreKeyPublic:     previousSignedPreKeyPublic,
+      previousSignedPreKeyId:         previousSignedPreKeyId,
+      previousSignedPreKeyRetiredAtUs: previousSignedPreKeyRetiredAtUs,
     );
   }
 
@@ -558,6 +672,15 @@ class PreKeyStore {
         'spk_priv': base64.encode(signedPreKeyPrivate),
         'spk_pub':  base64.encode(signedPreKeyPublic),
         'spk_id':   signedPreKeyId,
+        'spk_created_us': signedPreKeyCreatedAtUs,
+        if (previousSignedPreKeyPrivate != null)
+          'prev_spk_priv': base64.encode(previousSignedPreKeyPrivate!),
+        if (previousSignedPreKeyPublic != null)
+          'prev_spk_pub': base64.encode(previousSignedPreKeyPublic!),
+        if (previousSignedPreKeyId != null)
+          'prev_spk_id': previousSignedPreKeyId,
+        if (previousSignedPreKeyRetiredAtUs != null)
+          'prev_spk_retired_us': previousSignedPreKeyRetiredAtUs,
         'opks':     oneTimePreKeyPrivates.map(
           (id, priv) => MapEntry(id.toString(), base64.encode(priv)),
         ),
@@ -569,6 +692,15 @@ class PreKeyStore {
       signedPreKeyPrivate:  base64.decode(j['spk_priv'] as String),
       signedPreKeyPublic:   base64.decode((j['spk_pub'] as String?) ?? base64.encode(Uint8List(32))),
       signedPreKeyId:       j['spk_id'] as int,
+      signedPreKeyCreatedAtUs: (j['spk_created_us'] as int?) ?? 0,
+      previousSignedPreKeyPrivate: j['prev_spk_priv'] != null
+          ? base64.decode(j['prev_spk_priv'] as String)
+          : null,
+      previousSignedPreKeyPublic: j['prev_spk_pub'] != null
+          ? base64.decode(j['prev_spk_pub'] as String)
+          : null,
+      previousSignedPreKeyId: j['prev_spk_id'] as int?,
+      previousSignedPreKeyRetiredAtUs: j['prev_spk_retired_us'] as int?,
       oneTimePreKeyPrivates: opksRaw.map(
         (k, v) => MapEntry(int.parse(k as String), base64.decode(v as String)),
       ),

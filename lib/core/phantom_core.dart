@@ -71,6 +71,26 @@ class PhantomCore {
   String? _activeChatId;
   void setActiveChat(String? contactId) => _activeChatId = contactId;
 
+  // ── INIT rate limit ──────────────────────────────────────────────────────────
+  // Sliding-window counter of fresh INITs per sender. Caps the cost of X3DH
+  // respond + Kyber decapsulation an attacker can force on us by spamming
+  // valid-format INIT frames with random ephemeral keys. Replays (known EK) and
+  // hybrid INITs that reuse the same EK don't count — they short-circuit before
+  // hitting this guard.
+  static const _initRateMax = 8;
+  static const _initRateWindow = Duration(seconds: 60);
+  final Map<String, List<DateTime>> _initTimestamps = {};
+
+  bool _shouldAcceptInit(String senderId) {
+    final now = DateTime.now();
+    final windowStart = now.subtract(_initRateWindow);
+    final list = _initTimestamps.putIfAbsent(senderId, () => <DateTime>[]);
+    list.removeWhere((t) => t.isBefore(windowStart));
+    if (list.length >= _initRateMax) return false;
+    list.add(now);
+    return true;
+  }
+
   TransportStatus? get transportStatus => _transportV2?.status;
   Stream<TransportMode> get transportModeChanges =>
       _transportV2?.modeChanges ?? const Stream.empty();
@@ -108,6 +128,7 @@ class PhantomCore {
     // Derive Kyber-768 keypair deterministically from the seed phrase.
     await core._initKyberKeys(result.seedPhrase);
     await core._initializePreKeys();
+    await core._maybeRotateSignedPreKey();
     await core._startTransport();
     await core._startPresence();
 
@@ -148,6 +169,7 @@ class PhantomCore {
     if (existing == null) {
       await core._initializePreKeys();
     }
+    await core._maybeRotateSignedPreKey();
 
     // Load all known sessions into memory BEFORE the transport starts so that
     // any queued or in-flight MSG frames are decryptable immediately.
@@ -219,6 +241,7 @@ class PhantomCore {
       signedPreKeyId:          bundle.signedPreKeyId,
       signature:               bundle.signedPreKeySignature,
       kyber768PublicKeyBytes:  bundle.kyber768PublicKeyBytes,
+      identityKeySignature:    bundle.identityKeySignature,
     );
     String res = ca.encode();
 
@@ -247,10 +270,19 @@ class PhantomCore {
   }
 
   String? _cachedIpfsPeerId;
+  DateTime? _cachedIpfsPeerIdAt;
+  static const _ipfsPeerIdCacheTtl = Duration(minutes: 5);
 
   /// Returns our IPFS peer ID if the daemon is reachable.
+  /// Cached for [_ipfsPeerIdCacheTtl] so a daemon restart (which produces a new
+  /// session-scoped peer ID) is detected within a few minutes.
   Future<String?> getMyIpfsPeerId() async {
-    if (_cachedIpfsPeerId != null) return _cachedIpfsPeerId;
+    final now = DateTime.now();
+    if (_cachedIpfsPeerId != null &&
+        _cachedIpfsPeerIdAt != null &&
+        now.difference(_cachedIpfsPeerIdAt!) < _ipfsPeerIdCacheTtl) {
+      return _cachedIpfsPeerId;
+    }
     if (_ipfsApiUrl == null) return null;
     try {
       final resp = await http
@@ -258,6 +290,7 @@ class PhantomCore {
           .timeout(const Duration(seconds: 3));
       if (resp.statusCode == 200) {
         _cachedIpfsPeerId = jsonDecode(resp.body)['ID'] as String?;
+        _cachedIpfsPeerIdAt = now;
         return _cachedIpfsPeerId;
       }
     } catch (_) {}
@@ -332,9 +365,10 @@ class PhantomCore {
     // to embed our ephemeral keys.
     bool isHandshake = session.pendingX3dhEphemeralKey != null;
 
-    // Capture BEFORE encode() calls session.encrypt(), which clears both fields.
+    // Capture BEFORE encode() calls session.encrypt(), which clears these.
     final x3dhEk      = session.pendingX3dhEphemeralKey;
     final kyberCipher = session.pendingKyberCipherBytes;
+    final opkId       = session.pendingOpkId;
     final envelopeBytes = await protocol.encode(message);
 
     // Wrap in INIT frame on the first message (includes our full ContactAddress
@@ -342,7 +376,16 @@ class PhantomCore {
     final Uint8List wire;
     if (x3dhEk != null) {
       final caBytes = await _getMyContactAddressBytes();
-      if (kyberCipher != null) {
+      if (kyberCipher != null && opkId != null) {
+        wire = WireFrame.wrapHybridInitWithOpk(
+          senderIdentityKeyBytes:    identity.encryptionPublicKeyBytes,
+          senderEphemeralKeyBytes:   x3dhEk,
+          kyberCipherBytes:          kyberCipher,
+          senderContactAddressBytes: caBytes,
+          opkId:                     opkId,
+          envelopeBytes:             envelopeBytes,
+        );
+      } else if (kyberCipher != null) {
         wire = WireFrame.wrapHybridInit(
           senderIdentityKeyBytes:    identity.encryptionPublicKeyBytes,
           senderEphemeralKeyBytes:   x3dhEk,
@@ -371,8 +414,14 @@ class PhantomCore {
       direction:      MessageDirection.outgoing,
       status:         MessageStatus.sending,
     );
-    // System/protocol messages (avatar, alias) are not part of the chat history.
-    const systemTypes = {MessageType.avatarData, MessageType.aliasData, MessageType.readReceipt, MessageType.connectivityInfo};
+    // System/protocol messages are not part of the chat history.
+    const systemTypes = {
+      MessageType.avatarData,
+      MessageType.aliasData,
+      MessageType.readReceipt,
+      MessageType.connectivityInfo,
+      MessageType.preKeyShare,
+    };
     if (!systemTypes.contains(message.type)) {
       await storage.saveMessage(stored);
     }
@@ -399,7 +448,9 @@ class PhantomCore {
               : MessageStatus.failed;
           await storage.updateMessageStatus(recipientId, message.id, status);
 
-          if (isHandshake && status == MessageStatus.sent && message.type != MessageType.connectivityInfo) {
+          if (isHandshake && status == MessageStatus.sent &&
+              message.type != MessageType.connectivityInfo &&
+              message.type != MessageType.preKeyShare) {
             final dbg = TransportDebugger.instance;
             dbg.log('DBG: before _sendConnectivityInfo, session.pendingX3dhEk is null? ${session.pendingX3dhEphemeralKey == null}');
             unawaited(_sendConnectivityInfo(recipientId));
@@ -414,7 +465,9 @@ class PhantomCore {
           );
           await storage.updateMessageStatus(recipientId, message.id, MessageStatus.sent);
 
-          if (isHandshake && message.type != MessageType.connectivityInfo) {
+          if (isHandshake &&
+              message.type != MessageType.connectivityInfo &&
+              message.type != MessageType.preKeyShare) {
             final dbg = TransportDebugger.instance;
             dbg.log('DBG: before _sendConnectivityInfo, session.pendingX3dhEk is null? ${session.pendingX3dhEphemeralKey == null}');
             unawaited(_sendConnectivityInfo(recipientId));
@@ -444,13 +497,27 @@ class PhantomCore {
   }
 
   /// Builds the raw ContactAddress bytes for inclusion in INIT frames.
-  /// Returns v2 (1349 bytes) when Kyber-768 keys are available, v1 (165 bytes) otherwise.
+  /// Prefers v3 (1413 B, with IK↔SK signature) when both Kyber and ik_sig are
+  /// available; falls back to v2 (1349 B) for Kyber-only and v1 (165 B) otherwise.
   Future<Uint8List> _getMyContactAddressBytes() async {
     final bundleJson = await storage.getOwnBundle();
     if (bundleJson == null) return Uint8List(165);
     final bundle = PreKeyBundle.fromJson(bundleJson);
 
-    if (_kyberPublicKeyBytes != null) {
+    if (_kyberPublicKeyBytes != null && bundle.identityKeySignature != null) {
+      // v3: [1=0x03][32 ik][32 sk][32 spk][4 spk_id][64 sig][1184 kyber_pk][64 ik_sig]
+      const len = 1413;
+      final buf = ByteData(len);
+      buf.setUint8(0, 0x03);
+      _setBytesInBuf(buf, 1,    bundle.identityKeyBytes,      32);
+      _setBytesInBuf(buf, 33,   bundle.signingKeyBytes,        32);
+      _setBytesInBuf(buf, 65,   bundle.signedPreKeyBytes,      32);
+      buf.setUint32(97, bundle.signedPreKeyId, Endian.big);
+      _setBytesInBuf(buf, 101,  bundle.signedPreKeySignature,  64);
+      _setBytesInBuf(buf, 165,  _kyberPublicKeyBytes!,       1184);
+      _setBytesInBuf(buf, 1349, bundle.identityKeySignature!,  64);
+      return buf.buffer.asUint8List();
+    } else if (_kyberPublicKeyBytes != null) {
       // v2: [1=0x02][32 ik][32 sk][32 spk][4 spk_id][64 sig][1184 kyber_pk]
       const len = 1349;
       final buf = ByteData(len);
@@ -516,7 +583,12 @@ class PhantomCore {
       }
     }
 
-    final ca      = ContactAddress.decode(caStr);
+    final ca = ContactAddress.decode(caStr);
+    if (!await ca.verifyIdentityBinding()) {
+      throw const PhantomCoreException(
+        'Invalid contact address: identity key signature does not match.',
+      );
+    }
     final contact = ContactRecord(
       phantomId:                ca.phantomId,
       nickname:                 nickname,
@@ -526,6 +598,7 @@ class PhantomCore {
       signedPreKeyId:          ca.signedPreKeyId,
       signedPreKeySignature:    ca.signature,
       kyber768PublicKeyBytes:   ca.kyber768PublicKeyBytes,
+      identityKeySignature:     ca.identityKeySignature,
       ipfsPeerId:               finalIpfsPeerId,
       yggdrasilAddress:         yggAddr,
       i2pDestination:           i2pDest,
@@ -609,106 +682,108 @@ class PhantomCore {
     final ipfsApiUrl = _ipfsApiUrl ?? 'http://127.0.0.1:5001';
     final client = http.Client();
 
-    dbg.log('REVIVE: starting for $short');
-    yield 'Disconnecting from peer…';
-
-    // Step 1: Force disconnect from the peer
     try {
-      final knownPeerId = _getContactIpfsPeerId(contactId);
-      if (knownPeerId != null) {
-        await client.post(Uri.parse(
-            '$ipfsApiUrl/api/v0/swarm/disconnect?arg=/p2p/$knownPeerId'))
-            .timeout(const Duration(seconds: 5));
-        dbg.log('REVIVE: disconnected from $knownPeerId');
-      }
-    } catch (_) {}
-    await Future.delayed(const Duration(seconds: 2));
+      dbg.log('REVIVE: starting for $short');
+      yield 'Disconnecting from peer…';
 
-    // Step 2: Kill all existing cross-subscriptions and re-subscribe
-    yield 'Re-subscribing to topic…';
-    for (final t in transport.transports) {
-      if (t is IpfsTransport) {
-        final topic = 'msg$contactId';
-        await t.forceResubscribePublic(topic);
-      }
-    }
-    await Future.delayed(const Duration(seconds: 1));
-
-    // Step 3: Force reconnect via swarm/connect
-    yield 'Reconnecting to peer…';
-    try {
-      final knownPeerId = _getContactIpfsPeerId(contactId);
-      if (knownPeerId != null) {
-        await client.post(Uri.parse(
-            '$ipfsApiUrl/api/v0/swarm/connect?arg=/p2p/$knownPeerId'))
-            .timeout(const Duration(seconds: 10));
-        dbg.log('REVIVE: reconnected to $knownPeerId');
-      }
-    } catch (_) {}
-
-    // Step 4: Poll for GossipSub mesh formation — up to 90 seconds
-    yield 'Waiting for GossipSub mesh…';
-    final topic = 'msg$contactId';
-    final encodedTopic = 'u${base64Url.encode(utf8.encode(topic)).replaceAll('=', '')}';
-    bool meshFormed = false;
-
-    for (int i = 0; i < 45; i++) {
-      await Future.delayed(const Duration(seconds: 2));
+      // Step 1: Force disconnect from the peer
       try {
-        final r = await client.post(Uri.parse(
-            '$ipfsApiUrl/api/v0/pubsub/peers?arg=${Uri.encodeComponent(encodedTopic)}'))
-            .timeout(const Duration(seconds: 3));
-        if (r.statusCode == 200) {
-          final strings = (jsonDecode(r.body)['Strings'] as List?) ?? [];
-          if (strings.isNotEmpty) {
-            meshFormed = true;
-            dbg.log('REVIVE: ✓ gossipsub mesh formed! (${strings.length} peer(s))');
-            break;
-          }
+        final knownPeerId = _getContactIpfsPeerId(contactId);
+        if (knownPeerId != null) {
+          await client.post(Uri.parse(
+              '$ipfsApiUrl/api/v0/swarm/disconnect?arg=/p2p/$knownPeerId'))
+              .timeout(const Duration(seconds: 5));
+          dbg.log('REVIVE: disconnected from $knownPeerId');
+        }
+      } catch (_) {}
+      await Future.delayed(const Duration(seconds: 2));
+
+      // Step 2: Kill all existing cross-subscriptions and re-subscribe
+      yield 'Re-subscribing to topic…';
+      for (final t in transport.transports) {
+        if (t is IpfsTransport) {
+          final topic = 'msg$contactId';
+          await t.forceResubscribePublic(topic);
+        }
+      }
+      await Future.delayed(const Duration(seconds: 1));
+
+      // Step 3: Force reconnect via swarm/connect
+      yield 'Reconnecting to peer…';
+      try {
+        final knownPeerId = _getContactIpfsPeerId(contactId);
+        if (knownPeerId != null) {
+          await client.post(Uri.parse(
+              '$ipfsApiUrl/api/v0/swarm/connect?arg=/p2p/$knownPeerId'))
+              .timeout(const Duration(seconds: 10));
+          dbg.log('REVIVE: reconnected to $knownPeerId');
         }
       } catch (_) {}
 
-      // Every 10 seconds, force re-subscribe + reconnect
-      if (i % 5 == 4) {
-        yield 'Retrying connection (${i * 2}s)…';
-        for (final t in transport.transports) {
-          if (t is IpfsTransport) {
-            await t.forceResubscribePublic(topic);
-          }
-        }
+      // Step 4: Poll for GossipSub mesh formation — up to 90 seconds
+      yield 'Waiting for GossipSub mesh…';
+      final topic = 'msg$contactId';
+      final encodedTopic = 'u${base64Url.encode(utf8.encode(topic)).replaceAll('=', '')}';
+      bool meshFormed = false;
+
+      for (int i = 0; i < 45; i++) {
+        await Future.delayed(const Duration(seconds: 2));
         try {
-          final knownPeerId = _getContactIpfsPeerId(contactId);
-          if (knownPeerId != null) {
-            await client.post(Uri.parse(
-                '$ipfsApiUrl/api/v0/swarm/connect?arg=/p2p/$knownPeerId'))
-                .timeout(const Duration(seconds: 10));
+          final r = await client.post(Uri.parse(
+              '$ipfsApiUrl/api/v0/pubsub/peers?arg=${Uri.encodeComponent(encodedTopic)}'))
+              .timeout(const Duration(seconds: 3));
+          if (r.statusCode == 200) {
+            final strings = (jsonDecode(r.body)['Strings'] as List?) ?? [];
+            if (strings.isNotEmpty) {
+              meshFormed = true;
+              dbg.log('REVIVE: ✓ gossipsub mesh formed! (${strings.length} peer(s))');
+              break;
+            }
           }
         } catch (_) {}
+
+        // Every 10 seconds, force re-subscribe + reconnect
+        if (i % 5 == 4) {
+          yield 'Retrying connection (${i * 2}s)…';
+          for (final t in transport.transports) {
+            if (t is IpfsTransport) {
+              await t.forceResubscribePublic(topic);
+            }
+          }
+          try {
+            final knownPeerId = _getContactIpfsPeerId(contactId);
+            if (knownPeerId != null) {
+              await client.post(Uri.parse(
+                  '$ipfsApiUrl/api/v0/swarm/connect?arg=/p2p/$knownPeerId'))
+                  .timeout(const Duration(seconds: 10));
+            }
+          } catch (_) {}
+        }
       }
-    }
 
-    if (!meshFormed) {
-      dbg.log('REVIVE: ✗ failed — gossipsub mesh never formed after 90s');
-      yield 'failed';
+      if (!meshFormed) {
+        dbg.log('REVIVE: ✗ failed — gossipsub mesh never formed after 90s');
+        yield 'failed';
+        return;
+      }
+
+      // Step 5: Mesh is alive! Reset session and send handshake
+      yield 'Sending handshake…';
+      await resetSession(contactId);
+      try {
+        await _sendPhantomMessage(
+          recipientId: contactId,
+          message: PhantomMessage(type: MessageType.text, content: utf8.encode('[connection revived]')),
+        );
+        dbg.log('REVIVE: ✓ handshake sent successfully');
+        yield 'success';
+      } catch (e) {
+        dbg.log('REVIVE: handshake send failed: $e');
+        yield 'failed';
+      }
+    } finally {
       client.close();
-      return;
     }
-
-    // Step 5: Mesh is alive! Reset session and send handshake
-    yield 'Sending handshake…';
-    await resetSession(contactId);
-    try {
-      await _sendPhantomMessage(
-        recipientId: contactId,
-        message: PhantomMessage(type: MessageType.text, content: utf8.encode('[connection revived]')),
-      );
-      dbg.log('REVIVE: ✓ handshake sent successfully');
-      yield 'success';
-    } catch (e) {
-      dbg.log('REVIVE: handshake send failed: $e');
-      yield 'failed';
-    }
-    client.close();
   }
 
   /// Get the known IPFS peer ID for a contact, or null.
@@ -799,28 +874,198 @@ class PhantomCore {
 
   // ── PreKeys ────────────────────────────────────────────────────────────────
 
+  static const _opkPoolTarget = 10;
+
   Future<void> _initializePreKeys() async {
-    // OPKs require server-mediated exchange so they are not generated here.
+    // OPKs are generated as a local pool here. Their public halves are not
+    // embedded in the ContactAddress (a long-lived advertisement would defeat
+    // their one-time property); instead they are piggy-backed via preKeyShare
+    // messages once a session is established (see _sendPreKeyShares).
     final result = await X3DHHandshake.generateBundle(
       identityKP: identity.encryptionKeyPair,
       signingKP:  identity.signingKeyPair,
-      numOneTimePreKeys: 0,
+      numOneTimePreKeys: _opkPoolTarget,
     );
+    final opks = <int, Uint8List>{
+      for (final kp in result.oneTimePreKeyPairs.asMap().entries)
+        kp.key + 1: Uint8List.fromList(kp.value.bytes),
+    };
 
     await storage.savePreKeyStore(PreKeyStore(
-      signedPreKeyPrivate:   Uint8List.fromList(result.signedPreKeyPair.bytes),
-      signedPreKeyPublic:    result.signedPreKeyPublicBytes,
-      signedPreKeyId:        1,
-      oneTimePreKeyPrivates: const {},
+      signedPreKeyPrivate:    Uint8List.fromList(result.signedPreKeyPair.bytes),
+      signedPreKeyPublic:     result.signedPreKeyPublicBytes,
+      signedPreKeyId:         1,
+      oneTimePreKeyPrivates:  opks,
+      signedPreKeyCreatedAtUs: DateTime.now().microsecondsSinceEpoch,
     ));
 
-    // Persist own bundle, including the Kyber public key when available.
+    // Persist own bundle, including the Kyber public key and the IK↔SK
+    // cross-signature when available.
     final bundleJson = result.bundle.toJson();
     if (_kyberPublicKeyBytes != null) {
       bundleJson['kyber768_pk'] =
           List<int>.from(_kyberPublicKeyBytes!).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     }
+    final ikSig = await _signIdentityKeyWithSigningKey();
+    bundleJson['ik_sig'] =
+        List<int>.from(ikSig).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     await storage.saveOwnBundle(bundleJson);
+  }
+
+  /// Ed25519 signature over our X25519 identity public key. Lets remote peers
+  /// verify that whoever advertised this bundle controls both keys.
+  Future<Uint8List> _signIdentityKeyWithSigningKey() async {
+    final sig = await Ed25519().sign(
+      identity.encryptionPublicKeyBytes,
+      keyPair: identity.signingKeyPair,
+    );
+    return Uint8List.fromList(sig.bytes);
+  }
+
+  // ── OPK pool helpers ─────────────────────────────────────────────────────────
+
+  /// Refills our local OPK pool to [_opkPoolTarget] entries when consumed.
+  /// Returns the freshly added entries (id → private bytes) so the caller can
+  /// derive their public keys and broadcast preKeyShare messages.
+  Future<Map<int, Uint8List>> _topUpOneTimePreKeys() async {
+    final store = await storage.getPreKeyStore();
+    if (store == null) return const {};
+    final missing = _opkPoolTarget - store.oneTimePreKeyPrivates.length;
+    if (missing <= 0) return const {};
+
+    final nextId = store.oneTimePreKeyPrivates.keys.fold<int>(
+        0, (m, id) => id > m ? id : m) + 1;
+    final updated = Map<int, Uint8List>.from(store.oneTimePreKeyPrivates);
+    final added = <int, Uint8List>{};
+    final x25519 = X25519();
+    for (int i = 0; i < missing; i++) {
+      final kp = await x25519.newKeyPair();
+      final priv = Uint8List.fromList((await kp.extract()).bytes);
+      final id = nextId + i;
+      updated[id] = priv;
+      added[id]   = priv;
+    }
+
+    await storage.savePreKeyStore(PreKeyStore(
+      signedPreKeyPrivate:    store.signedPreKeyPrivate,
+      signedPreKeyPublic:     store.signedPreKeyPublic,
+      signedPreKeyId:         store.signedPreKeyId,
+      oneTimePreKeyPrivates:  updated,
+      signedPreKeyCreatedAtUs:           store.signedPreKeyCreatedAtUs,
+      previousSignedPreKeyPrivate:       store.previousSignedPreKeyPrivate,
+      previousSignedPreKeyPublic:        store.previousSignedPreKeyPublic,
+      previousSignedPreKeyId:            store.previousSignedPreKeyId,
+      previousSignedPreKeyRetiredAtUs:   store.previousSignedPreKeyRetiredAtUs,
+    ));
+    return added;
+  }
+
+  /// Derives the X25519 public key for an OPK private byte string.
+  Future<Uint8List> _opkPublicOf(Uint8List priv) async {
+    final kp = await X25519().newKeyPairFromSeed(priv);
+    final pub = await (await kp.extract()).extractPublicKey();
+    return Uint8List.fromList(pub.bytes);
+  }
+
+  /// Sends a preKeyShare message advertising one of our OPKs to [contactId].
+  /// The receiver pops it from the cache when they next initiate a session.
+  Future<void> _sendPreKeyShare(String contactId, int id, Uint8List pub) async {
+    final payload = Uint8List(36);
+    final view = ByteData.sublistView(payload);
+    view.setUint32(0, id, Endian.big);
+    payload.setRange(4, 36, pub);
+    await _sendPhantomMessage(
+      recipientId: contactId,
+      message: PhantomMessage(type: MessageType.preKeyShare, content: payload),
+    );
+  }
+
+  /// Tops up the local OPK pool and pushes the freshly added OPKs to [contactId]
+  /// as a sequence of preKeyShare messages.
+  Future<void> _replenishAndAdvertiseOpks(String contactId) async {
+    final added = await _topUpOneTimePreKeys();
+    for (final entry in added.entries) {
+      try {
+        final pub = await _opkPublicOf(entry.value);
+        await _sendPreKeyShare(contactId, entry.key, pub);
+      } catch (_) {}
+    }
+  }
+
+  // ── SPK rotation ──────────────────────────────────────────────────────────────
+  // Rotate the Signed PreKey periodically so that compromise of a single SPK
+  // private key only exposes a bounded window of new sessions.
+  // Signal rotates weekly; we use a 7-day cadence with a 7-day grace period.
+
+  static const _spkRotationInterval = Duration(days: 7);
+  static const _spkPreviousGrace = Duration(days: 7);
+
+  /// Rotates the active Signed PreKey if it has aged past [_spkRotationInterval].
+  /// The previous SPK is retained for [_spkPreviousGrace] so in-flight INITs
+  /// encrypted to the old SPK can still be processed.
+  Future<void> _maybeRotateSignedPreKey() async {
+    final dbg = TransportDebugger.instance;
+    final store = await storage.getPreKeyStore();
+    if (store == null) return;
+
+    final nowUs = DateTime.now().microsecondsSinceEpoch;
+    final ageUs = nowUs - store.signedPreKeyCreatedAtUs;
+    final mustRotate = store.signedPreKeyCreatedAtUs == 0 ||
+        ageUs >= _spkRotationInterval.inMicroseconds;
+
+    // If a previous SPK is past its grace period, drop it.
+    final prevRetiredUs = store.previousSignedPreKeyRetiredAtUs;
+    final graceExpired = prevRetiredUs != null &&
+        nowUs - prevRetiredUs >= _spkPreviousGrace.inMicroseconds;
+
+    if (!mustRotate) {
+      // Persist any grace-period cleanup even when we don't rotate.
+      if (graceExpired) {
+        await storage.savePreKeyStore(PreKeyStore(
+          signedPreKeyPrivate:    store.signedPreKeyPrivate,
+          signedPreKeyPublic:     store.signedPreKeyPublic,
+          signedPreKeyId:         store.signedPreKeyId,
+          oneTimePreKeyPrivates:  store.oneTimePreKeyPrivates,
+          signedPreKeyCreatedAtUs: store.signedPreKeyCreatedAtUs,
+        ));
+      }
+      return;
+    }
+
+    final result = await X3DHHandshake.generateBundle(
+      identityKP: identity.encryptionKeyPair,
+      signingKP:  identity.signingKeyPair,
+      numOneTimePreKeys: 0,
+    );
+    final newId = store.signedPreKeyId + 1;
+
+    await storage.savePreKeyStore(PreKeyStore(
+      signedPreKeyPrivate:    Uint8List.fromList(result.signedPreKeyPair.bytes),
+      signedPreKeyPublic:     result.signedPreKeyPublicBytes,
+      signedPreKeyId:         newId,
+      oneTimePreKeyPrivates:  store.oneTimePreKeyPrivates,
+      signedPreKeyCreatedAtUs: nowUs,
+      // Demote the just-rotated SPK to "previous" with a fresh retire time.
+      previousSignedPreKeyPrivate:    store.signedPreKeyPrivate,
+      previousSignedPreKeyPublic:     store.signedPreKeyPublic,
+      previousSignedPreKeyId:         store.signedPreKeyId,
+      previousSignedPreKeyRetiredAtUs: nowUs,
+    ));
+
+    // Update own bundle so the latest SPK is what we advertise to new contacts.
+    final bundleJson = result.bundle.toJson();
+    bundleJson['spk_id'] = newId;
+    if (_kyberPublicKeyBytes != null) {
+      bundleJson['kyber768_pk'] = List<int>.from(_kyberPublicKeyBytes!)
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join();
+    }
+    final ikSig = await _signIdentityKeyWithSigningKey();
+    bundleJson['ik_sig'] =
+        List<int>.from(ikSig).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    await storage.saveOwnBundle(bundleJson);
+
+    dbg.log('SPK: rotated to id=$newId (previous id=${store.signedPreKeyId} kept for grace)');
   }
 
   // ── Session management ─────────────────────────────────────────────────────
@@ -866,13 +1111,20 @@ class PhantomCore {
       throw PhantomCoreException('Contact not found: $recipientId. Add them first.');
     }
 
+    // Pop one OPK from the contact's piggy-backed pool, if any. Adds DH4 to
+    // X3DH and gives forward secrecy of the first message even under combined
+    // IK_priv + SPK_priv compromise.
+    final remoteOpk = await storage.popRemoteOpk(recipientId);
+
     final bundle = PreKeyBundle(
       identityKeyBytes:      contact.encryptionPublicKeyBytes,
       signingKeyBytes:       contact.signingPublicKeyBytes,
       signedPreKeyBytes:     contact.signedPreKeyBytes,
       signedPreKeyId:        contact.signedPreKeyId,
       signedPreKeySignature: contact.signedPreKeySignature,
-      oneTimePreKeys:        const [],
+      oneTimePreKeys: remoteOpk == null
+          ? const []
+          : [(id: remoteOpk.id, keyBytes: remoteOpk.pub)],
       kyber768PublicKeyBytes: contact.kyber768PublicKeyBytes,
     );
 
@@ -886,6 +1138,7 @@ class PhantomCore {
       remotePublicKey:       contact.encryptionPublicKeyBytes,
       x3dhEphemeralKeyBytes: x3dhResult.ephemeralPublicKeyBytes,
       kyberCipherBytes:      x3dhResult.kyberCipherBytes,
+      opkId:                 x3dhResult.usedOneTimePreKeyId,
     );
 
     _sessions[recipientId] = session;
@@ -971,6 +1224,20 @@ class PhantomCore {
     _notifyContactUpdated(contactId);
   }
 
+  /// Handles a `preKeyShare` message: stores the advertised OPK in the
+  /// per-contact remote pool. Subsequent session initiations to this contact
+  /// will pop one from the pool to add DH4 to X3DH.
+  Future<void> _handleIncomingPreKeyShare(String contactId, Uint8List payload) async {
+    if (payload.length != 36) {
+      TransportDebugger.instance.log('OPK: ✗ malformed preKeyShare (len=${payload.length})');
+      return;
+    }
+    final id  = ByteData.sublistView(payload).getUint32(0, Endian.big);
+    final pub = Uint8List.fromList(payload.sublist(4, 36));
+    await storage.addRemoteOpk(contactId, id, pub);
+    TransportDebugger.instance.log('OPK: cached id=$id from ${contactId.substring(0, 8)}');
+  }
+
   Future<void> _handleIncomingConnectivity(String contactId, String json) async {
     try {
       final data = jsonDecode(json) as Map<String, dynamic>;
@@ -1015,7 +1282,7 @@ class PhantomCore {
 
   Future<void> _sendConnectivityInfo(String recipientId) async {
     final ipfsId = await getMyIpfsPeerId();
-    
+
     // Try to get our Yggdrasil address if active
     String? myYgg;
     final ygg = transport.transports.whereType<YggdrasilTransport>().firstOrNull;
@@ -1031,11 +1298,30 @@ class PhantomCore {
       yggAddr:    myYgg,
       i2pDest:    myI2p,
     );
-    
+
     await _sendPhantomMessage(
       recipientId: recipientId,
       message: msg,
     );
+
+    // Piggy-back the OPK pool: ensures the contact has fresh OPKs to spend on
+    // their next session start. Cheap (each share is 36 bytes inside a Double
+    // Ratchet message) and keeps the pool topped up across both sides.
+    unawaited(_advertiseExistingOpks(recipientId));
+  }
+
+  /// Sends preKeyShare messages for every OPK currently in our local pool.
+  /// Used right after a handshake so the contact has material to spend on the
+  /// next session, even when no OPKs were consumed this round.
+  Future<void> _advertiseExistingOpks(String recipientId) async {
+    final store = await storage.getPreKeyStore();
+    if (store == null) return;
+    for (final entry in store.oneTimePreKeyPrivates.entries) {
+      try {
+        final pub = await _opkPublicOf(entry.value);
+        await _sendPreKeyShare(recipientId, entry.key, pub);
+      } catch (_) {}
+    }
   }
 
   Future<void> _handleIncomingBytes(Uint8List data) async {
@@ -1074,11 +1360,11 @@ class PhantomCore {
     final incomingEkHex = senderEkBytes
         .map((b) => b.toRadixString(16).padLeft(2, '0'))
         .join();
-    final storedEkHex = await storage.getLastInitEkHex(senderPhantomId);
+    final isKnownEk = await storage.isKnownInitEk(senderPhantomId, incomingEkHex);
 
     // Known EK → confirmed replay. Use existing session.
-    if (storedEkHex != null && storedEkHex == incomingEkHex) {
-      dbg.log('MSG: replay detected (same EK) → trying as MSG');
+    if (isKnownEk) {
+      dbg.log('MSG: replay detected (known EK) → trying as MSG');
       await _handleMsgFrame(frame);
       return;
     }
@@ -1086,6 +1372,7 @@ class PhantomCore {
     // No EK on record yet (cold-start after upgrade) but an active session
     // already exists.  We can't tell if this is a replay or a re-INIT; protect
     // the live session rather than overwriting it with a reset receiver state.
+    final storedEkHex = await storage.getLastInitEkHex(senderPhantomId);
     final hasMemSession    = _sessions.containsKey(senderPhantomId);
     final hasStoredSession = await storage.getSessionState(senderPhantomId) != null;
     if (storedEkHex == null && (hasMemSession || hasStoredSession)) {
@@ -1096,6 +1383,11 @@ class PhantomCore {
       dbg.log('MSG: ✗ decryption as MSG failed, falling back to process as fresh INIT');
     }
 
+    if (!_shouldAcceptInit(senderPhantomId)) {
+      dbg.log('MSG: ✗ rate-limited fresh INIT from ${senderPhantomId.substring(0, 8)}');
+      return;
+    }
+
     dbg.log('MSG: fresh INIT — running X3DH respond…');
 
     final preKeyStore = await storage.getPreKeyStore();
@@ -1104,99 +1396,157 @@ class PhantomCore {
       return;
     }
 
-    // Reconstruct our signed prekey keypair from stored private + public bytes
-    final spkPub = SimplePublicKey(
-      preKeyStore.signedPreKeyPublic,
-      type: KeyPairType.x25519,
-    );
-    final spkKP = SimpleKeyPairData(
-      preKeyStore.signedPreKeyPrivate,
-      publicKey: spkPub,
-      type: KeyPairType.x25519,
-    );
+    // Try the active SPK first; on failure fall through to the previous SPK
+    // (still within its grace period) so INITs encrypted to the just-rotated
+    // key still establish a session.
+    final spkCandidates = <({Uint8List priv, Uint8List pub, int id})>[
+      (
+        priv: preKeyStore.signedPreKeyPrivate,
+        pub:  preKeyStore.signedPreKeyPublic,
+        id:   preKeyStore.signedPreKeyId,
+      ),
+      if (preKeyStore.previousSignedPreKeyPrivate != null &&
+          preKeyStore.previousSignedPreKeyPublic != null &&
+          preKeyStore.previousSignedPreKeyId != null)
+        (
+          priv: preKeyStore.previousSignedPreKeyPrivate!,
+          pub:  preKeyStore.previousSignedPreKeyPublic!,
+          id:   preKeyStore.previousSignedPreKeyId!,
+        ),
+    ];
 
-    Uint8List sharedSecret;
-    try {
-      sharedSecret = await X3DHHandshake.respond(
-        ourIdentityKP:          identity.encryptionKeyPair,
-        ourSignedPreKP:         spkKP,
-        theirIdentityKeyBytes:  senderIkBytes,
-        theirEphemeralKeyBytes: senderEkBytes,
-      );
-      dbg.log('MSG: X3DH respond OK');
-    } catch (e) {
-      dbg.log('MSG: ✗ X3DH respond failed: $e');
-      return;
+    // If the frame asks us to consume one of our OPKs, look up its private
+    // bytes now so X3DH respond can include DH4. Missing OPK → silent fallback
+    // to no-OPK respond (the sender's SK won't match → caller drops + retries).
+    SimpleKeyPairData? opkKP;
+    if (frame.opkId != null) {
+      final opkPriv = preKeyStore.oneTimePreKeyPrivates[frame.opkId!];
+      if (opkPriv != null) {
+        try {
+          final opkKpFull = await X25519().newKeyPairFromSeed(opkPriv);
+          opkKP = await opkKpFull.extract();
+        } catch (e) {
+          dbg.log('MSG: ✗ OPK ${frame.opkId} key reconstruction failed: $e');
+        }
+      } else {
+        dbg.log('MSG: requested OPK id=${frame.opkId} not in pool — proceeding without DH4');
+      }
     }
 
-    // If this is a hybrid frame and we have our Kyber private key, decapsulate
-    // and combine with the X3DH secret to get the session key.
-    if (frame.isHybrid &&
-        frame.kyberCipherBytes != null &&
-        _kyberPrivateKeyBytes != null) {
+    RatchetSession? session;
+    PhantomMessage? message;
+    Object? lastError;
+    for (final spk in spkCandidates) {
+      final spkPub = SimplePublicKey(spk.pub, type: KeyPairType.x25519);
+      final spkKP = SimpleKeyPairData(spk.priv, publicKey: spkPub, type: KeyPairType.x25519);
+
+      Uint8List sharedSecret;
       try {
-        final kyberSecret = HybridKEM.decapsulate(
-          frame.kyberCipherBytes!,
-          _kyberPrivateKeyBytes!,
+        sharedSecret = await X3DHHandshake.respond(
+          ourIdentityKP:          identity.encryptionKeyPair,
+          ourSignedPreKP:         spkKP,
+          ourOneTimePreKP:        opkKP,
+          theirIdentityKeyBytes:  senderIkBytes,
+          theirEphemeralKeyBytes: senderEkBytes,
         );
-        sharedSecret = await HybridKEM.combineSecrets(sharedSecret, kyberSecret);
-        dbg.log('MSG: Kyber decapsulation OK');
       } catch (e) {
-        dbg.log('MSG: ✗ Kyber decapsulation failed: $e');
-        return;
+        lastError = e;
+        continue;
+      }
+
+      if (frame.isHybrid &&
+          frame.kyberCipherBytes != null &&
+          _kyberPrivateKeyBytes != null) {
+        try {
+          final kyberSecret = HybridKEM.decapsulate(
+            frame.kyberCipherBytes!,
+            _kyberPrivateKeyBytes!,
+          );
+          sharedSecret = await HybridKEM.combineSecrets(sharedSecret, kyberSecret);
+        } catch (e) {
+          lastError = e;
+          continue;
+        }
+      }
+
+      final candidate = await RatchetSession.initAsReceiver(
+        sharedSecret:    sharedSecret,
+        ourEncryptionKP: identity.encryptionKeyPair,
+      );
+
+      try {
+        final protocol = PhantomProtocol(candidate);
+        message = await protocol.decode(frame.payload);
+        session = candidate;
+        dbg.log('MSG: X3DH respond OK (spk_id=${spk.id})');
+        break;
+      } catch (e) {
+        lastError = e;
+        continue;
       }
     }
 
-    final session = await RatchetSession.initAsReceiver(
-      sharedSecret:    sharedSecret,
-      ourEncryptionKP: identity.encryptionKeyPair,
-    );
-
-    try {
-      final protocol = PhantomProtocol(session);
-      final message  = await protocol.decode(frame.payload);
-      dbg.log('MSG: ✓ INIT decrypted OK — type=${message.type.name}');
-
-      // Simultaneous re-init tiebreaker: if both sides cleared history and sent
-      // INITs at the same time, the side with the larger phantom ID keeps its
-      // sender session so both end up with a compatible sender/receiver pair.
-      // The "loser" side's first message is lost but they can resend immediately.
-      if (myId.compareTo(senderPhantomId) > 0 &&
-          _sessions[senderPhantomId]?.pendingX3dhEphemeralKey != null) {
-        dbg.log('MSG: tiebreaker — dropping incoming INIT (we win)');
-        return;
-      }
-
-      // Build a full ContactRecord from the embedded ContactAddress when possible,
-      // so we can re-initiate sessions later without the sender needing to resend.
-      if (await storage.getContact(senderPhantomId) == null) {
-        await storage.saveContact(
-          _buildContactFromInit(senderPhantomId, senderIkBytes, senderCaBytes),
-        );
-        dbg.log('MSG: auto-saved contact from INIT CA');
-      }
-
-      // Persist the ephemeral key so future replays of this INIT are detected.
-      await storage.setLastInitEkHex(senderPhantomId, incomingEkHex);
-      _sessions[senderPhantomId] = session;
-      await _saveSession(senderPhantomId, session);
-
-      await _dispatchIncoming(message, senderPhantomId);
-      dbg.log('MSG: ✓ dispatched to UI');
-    } catch (e) {
-      dbg.log('MSG: ✗ INIT decrypt failed: $e — trying existing session');
-      // X3DH decryption failed — duplicate INIT from a second transport while
-      // the primary already advanced the ratchet.  Try existing session.
+    if (session == null || message == null) {
+      dbg.log('MSG: ✗ X3DH respond/decrypt failed across all SPKs: $lastError');
+      // Last resort: maybe a duplicate INIT raced an existing session.
       if (_sessions.containsKey(senderPhantomId) ||
           await storage.getSessionState(senderPhantomId) != null) {
         await _handleMsgFrame(frame);
       }
+      return;
+    }
+
+    dbg.log('MSG: ✓ INIT decrypted OK — type=${message.type.name}');
+
+    // Simultaneous re-init tiebreaker: if both sides cleared history and sent
+    // INITs at the same time, the side with the larger phantom ID keeps its
+    // sender session so both end up with a compatible sender/receiver pair.
+    // The "loser" side's first message is lost but they can resend immediately.
+    if (myId.compareTo(senderPhantomId) > 0 &&
+        _sessions[senderPhantomId]?.pendingX3dhEphemeralKey != null) {
+      dbg.log('MSG: tiebreaker — dropping incoming INIT (we win)');
+      return;
+    }
+
+    // Build a full ContactRecord from the embedded ContactAddress when possible,
+    // so we can re-initiate sessions later without the sender needing to resend.
+    // For CA v3 we verify the IK↔SK binding signature first; on failure we
+    // skip the auto-save (X3DH already validated the sender owns IK_priv,
+    // but we won't trust the embedded SK without proof).
+    if (await storage.getContact(senderPhantomId) == null) {
+      final caBindingOk = await _verifyInitCaBinding(senderCaBytes);
+      if (caBindingOk) {
+        await storage.saveContact(
+          _buildContactFromInit(senderPhantomId, senderIkBytes, senderCaBytes),
+        );
+        dbg.log('MSG: auto-saved contact from INIT CA');
+      } else {
+        dbg.log('MSG: ✗ CA v3 ik_sig failed — not auto-saving contact');
+      }
+    }
+
+    // Persist the ephemeral key so future replays of this INIT are detected.
+    await storage.setLastInitEkHex(senderPhantomId, incomingEkHex);
+    _sessions[senderPhantomId] = session;
+    await _saveSession(senderPhantomId, session);
+
+    await _dispatchIncoming(message, senderPhantomId);
+    dbg.log('MSG: ✓ dispatched to UI');
+
+    // If we burned an OPK on this INIT, retire it locally and push a fresh
+    // batch back so the contact has material for the next session.
+    if (frame.opkId != null && opkKP != null) {
+      await storage.consumeOneTimePreKey(frame.opkId!);
+      unawaited(_replenishAndAdvertiseOpks(senderPhantomId));
     }
   }
 
   /// Builds a [ContactRecord] from data available in an INIT frame.
   /// Uses the embedded ContactAddress bytes for a full record; falls back to a
   /// minimal record (no SPK) when the CA is absent or malformed.
+  ///
+  /// Note: this is a sync helper — IK↔SK signature verification on CA v3
+  /// happens in [_handleInitFrame] before calling, so we trust the bytes here.
   static ContactRecord _buildContactFromInit(
     String phantomId,
     Uint8List senderIkBytes,
@@ -1226,6 +1576,17 @@ class PhantomCore {
             signedPreKeySignature:    Uint8List.fromList(caBytes.sublist(101, 165)),
             kyber768PublicKeyBytes:   Uint8List.fromList(caBytes.sublist(165, 1349)),
           );
+        } else if (version == 0x03 && caBytes.length == 1413) {
+          return ContactRecord(
+            phantomId:               phantomId,
+            encryptionPublicKeyBytes: Uint8List.fromList(caBytes.sublist(1,   33)),
+            signingPublicKeyBytes:    Uint8List.fromList(caBytes.sublist(33,  65)),
+            signedPreKeyBytes:        Uint8List.fromList(caBytes.sublist(65,  97)),
+            signedPreKeyId:           view.getUint32(97, Endian.big),
+            signedPreKeySignature:    Uint8List.fromList(caBytes.sublist(101, 165)),
+            kyber768PublicKeyBytes:   Uint8List.fromList(caBytes.sublist(165, 1349)),
+            identityKeySignature:     Uint8List.fromList(caBytes.sublist(1349, 1413)),
+          );
         }
       } catch (_) {
         // Malformed CA — fall through to minimal record
@@ -1240,6 +1601,25 @@ class PhantomCore {
       signedPreKeyId:           0,
       signedPreKeySignature:    Uint8List(64),
     );
+  }
+
+  /// True if the embedded CA v3 in [caBytes] passes IK↔SK signature verification.
+  /// Returns true for v1/v2 (no signature to check) so older clients still work.
+  static Future<bool> _verifyInitCaBinding(Uint8List? caBytes) async {
+    if (caBytes == null || caBytes.isEmpty) return true;
+    if (caBytes[0] != 0x03 || caBytes.length != 1413) return true;
+    final ikBytes  = Uint8List.fromList(caBytes.sublist(1,    33));
+    final skBytes  = Uint8List.fromList(caBytes.sublist(33,   65));
+    final ikSigBytes = Uint8List.fromList(caBytes.sublist(1349, 1413));
+    try {
+      final pub = SimplePublicKey(skBytes, type: KeyPairType.ed25519);
+      return await Ed25519().verify(
+        ikBytes,
+        signature: Signature(ikSigBytes, publicKey: pub),
+      );
+    } catch (_) {
+      return false;
+    }
   }
 
   /// Handle a regular MSG frame: try each active session until one decrypts.
@@ -1295,6 +1675,11 @@ class PhantomCore {
     if (message.type == MessageType.connectivityInfo) {
       await _handleIncomingConnectivity(senderId, utf8.decode(message.content));
       // Connectivity info doesn't need to be visible in the UI
+      return;
+    }
+
+    if (message.type == MessageType.preKeyShare) {
+      await _handleIncomingPreKeyShare(senderId, message.content);
       return;
     }
 
