@@ -399,7 +399,7 @@ class PhantomCore {
               : MessageStatus.failed;
           await storage.updateMessageStatus(recipientId, message.id, status);
 
-          if (isHandshake && status == MessageStatus.sent) {
+          if (isHandshake && status == MessageStatus.sent && message.type != MessageType.connectivityInfo) {
             final dbg = TransportDebugger.instance;
             dbg.log('DBG: before _sendConnectivityInfo, session.pendingX3dhEk is null? ${session.pendingX3dhEphemeralKey == null}');
             unawaited(_sendConnectivityInfo(recipientId));
@@ -414,7 +414,7 @@ class PhantomCore {
           );
           await storage.updateMessageStatus(recipientId, message.id, MessageStatus.sent);
 
-          if (isHandshake) {
+          if (isHandshake && message.type != MessageType.connectivityInfo) {
             final dbg = TransportDebugger.instance;
             dbg.log('DBG: before _sendConnectivityInfo, session.pendingX3dhEk is null? ${session.pendingX3dhEphemeralKey == null}');
             unawaited(_sendConnectivityInfo(recipientId));
@@ -902,10 +902,11 @@ class PhantomCore {
       yggAddr:    myYgg,
       i2pDest:    myI2p,
     );
-    final session = await _getOrCreateSession(recipientId);
-    final protocol = PhantomProtocol(session);
-    final envelope = await protocol.encode(msg);
-    await transport.publish(recipientId: recipientId, encryptedEnvelope: envelope);
+    
+    await _sendPhantomMessage(
+      recipientId: recipientId,
+      message: msg,
+    );
   }
 
   Future<void> _handleIncomingBytes(Uint8List data) async {
