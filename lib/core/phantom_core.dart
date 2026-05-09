@@ -559,6 +559,35 @@ class PhantomCore {
     }
   }
 
+  /// Delete the existing session with [contactId] and force a fresh X3DH
+  /// handshake on the next message. Use this when the remote side never
+  /// received our INIT and the session is stuck.
+  Future<void> resetSession(String contactId) async {
+    _sessions.remove(contactId);
+    _pendingInitSent.remove(contactId);
+    await storage.deleteSessionState(contactId);
+    TransportDebugger.instance.log('SESSION: reset for ${contactId.substring(0, 8)} — next message will re-handshake');
+  }
+
+  /// Reset the session AND immediately send a fresh INIT handshake.
+  /// Returns true if the INIT was sent successfully.
+  Future<bool> resendHandshake(String contactId) async {
+    await resetSession(contactId);
+    try {
+      // Sending any message will trigger a fresh X3DH handshake since
+      // the session state was deleted.
+      await _sendPhantomMessage(
+        recipientId: contactId,
+        message: PhantomMessage(type: MessageType.text, content: utf8.encode('[session reset]')),
+      );
+      TransportDebugger.instance.log('SESSION: INIT re-sent to ${contactId.substring(0, 8)}');
+      return true;
+    } catch (e) {
+      TransportDebugger.instance.log('SESSION: INIT re-send failed: $e');
+      return false;
+    }
+  }
+
   /// Pre-warm the transport layer for a newly added contact:
   /// 1. Cross-subscribe to their message topic (GossipSub mesh formation)
   /// 2. Trigger DHT discovery + swarm connect
