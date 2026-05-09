@@ -517,13 +517,22 @@ class IpfsTransport implements PhantomTransport {
       dbg.log('IPFS: direct connect via stored peer ID $knownPeerId');
       final preExisting = await _verifySwarmConnection(knownPeerId);
       if (preExisting) {
-        // Peer is in swarm — check if gossipsub works on this connection.
-        final hasMesh = await _checkTopicPeers(contactTopic, dbg);
+        bool hasMesh = await _checkTopicPeers(contactTopic, dbg);
+        if (!hasMesh) {
+          dbg.log('IPFS: $knownPeerId in swarm, waiting for gossipsub mesh (fast path)…');
+          for (int i = 0; i < 4; i++) {
+            await Future.delayed(const Duration(seconds: 2));
+            hasMesh = await _checkTopicPeers(contactTopic, dbg);
+            if (hasMesh) break;
+          }
+        }
+
         if (hasMesh) {
           _swarmConnected.add(knownPeerId);
           dbg.log('IPFS: $knownPeerId in swarm + gossipsub OK — ready');
           return true;
         }
+
         // Stale or relay connection that doesn't support gossipsub.
         // Disconnect and reconnect with fresh addresses to force
         // libp2p protocol renegotiation.
