@@ -298,39 +298,88 @@ class IpfsTransport implements PhantomTransport {
     unawaited(_runRetryLoop());
   }
 
-  /// Background loop: every 5 seconds, check each queued recipient's topic.
+  /// Background loop: aggressively retries message delivery.
+  ///
+  /// Strategy:
+  ///  - First 60s: check every 2s (fast reconnection window)
+  ///  - After 60s: check every 10s (steady state)
+  ///  - On each attempt: force re-subscribe → reconnect → check mesh → deliver
+  ///
   /// When GossipSub peers > 0, republish all queued messages for that contact.
   Future<void> _runRetryLoop() async {
     final dbg = TransportDebugger.instance;
+    int attempt = 0;
     while (!_disposed) {
-      await Future.delayed(const Duration(seconds: 5));
-      if (_retryQueue.isEmpty) continue;
+      // Aggressive timing: 2s for first 30 attempts (60s), then 10s
+      final delay = attempt < 30 ? 2 : 10;
+      await Future.delayed(Duration(seconds: delay));
+      if (_retryQueue.isEmpty) { attempt = 0; continue; }
+      attempt++;
 
       for (final recipientId in List.of(_retryQueue.keys)) {
         final topic = _topicForId(recipientId);
         final short = recipientId.substring(0, 8);
-        final hasPeers = await _checkTopicPeers(topic, dbg, silent: true);
-        if (!hasPeers) {
-          // Still no mesh — try to force reconnect
-          await _dhtDiscoverAndConnect(recipientId, dbg);
+
+        // Step 1: Force re-subscribe (kill stale GossipSub state, trigger fresh GRAFT)
+        if (attempt % 5 == 1) {
+          await _forceResubscribe(topic, dbg);
+        }
+
+        // Step 2: Check mesh first (cheap)
+        bool hasPeers = await _checkTopicPeers(topic, dbg, silent: attempt % 5 != 0);
+        if (hasPeers) {
+          await _flushRetryQueue(recipientId, topic, dbg);
           continue;
         }
 
-        // Mesh is alive! Drain the queue for this recipient.
-        final msgs = _retryQueue.remove(recipientId);
-        if (msgs == null || msgs.isEmpty) continue;
-        dbg.log('IPFS: ✓ gossipsub mesh formed for $short — flushing ${msgs.length} queued message(s)');
-        for (final envelope in msgs) {
-          try {
-            await _rawPublish(topic, envelope, dbg);
-            dbg.log('IPFS: retry-published ${envelope.length} bytes to $short');
-          } catch (e) {
-            dbg.log('IPFS: retry-publish failed: $e');
+        // Step 3: Force DHT reconnect
+        if (attempt % 3 == 1) {
+          dbg.log('IPFS: retry #$attempt for $short — forcing reconnect');
+          await _dhtDiscoverAndConnect(recipientId, dbg);
+          // Re-check immediately after reconnect
+          await Future.delayed(const Duration(seconds: 1));
+          hasPeers = await _checkTopicPeers(topic, dbg, silent: true);
+          if (hasPeers) {
+            await _flushRetryQueue(recipientId, topic, dbg);
+            continue;
           }
+        }
+
+        if (attempt % 10 == 0) {
+          dbg.log('IPFS: retry #$attempt — still waiting for gossipsub mesh for $short '
+              '(${_retryQueue[recipientId]?.length ?? 0} msg(s) queued)');
         }
       }
     }
     _retryLoopRunning = false;
+  }
+
+  /// Flush all queued messages for [recipientId] now that the mesh is alive.
+  Future<void> _flushRetryQueue(String recipientId, String topic, TransportDebugger dbg) async {
+    final short = recipientId.substring(0, 8);
+    final msgs = _retryQueue.remove(recipientId);
+    if (msgs == null || msgs.isEmpty) return;
+    dbg.log('IPFS: ✓ gossipsub mesh formed for $short — flushing ${msgs.length} queued message(s)');
+    for (final envelope in msgs) {
+      try {
+        await _rawPublish(topic, envelope, dbg);
+        dbg.log('IPFS: retry-published ${envelope.length} bytes to $short');
+      } catch (e) {
+        dbg.log('IPFS: retry-publish failed: $e');
+      }
+    }
+  }
+
+  /// Cancel the existing cross-subscription for [topic] and re-create it.
+  /// This forces GossipSub to send a fresh SUBSCRIBE + GRAFT to connected
+  /// peers, which can unstick a stale mesh that never formed.
+  Future<void> _forceResubscribe(String topic, TransportDebugger dbg) async {
+    final existing = _crossSubs.remove(topic);
+    if (existing != null) {
+      await existing.cancel();
+      dbg.log('IPFS: killed stale cross-sub for ${topic.substring(0, 11)}');
+    }
+    await _ensureCrossSubscribed(topic, dbg);
   }
 
   /// Raw HTTP publish — no discovery, no mesh check, just send.
