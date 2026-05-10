@@ -567,6 +567,13 @@ class _ReviveDialogState extends State<_ReviveDialog> with SingleTickerProviderS
           _success = false;
         });
         break;
+      } else if (status == 'offline') {
+        setState(() {
+          _status = 'contact appears offline — open Phantom on their device';
+          _finished = true;
+          _success = false;
+        });
+        break;
       } else {
         setState(() {
           _status = status;

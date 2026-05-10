@@ -31,7 +31,9 @@ jobs:
       - name: Set up Go (for static x86_64 Kubo build)
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.2'
+          # Pinned to 1.22 so gomobile + yggdrasil-go contrib/mobile don't
+          # silently upgrade to a Go version that pulls in a broken x/mobile.
+          go-version: '1.22.6'
           cache: true
 
       - name: Get dependencies

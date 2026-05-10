@@ -985,6 +985,23 @@ class IpfsTransport implements PhantomTransport {
     return false;
   }
 
+  /// Public probe: number of peers in the GossipSub mesh for the topic
+  /// associated with [contactId]. Returns 0 when the daemon is unreachable
+  /// or the contact's mesh is empty (likely offline).
+  Future<int> contactMeshPeerCount(String contactId) async {
+    try {
+      final topic = _topicForId(contactId);
+      final r = await _client.post(Uri.parse(
+          '$_apiUrl/api/v0/pubsub/peers?arg=${Uri.encodeComponent(_encodeTopic(topic))}'))
+          .timeout(const Duration(seconds: 3));
+      if (r.statusCode == 200) {
+        final strings = (jsonDecode(r.body)['Strings'] as List?) ?? [];
+        return strings.length;
+      }
+    } catch (_) {}
+    return 0;
+  }
+
   @override
   Future<void> dispose() async {
     _disposed = true;

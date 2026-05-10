@@ -688,22 +688,44 @@ class PhantomCore {
     }
 
     yield 'waiting for ack…';
-    final completer = Completer<bool>();
+    final completer = Completer<({bool acked, bool offline})>();
     final sub = incomingMessages
         .where((m) => m.conversationId == contactId)
         .listen((_) {
-      if (!completer.isCompleted) completer.complete(true);
-    });
-    Timer(const Duration(seconds: 30), () {
-      if (!completer.isCompleted) completer.complete(false);
+      if (!completer.isCompleted) {
+        completer.complete((acked: true, offline: false));
+      }
     });
 
-    final got = await completer.future;
+    // Hard timeout — give the peer the benefit of slow networks.
+    Timer(const Duration(seconds: 30), () {
+      if (!completer.isCompleted) {
+        completer.complete((acked: false, offline: false));
+      }
+    });
+
+    // Fail-fast probe — if 10 s after sending the INIT we still see zero
+    // peers in the contact's GossipSub mesh, the peer almost certainly
+    // isn't subscribed (app closed, daemon down). Skip the full 30 s wait.
+    Timer(const Duration(seconds: 10), () async {
+      if (completer.isCompleted) return;
+      final ipfs = transport.transports.whereType<IpfsTransport>().firstOrNull;
+      if (ipfs == null) return;
+      final peers = await ipfs.contactMeshPeerCount(contactId);
+      if (peers == 0 && !completer.isCompleted) {
+        dbg.log('SESSION: ✗ early offline detection — gossipsub mesh empty');
+        completer.complete((acked: false, offline: true));
+      }
+    });
+
+    final result = await completer.future;
     await sub.cancel();
 
-    if (got) {
+    if (result.acked) {
       dbg.log('SESSION: ✓ ack received from $short — handshake complete');
       yield 'success';
+    } else if (result.offline) {
+      yield 'offline';
     } else {
       dbg.log('SESSION: ✗ no ack from $short within 30s');
       yield 'failed';

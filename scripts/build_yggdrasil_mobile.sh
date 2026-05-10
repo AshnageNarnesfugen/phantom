@@ -22,12 +22,15 @@ echo "▶ yggdrasil-go version: $YGG_VERSION"
 echo "▶ workdir: $WORKDIR"
 
 # 1. Install gomobile + gobind into GOPATH (idempotent)
+# Pin to a 2024 snapshot — the May-2026 release of x/mobile reorganised the
+# bind/ subpackage and gobind fails to import it ("no Go package in
+# golang.org/x/mobile/bind"). The 0e9ed... pseudo-version is the last known
+# release where contrib/mobile of yggdrasil-go binds cleanly.
+GOMOBILE_VERSION="${GOMOBILE_VERSION:-v0.0.0-20240910153849-0e9ed3da6e8e}"
 export PATH="$(go env GOPATH)/bin:$PATH"
-if ! command -v gomobile &>/dev/null; then
-  echo "▶ installing gomobile…"
-  go install golang.org/x/mobile/cmd/gomobile@latest
-  go install golang.org/x/mobile/cmd/gobind@latest
-fi
+echo "▶ installing gomobile $GOMOBILE_VERSION…"
+go install "golang.org/x/mobile/cmd/gomobile@$GOMOBILE_VERSION"
+go install "golang.org/x/mobile/cmd/gobind@$GOMOBILE_VERSION"
 
 # 2. gomobile init wires up the NDK toolchain
 gomobile init
@@ -41,8 +44,9 @@ cd "$WORKDIR"
 go mod download
 
 # gobind needs `golang.org/x/mobile/bind` resolvable from the target module.
-# Yggdrasil-go doesn't declare it, so add it explicitly before binding.
-go get golang.org/x/mobile/bind@latest
+# Yggdrasil-go doesn't declare it; pin to the same version as gomobile so
+# they agree on the bind/ layout.
+go get "golang.org/x/mobile@$GOMOBILE_VERSION"
 go mod tidy
 
 # 4. Bind. The contrib/mobile package exposes the Yggdrasil type used by
