@@ -91,6 +91,15 @@ class PhantomCore {
     return true;
   }
 
+  // Tracks the wall-clock time we last sent an INIT to each contact. The
+  // simultaneous re-init tiebreaker uses this to keep our established session
+  // when a peer's INIT races against our own ack — the original guard only
+  // checked pendingX3dhEphemeralKey, which gets cleared by the first DH ratchet
+  // (i.e. the moment the ack lands), creating a window where a stale incoming
+  // INIT would replace a freshly-established session and desync both sides.
+  static const _initRecentWindow = Duration(seconds: 60);
+  final Map<String, DateTime> _lastInitSentAt = {};
+
   TransportStatus? get transportStatus => _transportV2?.status;
   Stream<TransportMode> get transportModeChanges =>
       _transportV2?.modeChanges ?? const Stream.empty();
@@ -1178,6 +1187,7 @@ class PhantomCore {
     );
 
     _sessions[recipientId] = session;
+    _lastInitSentAt[recipientId] = DateTime.now();
     await _saveSession(recipientId, session);
     return session;
   }
@@ -1424,6 +1434,22 @@ class PhantomCore {
       return;
     }
 
+    // Simultaneous re-init tiebreaker — broader version. Catches the race
+    // window where our pendingX3dhEphemeralKey was already cleared by the
+    // arrival of the peer's ack, but a stale INIT from the peer (issued before
+    // the ack landed) is still about to overwrite our just-established session.
+    final lastSent = _lastInitSentAt[senderPhantomId];
+    final recentlyInitiated = lastSent != null &&
+        DateTime.now().difference(lastSent) < _initRecentWindow;
+    final pendingInit =
+        _sessions[senderPhantomId]?.pendingX3dhEphemeralKey != null;
+    if (myId.compareTo(senderPhantomId) > 0 &&
+        (recentlyInitiated || pendingInit)) {
+      dbg.log('MSG: tiebreaker — dropping incoming INIT (we win, '
+          'recentInit=$recentlyInitiated pending=$pendingInit)');
+      return;
+    }
+
     dbg.log('MSG: fresh INIT — running X3DH respond…');
 
     final preKeyStore = await storage.getPreKeyStore();
@@ -1533,16 +1559,6 @@ class PhantomCore {
     }
 
     dbg.log('MSG: ✓ INIT decrypted OK — type=${message.type.name}');
-
-    // Simultaneous re-init tiebreaker: if both sides cleared history and sent
-    // INITs at the same time, the side with the larger phantom ID keeps its
-    // sender session so both end up with a compatible sender/receiver pair.
-    // The "loser" side's first message is lost but they can resend immediately.
-    if (myId.compareTo(senderPhantomId) > 0 &&
-        _sessions[senderPhantomId]?.pendingX3dhEphemeralKey != null) {
-      dbg.log('MSG: tiebreaker — dropping incoming INIT (we win)');
-      return;
-    }
 
     // Build a full ContactRecord from the embedded ContactAddress when possible,
     // so we can re-initiate sessions later without the sender needing to resend.
