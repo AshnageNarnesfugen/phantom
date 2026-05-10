@@ -40,6 +40,11 @@ git clone --depth=1 --branch "$YGG_VERSION" \
 cd "$WORKDIR"
 go mod download
 
+# gobind needs `golang.org/x/mobile/bind` resolvable from the target module.
+# Yggdrasil-go doesn't declare it, so add it explicitly before binding.
+go get golang.org/x/mobile/bind@latest
+go mod tidy
+
 # 4. Bind. The contrib/mobile package exposes the Yggdrasil type used by
 # YggDroid; same API works for any Android app that wants in-process routing.
 gomobile bind \
