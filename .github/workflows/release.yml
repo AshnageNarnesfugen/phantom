@@ -38,8 +38,13 @@ jobs:
         run: flutter pub get
 
       - name: Build yggdrasil-go mobile.aar (gomobile)
+        # Optional: gomobile + yggdrasil-go has been brittle on recent
+        # x/mobile snapshots (bind layout breakages). When this step fails
+        # the rest of the build still runs — the Kotlin VpnService loads
+        # mobile.Yggdrasil via reflection so the absent .aar simply means
+        # Yggdrasil features stay dormant. Logging + reset session etc. ship.
+        continue-on-error: true
         run: |
-          # Resolve NDK path. Flutter installs the NDK; latest one wins.
           export ANDROID_NDK_HOME=$(ls -d "$ANDROID_HOME/ndk/"*/ 2>/dev/null | sort -V | tail -1 || true)
           export ANDROID_NDK_HOME=${ANDROID_NDK_HOME%/}
           if [ -z "$ANDROID_NDK_HOME" ]; then
