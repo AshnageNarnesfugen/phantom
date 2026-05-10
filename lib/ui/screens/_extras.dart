@@ -498,11 +498,24 @@ class _ReviveDialog extends StatefulWidget {
   final String contactId;
   final PhantomCore core;
   final PhantomTokens t;
+  /// Title rendered in the dialog. Defaults to the revive flow.
+  final String title;
+  /// Final-success message shown for 2s before auto-dismiss.
+  final String successMessage;
+  /// Final-failure message.
+  final String failureMessage;
+  /// Stream factory: builds the progress stream when the dialog mounts.
+  /// Defaults to [PhantomCore.reviveConnection].
+  final Stream<String> Function(PhantomCore core, String contactId)? streamBuilder;
 
   const _ReviveDialog({
     required this.contactId,
     required this.core,
     required this.t,
+    this.title = 'Reviving Connection',
+    this.successMessage = 'connection revived!',
+    this.failureMessage = 'revive failed',
+    this.streamBuilder,
   });
 
   @override
@@ -532,11 +545,14 @@ class _ReviveDialogState extends State<_ReviveDialog> with SingleTickerProviderS
   }
 
   void _startRevive() async {
-    await for (final status in widget.core.reviveConnection(widget.contactId)) {
+    final stream = widget.streamBuilder != null
+        ? widget.streamBuilder!(widget.core, widget.contactId)
+        : widget.core.reviveConnection(widget.contactId);
+    await for (final status in stream) {
       if (!mounted) break;
       if (status == 'success') {
         setState(() {
-          _status = 'connection revived!';
+          _status = widget.successMessage;
           _finished = true;
           _success = true;
         });
@@ -546,7 +562,7 @@ class _ReviveDialogState extends State<_ReviveDialog> with SingleTickerProviderS
         break;
       } else if (status == 'failed') {
         setState(() {
-          _status = 'revive failed';
+          _status = widget.failureMessage;
           _finished = true;
           _success = false;
         });
@@ -623,7 +639,7 @@ class _ReviveDialogState extends State<_ReviveDialog> with SingleTickerProviderS
               ),
             const SizedBox(height: 24),
             Text(
-              'Reviving Connection',
+              widget.title,
               style: TextStyle(
                 color: t.textPrimary,
                 fontFamily: 'monospace',

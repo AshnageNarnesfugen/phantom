@@ -37,6 +37,19 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+      - name: Build yggdrasil-go mobile.aar (gomobile)
+        run: |
+          # Resolve NDK path. Flutter installs the NDK; latest one wins.
+          export ANDROID_NDK_HOME=$(ls -d "$ANDROID_HOME/ndk/"*/ 2>/dev/null | sort -V | tail -1 || true)
+          export ANDROID_NDK_HOME=${ANDROID_NDK_HOME%/}
+          if [ -z "$ANDROID_NDK_HOME" ]; then
+            sdkmanager --install "ndk;26.3.11579264"
+            export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/26.3.11579264"
+          fi
+          echo "Using NDK: $ANDROID_NDK_HOME"
+          mkdir -p android/app/libs
+          bash scripts/build_yggdrasil_mobile.sh android/app/libs/yggdrasil-mobile.aar
+
       - name: Download arm64 Kubo binary
         run: bash scripts/download_kubo.sh arm64-v8a
 

@@ -55,6 +55,16 @@
     <!-- BLE feature — no requerida, permite instalar en dispositivos sin BLE -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false"/>
 
+    <!-- Yggdrasil VpnService — establishes a TUN device for the 0200::/7 mesh.
+         BIND_VPN_SERVICE is the system permission Android requires for any
+         VpnService subclass; the user is also prompted via VpnService.prepare()
+         the first time we start the service. -->
+    <queries>
+        <intent>
+            <action android:name="android.net.VpnService"/>
+        </intent>
+    </queries>
+
     <application
         android:label="Phantom Messenger"
         android:name="${applicationName}"
@@ -109,6 +119,19 @@
             android:name=".PhantomMessagingService"
             android:exported="false"
             android:foregroundServiceType="dataSync"/>
+
+        <!-- Yggdrasil VPN service — owns the TUN device that hosts our 0200::/7
+             address. permission=BIND_VPN_SERVICE is mandatory for any
+             VpnService subclass per Android security model. -->
+        <service
+            android:name=".YggdrasilVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="dataSync">
+            <intent-filter>
+                <action android:name="android.net.VpnService"/>
+            </intent-filter>
+        </service>
 
         <!-- Restart IPFS daemon on device boot -->
         <receiver

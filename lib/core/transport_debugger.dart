@@ -15,14 +15,18 @@ class TransportDebugger {
   List<String>   get entries => List.unmodifiable(_entries);
 
   void log(String msg) {
-    if (!kDebugMode) return;
+    // The in-app Transport Debugger view depends on both [_entries] and the
+    // broadcast stream, so they are always populated — there is no risk of
+    // accidental disclosure beyond the user already running their own app.
+    // Only the logcat sink is gated, since logcat is reachable from `adb logs`
+    // and via apps holding READ_LOGS on rooted devices.
     final now = DateTime.now();
     final ts  = '${_p(now.hour)}:${_p(now.minute)}:${_p(now.second)}.${_p2(now.millisecond ~/ 10)}';
     final line = '[$ts] $msg';
     _entries.add(line);
     if (_entries.length > _max) _entries.removeAt(0);
     if (!_ctrl.isClosed) _ctrl.add(line);
-    debugPrint('[Transport] $msg');
+    if (kDebugMode) debugPrint('[Transport] $msg');
   }
 
   void clear() => _entries.clear();

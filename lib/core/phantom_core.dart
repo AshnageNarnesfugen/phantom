@@ -421,6 +421,7 @@ class PhantomCore {
       MessageType.readReceipt,
       MessageType.connectivityInfo,
       MessageType.preKeyShare,
+      MessageType.handshakeAck,
     };
     if (!systemTypes.contains(message.type)) {
       await storage.saveMessage(stored);
@@ -450,7 +451,8 @@ class PhantomCore {
 
           if (isHandshake && status == MessageStatus.sent &&
               message.type != MessageType.connectivityInfo &&
-              message.type != MessageType.preKeyShare) {
+              message.type != MessageType.preKeyShare &&
+              message.type != MessageType.handshakeAck) {
             final dbg = TransportDebugger.instance;
             dbg.log('DBG: before _sendConnectivityInfo, session.pendingX3dhEk is null? ${session.pendingX3dhEphemeralKey == null}');
             unawaited(_sendConnectivityInfo(recipientId));
@@ -467,7 +469,8 @@ class PhantomCore {
 
           if (isHandshake &&
               message.type != MessageType.connectivityInfo &&
-              message.type != MessageType.preKeyShare) {
+              message.type != MessageType.preKeyShare &&
+              message.type != MessageType.handshakeAck) {
             final dbg = TransportDebugger.instance;
             dbg.log('DBG: before _sendConnectivityInfo, session.pendingX3dhEk is null? ${session.pendingX3dhEphemeralKey == null}');
             unawaited(_sendConnectivityInfo(recipientId));
@@ -647,21 +650,54 @@ class PhantomCore {
   }
 
   /// Reset the session AND immediately send a fresh INIT handshake.
-  /// Returns true if the INIT was sent successfully.
-  Future<bool> resendHandshake(String contactId) async {
+  /// Yields progress strings; the final value is 'success' or 'failed'.
+  ///
+  /// Success means the remote peer actually received the INIT, processed it,
+  /// and sent back an automatic handshakeAck within 30 seconds. A successful
+  /// IPFS publish that never reaches the peer reports 'failed'.
+  Stream<String> resendHandshake(String contactId) async* {
+    final dbg = TransportDebugger.instance;
+    final short = contactId.substring(0, 8);
+
+    yield 'resetting session…';
     await resetSession(contactId);
+
+    yield 'sending handshake…';
     try {
-      // Sending any message will trigger a fresh X3DH handshake since
-      // the session state was deleted.
       await _sendPhantomMessage(
         recipientId: contactId,
-        message: PhantomMessage(type: MessageType.text, content: utf8.encode('[session reset]')),
+        message: PhantomMessage(
+          type: MessageType.text,
+          content: utf8.encode('[session reset]'),
+        ),
       );
-      TransportDebugger.instance.log('SESSION: INIT re-sent to ${contactId.substring(0, 8)}');
-      return true;
+      dbg.log('SESSION: INIT re-sent to $short — waiting for ack…');
     } catch (e) {
-      TransportDebugger.instance.log('SESSION: INIT re-send failed: $e');
-      return false;
+      dbg.log('SESSION: INIT re-send failed: $e');
+      yield 'failed';
+      return;
+    }
+
+    yield 'waiting for ack…';
+    final completer = Completer<bool>();
+    final sub = incomingMessages
+        .where((m) => m.conversationId == contactId)
+        .listen((_) {
+      if (!completer.isCompleted) completer.complete(true);
+    });
+    Timer(const Duration(seconds: 30), () {
+      if (!completer.isCompleted) completer.complete(false);
+    });
+
+    final got = await completer.future;
+    await sub.cancel();
+
+    if (got) {
+      dbg.log('SESSION: ✓ ack received from $short — handshake complete');
+      yield 'success';
+    } else {
+      dbg.log('SESSION: ✗ no ack from $short within 30s');
+      yield 'failed';
     }
   }
 
@@ -1539,6 +1575,14 @@ class PhantomCore {
       await storage.consumeOneTimePreKey(frame.opkId!);
       unawaited(_replenishAndAdvertiseOpks(senderPhantomId));
     }
+
+    // Auto-acknowledge so the sender's resendHandshake stream knows the INIT
+    // landed and a session was actually established. Empty payload — the
+    // arrival on incomingMessages is the signal.
+    unawaited(_sendPhantomMessage(
+      recipientId: senderPhantomId,
+      message: PhantomMessage(type: MessageType.handshakeAck, content: Uint8List(0)),
+    ));
   }
 
   /// Builds a [ContactRecord] from data available in an INIT frame.
@@ -1680,6 +1724,17 @@ class PhantomCore {
 
     if (message.type == MessageType.preKeyShare) {
       await _handleIncomingPreKeyShare(senderId, message.content);
+      return;
+    }
+
+    if (message.type == MessageType.handshakeAck) {
+      // Receipt is implicit — the message arriving on incomingMessages is the
+      // confirmation. Don't surface in chat history; just emit so resendHandshake
+      // streams unblock.
+      _incomingController.add(StoredMessage.fromPhantomMessage(
+        msg: message, conversationId: senderId,
+        direction: MessageDirection.incoming, status: MessageStatus.delivered,
+      ));
       return;
     }
 

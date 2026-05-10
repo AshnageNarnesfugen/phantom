@@ -19,6 +19,13 @@ if (keyPropertiesFile.exists()) {
     keyPropertiesFile.inputStream().use { keyProperties.load(it) }
 }
 
+// libs/ holds the Yggdrasil mobile.aar produced by scripts/build_yggdrasil_mobile.sh
+// (or the workflow). When the file is missing locally, Yggdrasil features simply
+// won't link — IPFS / I2P / BLE keep working.
+repositories {
+    flatDir { dirs("libs") }
+}
+
 android {
     namespace = "com.phantom.phantom_messenger"
     compileSdk = flutter.compileSdkVersion
@@ -76,6 +83,10 @@ android {
 
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+    // Optional Yggdrasil binding — only present when the workflow / local build
+    // has populated libs/yggdrasil-mobile.aar. The fileTree filter avoids a
+    // hard failure when the file is absent.
+    implementation(fileTree("libs") { include("yggdrasil-mobile.aar") })
 }
 
 flutter {

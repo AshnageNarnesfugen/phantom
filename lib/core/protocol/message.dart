@@ -33,7 +33,8 @@ enum MessageType {
   avatarData(0x30),
   aliasData(0x31),
   connectivityInfo(0x32),
-  preKeyShare(0x33);
+  preKeyShare(0x33),
+  handshakeAck(0x34);
 
   final int code;
   const MessageType(this.code);

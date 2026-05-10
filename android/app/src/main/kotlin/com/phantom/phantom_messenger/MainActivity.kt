@@ -2,9 +2,11 @@ package com.phantom.phantom_messenger
 
 import android.app.WallpaperManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
+import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
@@ -14,6 +16,8 @@ import java.io.ByteArrayOutputStream
 
 class MainActivity : FlutterActivity() {
     private var gattServer: PhantomGattServer? = null
+    private var pendingVpnPermissionResult: MethodChannel.Result? = null
+    private val VPN_PERMISSION_REQ = 0xFEED
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -91,6 +95,54 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // ── Yggdrasil VPN daemon channel ──────────────────────────────────────
+        MethodChannel(
+            flutterEngine!!.dartExecutor.binaryMessenger,
+            "phantom/yggdrasil_daemon",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                // Returns true when the user has already granted VPN permission.
+                // When false, the caller should next invoke "requestPermission".
+                "isPrepared" -> {
+                    result.success(VpnService.prepare(applicationContext) == null)
+                }
+                "requestPermission" -> {
+                    val intent = VpnService.prepare(applicationContext)
+                    if (intent == null) {
+                        result.success(true)
+                    } else {
+                        pendingVpnPermissionResult = result
+                        startActivityForResult(intent, VPN_PERMISSION_REQ)
+                    }
+                }
+                "startService" -> {
+                    try {
+                        val args = call.arguments as Map<*, *>
+                        val cfg  = args["configJson"] as String
+                        val addr = args["address"] as String
+                        val intent = YggdrasilVpnService.startIntent(applicationContext, cfg, addr)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("YGG_START_FAILED", e.message, null)
+                    }
+                }
+                "stopService" -> {
+                    try {
+                        startService(YggdrasilVpnService.stopIntent(applicationContext))
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("YGG_STOP_FAILED", e.message, null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         // ── Messaging service channel ─────────────────────────────────────────
         MethodChannel(
             flutterEngine!!.dartExecutor.binaryMessenger,
@@ -152,6 +204,15 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == VPN_PERMISSION_REQ) {
+            pendingVpnPermissionResult?.success(resultCode == RESULT_OK)
+            pendingVpnPermissionResult = null
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
     }
 
     override fun onDestroy() {

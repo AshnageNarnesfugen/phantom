@@ -5,6 +5,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
 import 'core/phantom_core.dart';
 import 'core/ipfs_daemon.dart';
+import 'core/yggdrasil_daemon.dart';
 import 'core/notification_service.dart';
 import 'core_provider.dart';
 import 'ui/theme/phantom_theme.dart';
@@ -77,6 +78,7 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
     if (mounted) setState(() => _themeCtrl = persisted);
     if (Platform.isAndroid) {
       try { await IpfsDaemon.instance.ensure(); } catch (_) {}
+      try { await YggdrasilDaemon.instance.ensure(); } catch (_) {}
     }
     await _tryRestoreAccount();
   }

@@ -621,20 +621,21 @@ class _ChatScreenState extends State<ChatScreen> {
               _MenuItem(icon: Icons.sync_outlined, label: 'reset session', tokens: t,
                 onTap: () async {
                   Navigator.pop(context);
-                  if (core != null) {
-                    final messenger = ScaffoldMessenger.of(context);
-                    final ok = await core.resendHandshake(widget.contactId);
-                    if (mounted) {
-                      messenger.showSnackBar(SnackBar(
-                        content: Text(
-                          ok ? 'session reset — handshake re-sent' : 'reset failed — check transport',
-                          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-                        ),
-                        backgroundColor: ok ? t.bgSurface : const Color(0xFFCF6679),
-                      ));
-                      if (ok) _loadMessages(core);
-                    }
-                  }
+                  if (core == null) return;
+                  await showDialog(
+                    context: context,
+                    barrierDismissible: false,
+                    builder: (_) => _ReviveDialog(
+                      contactId: widget.contactId,
+                      core: core,
+                      t: t,
+                      title: 'Resetting Session',
+                      successMessage: 'session re-established',
+                      failureMessage: 'reset failed — peer did not respond',
+                      streamBuilder: (c, id) => c.resendHandshake(id),
+                    ),
+                  );
+                  if (mounted) _loadMessages(core);
                 }),
               _MenuItem(icon: Icons.delete_outline, label: 'clear history', tokens: t,
                 onTap: () async {
