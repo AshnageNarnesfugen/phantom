@@ -161,7 +161,7 @@ class _AddContactScreenState extends State<AddContactScreen> {
                 preferredSize: const Size.fromHeight(0.5),
                 child: Divider(height: 0.5, color: t.divider)),
       ),
-      body: Padding(
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,

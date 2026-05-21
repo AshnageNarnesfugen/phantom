@@ -1103,7 +1103,12 @@ class I2PTransport implements PhantomTransport {
 
   final _incoming = StreamController<IncomingEnvelope>.broadcast();
 
-  static const _sessionId = 'phantom-main';
+  /// SAM session identifier. Regenerated on every connection attempt to
+  /// avoid DUPLICATED_ID when a previous SESSION CREATE was accepted by
+  /// SAM but its reply timed out on our side (cold-start i2pd can take
+  /// 30+ seconds to answer the first command), leaving a zombie session
+  /// holding the old name.
+  String _sessionId = 'phantom-${DateTime.now().millisecondsSinceEpoch}';
 
   @override
   final String name = 'i2p-sam';
@@ -1154,6 +1159,9 @@ class I2PTransport implements PhantomTransport {
   Future<bool> _ensureSession() async {
     if (_ready && _control != null && _udp != null) return true;
     final dbg = TransportDebugger.instance;
+    // Fresh session name per attempt so a stalled previous SESSION CREATE
+    // doesn't make us collide with our own zombie session on SAM's side.
+    _sessionId = 'phantom-${DateTime.now().microsecondsSinceEpoch}';
     try {
       // Bind+listen exactly once per process. RawDatagramSocket is a
       // single-subscription stream; calling listen() twice (on a retry after
@@ -1197,7 +1205,11 @@ class I2PTransport implements PhantomTransport {
           'SESSION CREATE STYLE=DATAGRAM ID=$_sessionId DESTINATION=$destArg '
           'PORT=$myUdp HOST=127.0.0.1\n';
       s.add(utf8.encode(createCmd));
-      final status = await next(const Duration(seconds: 20));
+      // i2pd often takes 30-60 s on cold start before replying to SESSION
+      // CREATE (it has to reseed + build initial tunnels). A short timeout
+      // here means we try again with a new session id while the previous
+      // command is still being processed, and DUPLICATED_ID errors pile up.
+      final status = await next(const Duration(seconds: 90));
       if (!status.contains('RESULT=OK')) {
         dbg.log('I2P: SESSION CREATE rejected: $status');
         await _teardown();

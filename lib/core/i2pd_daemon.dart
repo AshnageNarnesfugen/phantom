@@ -26,9 +26,20 @@ class I2pdDaemon {
   /// SAM control TCP port. Hard-coded to match [I2PTransport] defaults.
   static const samPort = 7656;
 
-  /// How long we poll the SAM control port for liveness after starting
-  /// the service before giving up and falling back to a direct spawn.
+  /// How long the *direct-spawn fallback* polls the SAM control port after
+  /// launching the binary. The ForegroundService is allowed to take much
+  /// longer (see [_serviceBootGraceSeconds]) because it gets its own life
+  /// support from Android and can outlive this call.
   static const _serviceWaitSeconds = 5;
+
+  /// Maximum time we wait for the ForegroundService-managed daemon to bring
+  /// SAM up before giving up *on the synchronous check* — we never spawn a
+  /// second daemon process even if this elapses, because a parallel daemon
+  /// would just lose the pid-file race and exit. The transport's own
+  /// availability probe keeps polling and will pick up SAM whenever it
+  /// eventually starts answering (first-run reseed + keypair generation can
+  /// take 20-40 s on a cold device).
+  static const _serviceBootGraceSeconds = 30;
 
   static final instance = I2pdDaemon._();
   I2pdDaemon._();
@@ -82,9 +93,11 @@ class I2pdDaemon {
       await _writeConfigsIfNeeded(dataDir);
       _logBuf.writeln('[init] config ready');
 
-      // Prefer the foreground service (survives app swipe). If the service
-      // call throws OR SAM doesn't come up in time, we fall back to a direct
-      // Process.start — same shape as IpfsDaemon.
+      // Prefer the foreground service (survives app swipe). Only fall back
+      // to a direct Process.start when the service call itself fails —
+      // running two parallel daemons against the same data dir means the
+      // loser hits "Could not lock pid file ... Try again" and exits, which
+      // shows up as a scary-looking error in logs even though it's harmless.
       bool serviceStarted = false;
       try {
         await _ch.invokeMethod<void>('startService', {
@@ -97,14 +110,18 @@ class I2pdDaemon {
         _logBuf.writeln('[init] ForegroundService error: $e');
       }
 
-      final samReady = serviceStarted
-          ? await _waitForSam(seconds: _serviceWaitSeconds)
-          : false;
-      _logBuf.writeln('[init] SAM ready via service: $samReady');
-
-      if (!samReady) {
-        _logBuf.writeln('[init] spawning daemon directly…');
+      if (serviceStarted) {
+        // Best-effort liveness probe so callers waiting on us see "SAM up"
+        // when possible. We do NOT spawn a fallback if this times out —
+        // i2pd's first-run reseed often takes 20-40 s, and the transport's
+        // own availability probe keeps trying every few seconds anyway.
+        final samReady = await _waitForSam(seconds: _serviceBootGraceSeconds);
+        _logBuf.writeln('[init] SAM ready via service: $samReady '
+            '(checked over ${_serviceBootGraceSeconds}s)');
+      } else {
+        _logBuf.writeln('[init] spawning daemon directly (service unavailable)…');
         await _spawnDaemonDirectly(binary, dataDir);
+        await _waitForSam(seconds: _serviceWaitSeconds);
       }
     } catch (e, st) {
       _logBuf.writeln('[init] EXCEPTION: $e\n$st');
