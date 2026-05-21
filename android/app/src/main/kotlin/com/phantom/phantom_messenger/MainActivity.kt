@@ -1,6 +1,7 @@
 package com.phantom.phantom_messenger
 
 import android.app.WallpaperManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -9,10 +10,14 @@ import android.graphics.drawable.BitmapDrawable
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : FlutterActivity() {
     private var gattServer: PhantomGattServer? = null
@@ -54,6 +59,28 @@ class MainActivity : FlutterActivity() {
                         result.success(out.toByteArray())
                     } catch (_: Exception) {
                         result.success(null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        // ── Diagnostics channel ───────────────────────────────────────────────
+        // Mirrors Dart's _writeCrashLog to a publicly-readable path so the
+        // user can pull the crash trace without root / adb when reproducing
+        // a release-only failure.
+        MethodChannel(
+            flutterEngine!!.dartExecutor.binaryMessenger,
+            "phantom/diagnostics",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "writeCrashToDownloads" -> {
+                    try {
+                        val body = call.argument<String>("body") ?: ""
+                        val path = writeCrashToDownloads(body)
+                        result.success(path)
+                    } catch (e: Exception) {
+                        result.error("CRASH_WRITE_FAILED", e.message, null)
                     }
                 }
                 else -> result.notImplemented()
@@ -253,5 +280,50 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         gattServer?.stop()
         super.onDestroy()
+    }
+
+    /**
+     * Writes [body] to a public-storage file the user can open with any file
+     * manager. On Android 10+ we use MediaStore.Downloads (no permission
+     * needed, no scoped-storage restriction). On older releases we fall back
+     * to a direct write under the public Downloads dir, which requires the
+     * WRITE_EXTERNAL_STORAGE permission already declared in the manifest
+     * for maxSdkVersion=29.
+     *
+     * Each call appends a timestamp suffix so successive crashes don't
+     * overwrite one another. Returns the human-readable target path.
+     */
+    private fun writeCrashToDownloads(body: String): String {
+        val stamp  = System.currentTimeMillis()
+        val name   = "phantom-crash-$stamp.txt"
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE,    "text/plain")
+                put(MediaStore.Downloads.IS_PENDING,   1)
+            }
+            val resolver = contentResolver
+            val uri = resolver.insert(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI, values,
+            ) ?: throw RuntimeException("MediaStore.insert returned null")
+            resolver.openOutputStream(uri)?.use { os ->
+                os.write(body.toByteArray(Charsets.UTF_8))
+            } ?: throw RuntimeException("openOutputStream returned null")
+            values.clear()
+            values.put(MediaStore.Downloads.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            return "Downloads/$name"
+        }
+
+        // Pre-Android-10 path: direct write to the public Downloads dir.
+        @Suppress("DEPRECATION")
+        val dir = Environment.getExternalStoragePublicDirectory(
+            Environment.DIRECTORY_DOWNLOADS
+        )
+        dir.mkdirs()
+        val file = File(dir, name)
+        FileOutputStream(file).use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        return file.absolutePath
     }
 }

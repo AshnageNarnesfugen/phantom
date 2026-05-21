@@ -16,6 +16,7 @@ import 'ui/screens/screens.dart';
 const _seedKey = 'phantom_seed_v1';
 
 const _messagingChannel = MethodChannel('phantom/messaging');
+const _diagnosticsChannel = MethodChannel('phantom/diagnostics');
 
 void _startMessagingService() {
   if (!Platform.isAndroid) return;
@@ -32,18 +33,25 @@ void _stopMessagingService() {
 /// the only viable diagnostic channel in release mode when the user can't
 /// run `adb logcat` — Dart's normal stderr is invisible there.
 Future<void> _writeCrashLog(Object error, StackTrace? stack) async {
+  final ts = DateTime.now().toIso8601String();
+  final body = '─── CRASH @ $ts ───\n$error\n$stack\n\n';
+
+  // 1. Internal storage — read by [_dumpPreviousCrashIfAny] on next launch.
   try {
     final dir = await getApplicationDocumentsDirectory();
     final f = File('${dir.path}/last_crash.txt');
-    final ts = DateTime.now().toIso8601String();
-    await f.writeAsString(
-      '─── CRASH @ $ts ───\n$error\n$stack\n\n',
-      mode: FileMode.append,
-    );
-  } catch (_) {
-    // If even writing the crash log fails there's nothing left to do —
-    // swallowing the error here is intentional, we don't want a logging
-    // failure to take down the app.
+    await f.writeAsString(body, mode: FileMode.append);
+  } catch (_) {}
+
+  // 2. Public Downloads via MediaStore — survives uninstall and is readable
+  // from any file manager without root or adb. This is the diagnostic
+  // channel the user can actually reach when a release-mode crash kills
+  // the app before any UI loads.
+  if (Platform.isAndroid) {
+    try {
+      await _diagnosticsChannel
+          .invokeMethod<String>('writeCrashToDownloads', {'body': body});
+    } catch (_) {}
   }
 }
 
