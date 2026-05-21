@@ -60,6 +60,14 @@ jobs:
       - name: Download arm64 Kubo binary
         run: bash scripts/download_kubo.sh arm64-v8a
 
+      - name: Bundle i2pd binaries (PurpleI2P)
+        # Non-blocking: when the script can't fetch the upstream APKs (asset
+        # names changed, release moved, network hiccup) the rest of the build
+        # still succeeds. The Dart-side I2pdDaemon logs the missing binary and
+        # I2PTransport gracefully falls back to IPFS for handshakes.
+        continue-on-error: true
+        run: bash scripts/download_i2pd.sh arm64-v8a x86_64
+
       - name: Build static x86_64 Kubo binary
         run: |
           # go install doesn't work for Kubo because its go.mod has exclude

@@ -95,6 +95,41 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // ── i2pd daemon channel ───────────────────────────────────────────────
+        MethodChannel(
+            flutterEngine!!.dartExecutor.binaryMessenger,
+            "phantom/i2pd_daemon",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getNativeLibDir" -> {
+                    result.success(applicationContext.applicationInfo.nativeLibraryDir)
+                }
+                "startService" -> {
+                    try {
+                        val args       = call.arguments as Map<*, *>
+                        val binaryPath = args["binaryPath"] as String
+                        val dataDir    = args["dataDir"]   as String
+                        val intent     = I2pdForegroundService.startIntent(
+                            applicationContext, binaryPath, dataDir,
+                        )
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("I2PD_START_FAILED", e.message, null)
+                    }
+                }
+                "stopService" -> {
+                    startService(I2pdForegroundService.stopIntent(applicationContext))
+                    result.success(null)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         // ── Yggdrasil VPN daemon channel ──────────────────────────────────────
         MethodChannel(
             flutterEngine!!.dartExecutor.binaryMessenger,

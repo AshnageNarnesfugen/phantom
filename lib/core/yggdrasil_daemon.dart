@@ -75,13 +75,14 @@ class YggdrasilDaemon {
 
   Future<bool> _startService() async {
     final cfg = await _loadOrGenerateConfig();
-    _address = cfg.address;
+    // Empty cfg.address means we are waiting for the Go side to pick one.
+    _address = cfg.address.isEmpty ? null : cfg.address;
     try {
       await _ch.invokeMethod<void>('startService', {
         'configJson': cfg.json,
         'address':    cfg.address,
       });
-      debugPrint('[YggDaemon] service started — address=${cfg.address}');
+      debugPrint('[YggDaemon] service started — address=${_address ?? "(pending)"}');
       return true;
     } catch (e) {
       debugPrint('[YggDaemon] startService failed: $e');
@@ -98,16 +99,16 @@ class YggdrasilDaemon {
       try {
         final json = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
         final addr = json['_phantom_address'] as String?;
-        if (addr != null) {
+        if (addr != null && addr.isNotEmpty && _isYggAddress(addr)) {
           return _YggConfig(json: jsonEncode(json), address: addr);
         }
       } catch (_) {}
     }
-    // Generate fresh — actual key generation happens on the Go side via
-    // mobile.Yggdrasil.GenConf(). For the first iteration we ship a minimal
-    // config and let yggdrasil-go fill in the random keys at startup.
+    // First run / corrupt config: ship a minimal config and let mobile.Yggdrasil
+    // fill in the real keypair + 0200::/7 address on its first startJSON call.
+    // We persist the empty `_phantom_address` so the next launch knows to look
+    // up the real address from the TUN scan rather than re-trusting the file.
     final config = <String, dynamic>{
-      // Public peers — small set of well-known nodes. Users can extend later.
       'Peers': [
         'tls://ygg-ukfi.incognet.io:8884',
         'tls://ygg-ukcov.incognet.io:8884',
@@ -116,13 +117,26 @@ class YggdrasilDaemon {
       'PeersByListenAddress': <String, dynamic>{},
       'IfMTU': 1280,
       'NodeInfoPrivacy': true,
-      // Placeholder — real keys + address get baked in by the Go side on
-      // first startup and persisted via a follow-up call.
-      '_phantom_address': 'fc00::1',
+      '_phantom_address': '',
     };
     final encoded = jsonEncode(config);
     await f.writeAsString(encoded);
-    return _YggConfig(json: encoded, address: config['_phantom_address'] as String);
+    return _YggConfig(json: encoded, address: '');
+  }
+
+  /// True if [s] is a valid Yggdrasil 0200::/7 IPv6 address. The Go side never
+  /// returns anything outside that range when running, so this is a cheap way
+  /// to reject the legacy `fc00::1` placeholder we used to write.
+  static bool _isYggAddress(String s) {
+    if (s.isEmpty) return false;
+    try {
+      final addr = InternetAddress(s);
+      if (addr.type != InternetAddressType.IPv6) return false;
+      final b = addr.rawAddress;
+      return b.length == 16 && (b[0] == 0x02 || b[0] == 0x03);
+    } catch (_) {
+      return false;
+    }
   }
 }
 

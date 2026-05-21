@@ -1,9 +1,12 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'transport.dart' show TransportPriority;
 import 'bluetooth/bluetooth_mesh_transport.dart';
 import 'bluetooth/mesh_protocol.dart';
 import 'bluetooth/message_store.dart';
+
+export 'transport.dart' show TransportPriority;
 
 // Retry interval when pending messages remain after a flush attempt.
 const _kRetryInterval = Duration(seconds: 30);
@@ -28,6 +31,7 @@ class TransportManagerV2 {
     required String recipientId,
     required Uint8List encryptedEnvelope,
     bool isHandshake,
+    TransportPriority priority,
   })? _internetPublish;
 
   TransportMode _mode = TransportMode.offline;
@@ -52,6 +56,7 @@ class TransportManagerV2 {
       required String recipientId,
       required Uint8List encryptedEnvelope,
       bool isHandshake,
+      TransportPriority priority,
     })? internetPublish,
   })  : _btMesh = btMesh,
         _store = store,
@@ -100,6 +105,7 @@ class TransportManagerV2 {
     required String fullMessageId,
     required Uint8List encryptedEnvelope,
     bool isHandshake = false,
+    TransportPriority priority = TransportPriority.data,
   }) async {
     switch (_mode) {
       case TransportMode.internet:
@@ -108,6 +114,7 @@ class TransportManagerV2 {
             recipientId: recipientId,
             encryptedEnvelope: encryptedEnvelope,
             isHandshake: isHandshake,
+            priority: priority,
           );
           return SendResult.sent(via: TransportSource.internet);
         } catch (e) {
@@ -233,6 +240,9 @@ class TransportManagerV2 {
       } catch (_) {
         _store.recordAttempt(msg.packet.messageIdHex);
       }
+      // Yield to the event loop between sends so a long pending queue
+      // doesn't starve the connectivity listener.
+      await Future<void>.delayed(Duration.zero);
     }
 
     // If messages still couldn't be delivered (e.g. ntfy rate-limited), retry

@@ -79,6 +79,10 @@ class BluetoothMeshTransport {
   Timer? _announceTimer;
   Timer? _pruneTimer;
 
+  /// Last advertised hasPending flag — used to skip re-advertise calls when
+  /// the queue length hasn't actually crossed the zero / non-zero boundary.
+  bool _lastAdvertisedHasPending = false;
+
   // Estado
   bool _isRunning = false;
   bool _btAvailable = false;
@@ -138,17 +142,35 @@ class BluetoothMeshTransport {
   }
 
   Future<void> _startAll() async {
-    // Start GATT server + advertising so other devices can connect to us
+    final hasPending = _store.pendingCount > 0;
+    _lastAdvertisedHasPending = hasPending;
     final advPayload = MeshAdvertisement.forNode(
       phantomId: _myPhantomId,
       canRelay: true,
-      hasPending: _store.pendingCount > 0,
+      hasPending: hasPending,
     ).toAdvPayload();
     final startResult = await _gattServer.start(advPayload);
     if (!startResult.success) {
       _emitState(MeshState.unavailable(startResult.reason ?? 'No se pudo iniciar BLE'));
       return;
     }
+
+    // Re-advertise only when the pending boundary flips. Restarting the
+    // GATT server is expensive, so we deliberately skip updates that don't
+    // change the broadcast bit other scanners can observe.
+    _subs.add(_store.pendingCountStream.listen((count) async {
+      if (!_isRunning) return;
+      final next = count > 0;
+      if (next == _lastAdvertisedHasPending) return;
+      _lastAdvertisedHasPending = next;
+      try {
+        await _gattServer.start(MeshAdvertisement.forNode(
+          phantomId: _myPhantomId,
+          canRelay: true,
+          hasPending: next,
+        ).toAdvPayload());
+      } catch (_) {}
+    }));
 
     // Wire incoming GATT server writes to our receive pipeline
     _subs.add(_gattServer.received.listen((data) {
@@ -182,24 +204,39 @@ class BluetoothMeshTransport {
     _gattServer.stop();
     _announceTimer?.cancel();
     _pruneTimer?.cancel();
+    _scanCycleTimer?.cancel();
   }
 
   // ── Scanning ──────────────────────────────────────────────────────────────
 
-  Future<void> _startScanning() async {
-    // Buscar dispositivos con nuestro service UUID
-    await FlutterBluePlus.startScan(
-      withServices: [Guid(kPhantomServiceUuid)],
-      // withMsd: buscar por manufacturer data (alternativo)
-      timeout: const Duration(days: 365), // continuo — se cancela en stop()
-      androidUsesFineLocation: false,
-    );
+  Timer? _scanCycleTimer;
 
+  Future<void> _startScanning() async {
+    await _kickScanCycle();
     _subs.add(FlutterBluePlus.scanResults.listen((results) {
       for (final result in results) {
         _handleScanResult(result);
       }
     }));
+
+    // Android limits an app to 5 startScan() calls per 30 s when the screen
+    // is off (opportunistic mode). To keep discovery alive without hitting
+    // the per-window cap, cycle the scan every 20 s: ~3 cycles per minute.
+    _scanCycleTimer?.cancel();
+    _scanCycleTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+      if (_isRunning && _btAvailable) _kickScanCycle();
+    });
+  }
+
+  Future<void> _kickScanCycle() async {
+    try { await FlutterBluePlus.stopScan(); } catch (_) {}
+    try {
+      await FlutterBluePlus.startScan(
+        withServices: [Guid(kPhantomServiceUuid)],
+        timeout: const Duration(seconds: 30),
+        androidUsesFineLocation: false,
+      );
+    } catch (_) {}
   }
 
   void _handleScanResult(ScanResult result) {

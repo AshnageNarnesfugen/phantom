@@ -1,9 +1,29 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:convert';
 import 'package:hive/hive.dart';
 import 'package:cryptography/cryptography.dart';
 import '../protocol/message.dart';
+
+/// Per-key async lock. Serializes read-modify-write sequences that the storage
+/// layer otherwise cannot guarantee atomic (OPK consumption, remote OPK pool,
+/// prekey top-up) when called concurrently from different transports.
+class _AsyncLock {
+  Future<void> _tail = Future.value();
+  Future<T> guard<T>(Future<T> Function() fn) {
+    final completer = Completer<void>();
+    final prev = _tail;
+    _tail = completer.future;
+    return prev.then((_) async {
+      try {
+        return await fn();
+      } finally {
+        completer.complete();
+      }
+    });
+  }
+}
 
 /// Encrypted local storage via Hive.
 ///
@@ -28,6 +48,11 @@ class PhantomStorage {
   static PhantomStorage? _instance;
   HiveAesCipher? _cipher;
   bool _initialized = false;
+
+  final _preKeyLock = _AsyncLock();
+  final Map<String, _AsyncLock> _opkLocks = {};
+  _AsyncLock _opkLock(String contactId) =>
+      _opkLocks.putIfAbsent(contactId, () => _AsyncLock());
 
   PhantomStorage._();
 
@@ -187,10 +212,27 @@ class PhantomStorage {
     return PreKeyStore.fromJson(Map<String, dynamic>.from(data as Map));
   }
 
-  Future<void> consumeOneTimePreKey(int id) async {
-    final store = await getPreKeyStore();
-    if (store == null) return;
-    await savePreKeyStore(store.withoutOneTimePreKey(id));
+  Future<void> consumeOneTimePreKey(int id) {
+    return _preKeyLock.guard(() async {
+      final store = await getPreKeyStore();
+      if (store == null) return;
+      await savePreKeyStore(store.withoutOneTimePreKey(id));
+    });
+  }
+
+  /// Read-modify-write the prekey store under the global lock. The caller
+  /// returns the updated store; null means "do nothing". Use this for OPK
+  /// pool top-ups so two concurrent calls cannot allocate the same id.
+  Future<PreKeyStore?> updatePreKeyStore(
+      Future<PreKeyStore?> Function(PreKeyStore current) mutate) {
+    return _preKeyLock.guard(() async {
+      final current = await getPreKeyStore();
+      if (current == null) return null;
+      final next = await mutate(current);
+      if (next == null) return current;
+      await savePreKeyStore(next);
+      return next;
+    });
   }
 
   // ── Remote OPK pool (per-contact, piggy-backed via preKeyShare) ──────────────
@@ -226,23 +268,27 @@ class PhantomStorage {
     await setSetting('opks_$contactId', encoded);
   }
 
-  Future<void> addRemoteOpk(String contactId, int id, Uint8List pub) async {
-    final list = await getRemoteOpks(contactId);
-    list.removeWhere((e) => e.id == id); // dedupe
-    list.add((id: id, pub: pub, rxAtUs: DateTime.now().microsecondsSinceEpoch));
-    while (list.length > _remoteOpkCacheSize) {
-      list.removeAt(0);
-    }
-    await _saveRemoteOpks(contactId, list);
+  Future<void> addRemoteOpk(String contactId, int id, Uint8List pub) {
+    return _opkLock(contactId).guard(() async {
+      final list = await getRemoteOpks(contactId);
+      list.removeWhere((e) => e.id == id);
+      list.add((id: id, pub: pub, rxAtUs: DateTime.now().microsecondsSinceEpoch));
+      while (list.length > _remoteOpkCacheSize) {
+        list.removeAt(0);
+      }
+      await _saveRemoteOpks(contactId, list);
+    });
   }
 
   /// Returns and removes the newest cached OPK for [contactId], or null.
-  Future<({int id, Uint8List pub})?> popRemoteOpk(String contactId) async {
-    final list = await getRemoteOpks(contactId);
-    if (list.isEmpty) return null;
-    final picked = list.removeLast();
-    await _saveRemoteOpks(contactId, list);
-    return (id: picked.id, pub: picked.pub);
+  Future<({int id, Uint8List pub})?> popRemoteOpk(String contactId) {
+    return _opkLock(contactId).guard(() async {
+      final list = await getRemoteOpks(contactId);
+      if (list.isEmpty) return null;
+      final picked = list.removeLast();
+      await _saveRemoteOpks(contactId, list);
+      return (id: picked.id, pub: picked.pub);
+    });
   }
 
   // ── Own public bundle ────────────────────────────────────────────────────────
@@ -259,6 +305,20 @@ class PhantomStorage {
     final data = box.get('bundle');
     if (data == null) return null;
     return Map<String, dynamic>.from(data as Map);
+  }
+
+  // ── I2P persistent destination keypair ───────────────────────────────────────
+  // The SAM bridge returns a base64-encoded full destination (private+public)
+  // when SESSION CREATE uses DESTINATION=TRANSIENT. Persisting it here means
+  // our public I2P destination remains stable across app restarts, so
+  // ContactAddress strings shared with other users never go stale.
+
+  Future<String?> getI2PPrivateDestination() async {
+    return getSetting<String>('i2p_priv_dest_v1');
+  }
+
+  Future<void> setI2PPrivateDestination(String b64) async {
+    await setSetting('i2p_priv_dest_v1', b64);
   }
 
   // ── Settings ─────────────────────────────────────────────────────────────────

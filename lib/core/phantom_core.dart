@@ -71,6 +71,8 @@ class PhantomCore {
   String? _activeChatId;
   void setActiveChat(String? contactId) => _activeChatId = contactId;
 
+  bool _disposed = false;
+
   // ── INIT rate limit ──────────────────────────────────────────────────────────
   // Sliding-window counter of fresh INITs per sender. Caps the cost of X3DH
   // respond + Kyber decapsulation an attacker can force on us by spamming
@@ -204,6 +206,9 @@ class PhantomCore {
       i2pSamHost:       config?.i2pSamHost,
       i2pSamPort:       config?.i2pSamPort,
       yggdrasilAddress: config?.yggdrasilAddress,
+      i2pLoadKey:       () => PhantomStorage.instance.getI2PPrivateDestination(),
+      i2pPersistKey:    (b64) =>
+          PhantomStorage.instance.setI2PPrivateDestination(b64),
     );
   }
 
@@ -225,11 +230,13 @@ class PhantomCore {
         required String recipientId,
         required Uint8List encryptedEnvelope,
         bool isHandshake = false,
+        TransportPriority priority = TransportPriority.data,
       }) =>
           v1.publish(
             recipientId:       recipientId,
             encryptedEnvelope: encryptedEnvelope,
             isHandshake:       isHandshake,
+            priority:          priority,
           ),
     );
   }
@@ -384,13 +391,12 @@ class PhantomCore {
     // so the receiver can persist our bundle and re-initiate sessions later).
     final Uint8List wire;
     if (x3dhEk != null) {
-      final caBytes = await _getMyContactAddressBytes();
       if (kyberCipher != null && opkId != null) {
         wire = WireFrame.wrapHybridInitWithOpk(
           senderIdentityKeyBytes:    identity.encryptionPublicKeyBytes,
           senderEphemeralKeyBytes:   x3dhEk,
           kyberCipherBytes:          kyberCipher,
-          senderContactAddressBytes: caBytes,
+          senderContactAddressBytes: await _getMyContactAddressBytes(),
           opkId:                     opkId,
           envelopeBytes:             envelopeBytes,
         );
@@ -399,14 +405,16 @@ class PhantomCore {
           senderIdentityKeyBytes:    identity.encryptionPublicKeyBytes,
           senderEphemeralKeyBytes:   x3dhEk,
           kyberCipherBytes:          kyberCipher,
-          senderContactAddressBytes: caBytes,
+          senderContactAddressBytes: await _getMyContactAddressBytes(),
           envelopeBytes:             envelopeBytes,
         );
       } else {
+        // Classical INIT (0x49) — wire layout reserves a fixed 165-byte CA
+        // slot, so the address MUST be v1 to round-trip cleanly.
         wire = WireFrame.wrapInit(
           senderIdentityKeyBytes:    identity.encryptionPublicKeyBytes,
           senderEphemeralKeyBytes:   x3dhEk,
-          senderContactAddressBytes: caBytes,
+          senderContactAddressBytes: await _getMyContactAddressBytes(forceV1: true),
           envelopeBytes:             envelopeBytes,
         );
       }
@@ -436,12 +444,17 @@ class PhantomCore {
       await storage.saveMessage(stored);
     }
 
-    // Try v2 transport first (BLE mesh + internet with fallback + store-and-forward).
-    // Fall back to v1 (internet-only) if v2 is not wired.
-    //
+    // Classify the outbound frame so the transport layer can pick the right
+    // backend: control plane (X3DH INIT + housekeeping) goes via I2P first,
+    // data plane (text / files) goes via IPFS (+ Yggdrasil). See
+    // [TransportManager.publish] for the full routing policy.
+    final isControl = isHandshake ||
+        message.type == MessageType.handshakeAck ||
+        message.type == MessageType.preKeyShare ||
+        message.type == MessageType.connectivityInfo;
+    final priority = isControl ? TransportPriority.control : TransportPriority.data;
+
     // For handshake INIT frames, retry up to 3 times with exponential backoff.
-    // The INIT is the most critical message — without it the session never
-    // establishes. Retries give the GossipSub mesh time to form.
     final maxAttempts = isHandshake ? 3 : 1;
 
     for (int attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -452,6 +465,7 @@ class PhantomCore {
             fullMessageId:      message.id,
             encryptedEnvelope:  wire,
             isHandshake:        isHandshake,
+            priority:           priority,
           );
           final status = (result.success || result.queued)
               ? MessageStatus.sent
@@ -473,6 +487,7 @@ class PhantomCore {
             recipientId: recipientId,
             encryptedEnvelope: wire,
             isHandshake: isHandshake,
+            priority:    priority,
           );
           await storage.updateMessageStatus(recipientId, message.id, MessageStatus.sent);
 
@@ -508,16 +523,19 @@ class PhantomCore {
     return stored.copyWith(status: MessageStatus.failed);
   }
 
-  /// Builds the raw ContactAddress bytes for inclusion in INIT frames.
-  /// Prefers v3 (1413 B, with IK↔SK signature) when both Kyber and ik_sig are
-  /// available; falls back to v2 (1349 B) for Kyber-only and v1 (165 B) otherwise.
-  Future<Uint8List> _getMyContactAddressBytes() async {
+  /// Builds the raw ContactAddress bytes to embed in an INIT frame.
+  ///
+  /// [forceV1] is set by the classical-INIT (0x49) branch: that wire format
+  /// reserves a fixed 165-byte CA slot, so emitting v2/v3 here would silently
+  /// truncate the CA on the wire and the receiver would persist a contact with
+  /// no SPK. The hybrid INIT frames (0x48 / 0x47) use length-prefixed CAs and
+  /// can carry v3 freely.
+  Future<Uint8List> _getMyContactAddressBytes({bool forceV1 = false}) async {
     final bundleJson = await storage.getOwnBundle();
     if (bundleJson == null) return Uint8List(165);
     final bundle = PreKeyBundle.fromJson(bundleJson);
 
-    if (_kyberPublicKeyBytes != null && bundle.identityKeySignature != null) {
-      // v3: [1=0x03][32 ik][32 sk][32 spk][4 spk_id][64 sig][1184 kyber_pk][64 ik_sig]
+    if (!forceV1 && _kyberPublicKeyBytes != null && bundle.identityKeySignature != null) {
       const len = 1413;
       final buf = ByteData(len);
       buf.setUint8(0, 0x03);
@@ -529,8 +547,7 @@ class PhantomCore {
       _setBytesInBuf(buf, 165,  _kyberPublicKeyBytes!,       1184);
       _setBytesInBuf(buf, 1349, bundle.identityKeySignature!,  64);
       return buf.buffer.asUint8List();
-    } else if (_kyberPublicKeyBytes != null) {
-      // v2: [1=0x02][32 ik][32 sk][32 spk][4 spk_id][64 sig][1184 kyber_pk]
+    } else if (!forceV1 && _kyberPublicKeyBytes != null) {
       const len = 1349;
       final buf = ByteData(len);
       buf.setUint8(0, 0x02);
@@ -542,7 +559,6 @@ class PhantomCore {
       _setBytesInBuf(buf, 165, _kyberPublicKeyBytes!,      1184);
       return buf.buffer.asUint8List();
     } else {
-      // v1: [1=0x01][32 ik][32 sk][32 spk][4 spk_id][64 sig]
       final buf = ByteData(165);
       buf.setUint8(0, 0x01);
       _setBytesInBuf(buf, 1,   bundle.identityKeyBytes,     32);
@@ -995,35 +1011,35 @@ class PhantomCore {
   /// Returns the freshly added entries (id → private bytes) so the caller can
   /// derive their public keys and broadcast preKeyShare messages.
   Future<Map<int, Uint8List>> _topUpOneTimePreKeys() async {
-    final store = await storage.getPreKeyStore();
-    if (store == null) return const {};
-    final missing = _opkPoolTarget - store.oneTimePreKeyPrivates.length;
-    if (missing <= 0) return const {};
-
-    final nextId = store.oneTimePreKeyPrivates.keys.fold<int>(
-        0, (m, id) => id > m ? id : m) + 1;
-    final updated = Map<int, Uint8List>.from(store.oneTimePreKeyPrivates);
     final added = <int, Uint8List>{};
-    final x25519 = X25519();
-    for (int i = 0; i < missing; i++) {
-      final kp = await x25519.newKeyPair();
-      final priv = Uint8List.fromList((await kp.extract()).bytes);
-      final id = nextId + i;
-      updated[id] = priv;
-      added[id]   = priv;
-    }
+    await storage.updatePreKeyStore((store) async {
+      final missing = _opkPoolTarget - store.oneTimePreKeyPrivates.length;
+      if (missing <= 0) return null;
 
-    await storage.savePreKeyStore(PreKeyStore(
-      signedPreKeyPrivate:    store.signedPreKeyPrivate,
-      signedPreKeyPublic:     store.signedPreKeyPublic,
-      signedPreKeyId:         store.signedPreKeyId,
-      oneTimePreKeyPrivates:  updated,
-      signedPreKeyCreatedAtUs:           store.signedPreKeyCreatedAtUs,
-      previousSignedPreKeyPrivate:       store.previousSignedPreKeyPrivate,
-      previousSignedPreKeyPublic:        store.previousSignedPreKeyPublic,
-      previousSignedPreKeyId:            store.previousSignedPreKeyId,
-      previousSignedPreKeyRetiredAtUs:   store.previousSignedPreKeyRetiredAtUs,
-    ));
+      final nextId = store.oneTimePreKeyPrivates.keys.fold<int>(
+          0, (m, id) => id > m ? id : m) + 1;
+      final updated = Map<int, Uint8List>.from(store.oneTimePreKeyPrivates);
+      final x25519 = X25519();
+      for (int i = 0; i < missing; i++) {
+        final kp = await x25519.newKeyPair();
+        final priv = Uint8List.fromList((await kp.extract()).bytes);
+        final id = nextId + i;
+        updated[id] = priv;
+        added[id]   = priv;
+      }
+
+      return PreKeyStore(
+        signedPreKeyPrivate:    store.signedPreKeyPrivate,
+        signedPreKeyPublic:     store.signedPreKeyPublic,
+        signedPreKeyId:         store.signedPreKeyId,
+        oneTimePreKeyPrivates:  updated,
+        signedPreKeyCreatedAtUs:           store.signedPreKeyCreatedAtUs,
+        previousSignedPreKeyPrivate:       store.previousSignedPreKeyPrivate,
+        previousSignedPreKeyPublic:        store.previousSignedPreKeyPublic,
+        previousSignedPreKeyId:            store.previousSignedPreKeyId,
+        previousSignedPreKeyRetiredAtUs:   store.previousSignedPreKeyRetiredAtUs,
+      );
+    });
     return added;
   }
 
@@ -1393,6 +1409,7 @@ class PhantomCore {
   }
 
   Future<void> _handleIncomingBytes(Uint8List data) async {
+    if (_disposed) return;
     final dbg = TransportDebugger.instance;
     try {
       final frame = WireFrame.parse(data);
@@ -1615,12 +1632,19 @@ class PhantomCore {
     }
 
     // Auto-acknowledge so the sender's resendHandshake stream knows the INIT
-    // landed and a session was actually established. Empty payload — the
-    // arrival on incomingMessages is the signal.
+    // landed and a session was actually established. Send via I2P first
+    // (control priority) so the ack travels independently of IPFS mesh
+    // formation — without this, an established session could appear "failed"
+    // for 30 s while gossipsub bootstraps on the responder's side.
+    //
+    // Piggy-back our own connectivityInfo on the same wake-up so the sender
+    // learns our I2P / IPFS / Ygg endpoints in one round trip instead of
+    // waiting for the next outbound MSG.
     unawaited(_sendPhantomMessage(
       recipientId: senderPhantomId,
       message: PhantomMessage(type: MessageType.handshakeAck, content: Uint8List(0)),
     ));
+    unawaited(_sendConnectivityInfo(senderPhantomId));
   }
 
   /// Builds a [ContactRecord] from data available in an INIT frame.
@@ -1880,6 +1904,9 @@ class PhantomCore {
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
   Future<void> dispose() async {
+    // Set the flag first so any in-flight _handleIncomingBytes returns before
+    // we tear down storage / transports underneath them.
+    _disposed = true;
     await _transportSub?.cancel();
     await _transportV2Sub?.cancel();
     await _meshStoreSub?.cancel();

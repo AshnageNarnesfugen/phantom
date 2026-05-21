@@ -42,6 +42,16 @@ abstract class PhantomTransport {
   Future<void> dispose();
 }
 
+/// Classification used by [TransportManager.publish] to choose which backend
+/// gets the first attempt. See the doc on `publish` for the policy.
+enum TransportPriority {
+  /// X3DH INIT, handshakeAck, preKeyShare, connectivityInfo — anything that
+  /// negotiates or maintains session state. Sent over I2P when possible.
+  control,
+  /// Regular text / file payloads. Sent over IPFS (+ Yggdrasil) only.
+  data,
+}
+
 @immutable
 class IncomingEnvelope {
   final Uint8List data;
@@ -85,11 +95,15 @@ class TransportManager {
     String? i2pSamHost,
     int? i2pSamPort,
     String? yggdrasilAddress,
+    Future<String?> Function()? i2pLoadKey,
+    Future<void> Function(String)? i2pPersistKey,
   }) : _transports = [
           YggdrasilTransport(address: yggdrasilAddress),
           I2PTransport(
-            host: i2pSamHost ?? '127.0.0.1', 
-            samPort: i2pSamPort ?? 7656
+            host:        i2pSamHost ?? '127.0.0.1',
+            samPort:     i2pSamPort ?? 7656,
+            loadKey:     i2pLoadKey,
+            persistKey:  i2pPersistKey,
           ),
           IpfsTransport(apiUrl: ipfsApiUrl ?? 'http://127.0.0.1:5001'),
         ];
@@ -129,12 +143,14 @@ class TransportManager {
   }
 
   /// Re-checks any transport that was not available at [initialize] time.
-  /// Throttled to once per 20 s so it doesn't slow down every publish call.
+  /// Throttled to once per 3 s so a burst of publish() calls right after
+  /// app start doesn't all skip the retry — but also doesn't hammer the
+  /// daemon either.
   Future<void> _activateLateTransports() async {
     if (_ourId.isEmpty) return;
     final now = DateTime.now();
     if (_lastRetryAt != null &&
-        now.difference(_lastRetryAt!) < const Duration(seconds: 10)) {
+        now.difference(_lastRetryAt!) < const Duration(seconds: 3)) {
       return;
     }
     _lastRetryAt = now;
@@ -165,13 +181,26 @@ class TransportManager {
     }
   }
 
-  /// Publishes the message over ALL available transports SIMULTANEOUSLY.
-  /// Whichever network is fastest will trigger the Double Ratchet decryption first.
-  /// Slower networks will deliver a duplicate packet that the MessageStore will safely ignore.
+  /// Routes a payload over the network. Behaviour depends on [priority]:
+  ///
+  ///   * `TransportPriority.control` — used for session-establishment frames
+  ///     (X3DH INIT, handshakeAck, preKeyShare, connectivityInfo). I2P is the
+  ///     preferred backend; we try it first because it gives stronger sender
+  ///     anonymity for the key-exchange flow. On failure (or when we don't
+  ///     know the contact's I2P destination, or when no SAM bridge is up) we
+  ///     fall back to IPFS / Yggdrasil in parallel.
+  ///
+  ///   * `TransportPriority.data` — used for regular text/file payloads.
+  ///     Skips I2P entirely and publishes via IPFS (+ Yggdrasil when an
+  ///     address is known) in parallel. Faster, higher bandwidth.
+  ///
+  /// Throws [TransportException] only when *every* attempt fails — the caller
+  /// then falls back to BLE mesh / persistent store.
   Future<void> publish({
     required String recipientId,
     required Uint8List encryptedEnvelope,
     bool isHandshake = false,
+    TransportPriority priority = TransportPriority.data,
   }) async {
     if (_activeTransports.isEmpty) await _activateLateTransports();
     if (_activeTransports.isEmpty) {
@@ -179,33 +208,37 @@ class TransportManager {
     }
 
     final dbg = TransportDebugger.instance;
-    final futures = <Future<void>>[];
 
-    // 1. I2P
-    final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
-    final dest = _i2pDests[recipientId];
-    if (i2p != null && dest != null) {
-      futures.add(() async {
-        dbg.log('TRANSPORT: firing I2P to ${dest.substring(0, 12)}...');
+    if (priority == TransportPriority.control) {
+      final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
+      final dest = _i2pDests[recipientId];
+      if (i2p != null && dest != null && i2p.isAvailable) {
         try {
-          await i2p.publishToDest(dest: dest, data: encryptedEnvelope);
-          dbg.log('TRANSPORT: I2P delivery successful');
+          dbg.log('TRANSPORT: control via I2P → ${dest.substring(0, 12)}…');
+          await i2p
+              .publishToDest(dest: dest, data: encryptedEnvelope)
+              .timeout(const Duration(seconds: 12));
+          dbg.log('TRANSPORT: control delivered via I2P');
+          return;
         } catch (e) {
-          dbg.log('TRANSPORT: I2P failed ($e)');
-          rethrow;
+          dbg.log('TRANSPORT: I2P control failed ($e) — falling back to IPFS');
         }
-      }());
+      } else {
+        dbg.log('TRANSPORT: I2P unavailable for control '
+            '(i2p=${i2p != null} dest=${dest != null} ready=${i2p?.isAvailable ?? false}) — using IPFS');
+      }
     }
 
-    // 2. Yggdrasil
+    final futures = <Future<void>>[];
+
     final ygg = _activeTransports.whereType<YggdrasilTransport>().firstOrNull;
     final yggAddr = _yggAddrs[recipientId];
     if (ygg != null && yggAddr != null) {
       futures.add(() async {
-        dbg.log('TRANSPORT: firing Yggdrasil to ${recipientId.substring(0, 8)}...');
+        dbg.log('TRANSPORT: firing Yggdrasil to ${recipientId.substring(0, 8)}…');
         try {
           await ygg.publishToAddr(address: yggAddr, data: encryptedEnvelope);
-          dbg.log('TRANSPORT: Yggdrasil delivery successful');
+          dbg.log('TRANSPORT: Yggdrasil delivery OK');
         } catch (e) {
           dbg.log('TRANSPORT: Yggdrasil failed ($e)');
           rethrow;
@@ -213,16 +246,16 @@ class TransportManager {
       }());
     }
 
-    // 3. IPFS
     final ipfsList = _activeTransports.whereType<IpfsTransport>();
     for (final ipfs in ipfsList) {
-      // Signal handshake mode so IPFS waits for GossipSub mesh formation
-      if (isHandshake) ipfs.markNextPublishAsHandshake();
+      if (isHandshake || priority == TransportPriority.control) {
+        ipfs.markNextPublishAsHandshake();
+      }
       futures.add(() async {
-        dbg.log('TRANSPORT: firing IPFS PubSub for ${recipientId.substring(0, 8)}...');
+        dbg.log('TRANSPORT: firing IPFS PubSub for ${recipientId.substring(0, 8)}…');
         try {
           await ipfs.publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope);
-          dbg.log('TRANSPORT: IPFS delivery successful');
+          dbg.log('TRANSPORT: IPFS delivery OK');
         } catch (e) {
           dbg.log('TRANSPORT: IPFS failed ($e)');
           rethrow;
@@ -234,13 +267,10 @@ class TransportManager {
       throw const TransportException('No valid transport target for recipient.');
     }
 
-    // Wait for all transports to finish (either success or fail)
     final results = await Future.wait(
-      futures.map((f) => f.then((_) => true).catchError((_) => false))
+      futures.map((f) => f.then((_) => true).catchError((_) => false)),
     );
-
-    // If EVERY single transport failed, throw an error to fallback to Bluetooth/Storage.
-    if (!results.any((success) => success)) {
+    if (!results.any((s) => s)) {
       throw const TransportException('All simultaneous transport layers failed.');
     }
   }
@@ -273,6 +303,14 @@ class IpfsTransport implements PhantomTransport {
   /// Holds the StreamSubscription so we can cancel (close) the HTTP stream
   /// on dispose — avoids accumulating zombie connections.
   final Map<String, StreamSubscription<List<int>>> _crossSubs = {};
+
+  /// Bound on how many contact topics we keep cross-subscribed concurrently.
+  /// Each subscription is a long-lived HTTP stream against Kubo; without a
+  /// cap an active user with dozens of contacts ends up holding the daemon's
+  /// pubsub goroutines hostage. When the bound is reached we evict the
+  /// least-recently-touched topic.
+  static const int _crossSubMax = 24;
+  final List<String> _crossSubLru = [];
 
   /// Known IPFS peer IDs for contacts, populated from the '#<peerId>' suffix
   /// in the contact address. When set, _dhtDiscoverAndConnect skips findprovs
@@ -386,6 +424,7 @@ class IpfsTransport implements PhantomTransport {
   /// peers, which can unstick a stale mesh that never formed.
   Future<void> _forceResubscribe(String topic, TransportDebugger dbg) async {
     final existing = _crossSubs.remove(topic);
+    _crossSubLru.remove(topic);
     if (existing != null) {
       await existing.cancel();
       dbg.log('IPFS: killed stale cross-sub for ${topic.substring(0, 11)}');
@@ -942,10 +981,15 @@ class IpfsTransport implements PhantomTransport {
   // ── Cross-subscription for GossipSub mesh formation ─────────────────────
 
   /// Opens a subscription to [topic] so GossipSub announces us as a peer on
-  /// that topic. Idempotent — subsequent calls for the same topic are no-ops.
-  /// The subscription is kept open until [dispose] cancels it.
+  /// that topic. Idempotent — calls for the same topic refresh its LRU
+  /// position but never open a second stream. The subscription is kept open
+  /// until [dispose] cancels it or it is evicted by the LRU cap.
   Future<void> _ensureCrossSubscribed(String topic, TransportDebugger dbg) async {
-    if (_crossSubs.containsKey(topic)) return;
+    if (_crossSubs.containsKey(topic)) {
+      _crossSubLru.remove(topic);
+      _crossSubLru.add(topic);
+      return;
+    }
 
     final uri = Uri.parse(
         '$_apiUrl/api/v0/pubsub/sub?arg=${Uri.encodeComponent(_encodeTopic(topic))}');
@@ -954,10 +998,17 @@ class IpfsTransport implements PhantomTransport {
       final response = await _client.send(request)
           .timeout(const Duration(seconds: 5));
       if (response.statusCode == 200) {
-        // Hold the StreamSubscription so dispose() can cancel it, which closes
-        // the HTTP connection and drops the IPFS pubsub subscription cleanly.
         final sub = response.stream.listen(null, onError: (_) {}, cancelOnError: false);
         _crossSubs[topic] = sub;
+        _crossSubLru.add(topic);
+        while (_crossSubLru.length > _crossSubMax) {
+          final evict = _crossSubLru.removeAt(0);
+          final old = _crossSubs.remove(evict);
+          if (old != null) {
+            try { await old.cancel(); } catch (_) {}
+            dbg.log('IPFS: cross-sub evicted ${evict.split('/').last.substring(0, 8)}');
+          }
+        }
         dbg.log('IPFS: cross-sub active for ${topic.split('/').last.substring(0, 8)}');
       } else {
         dbg.log('IPFS: cross-sub HTTP ${response.statusCode}');
@@ -1009,26 +1060,66 @@ class IpfsTransport implements PhantomTransport {
       sub.cancel();
     }
     _crossSubs.clear();
+    _crossSubLru.clear();
     _client.close();
   }
 }
 
-/// Transport over I2P via SAM Bridge (Simple Anonymous Messaging).
+/// Transport over I2P via SAM v3.3 (Simple Anonymous Messaging) bridge.
 ///
-/// Default for handshakes. Creates a persistent I2P destination.
+/// This is the **primary** transport for handshake / control-plane frames
+/// (INIT, handshakeAck, preKeyShare, connectivityInfo). Bulk message traffic
+/// stays on IPFS — see TransportManager.publish.
+///
+/// Protocol:
+///   * TCP control socket to host:samPort (default 7656) — kept open for the
+///     lifetime of the session so the SAM bridge keeps our destination alive.
+///   * UDP socket bound to an ephemeral local port for incoming datagrams.
+///     SAM forwards every datagram addressed to us to that UDP port.
+///   * Outgoing datagrams are sent to host:[samPort-1] (the SAM "datagram in"
+///     port, default 7655) as `3.0 <session_id> <peer_dest>\n<payload>`.
+///
+/// The full destination keypair returned by the first `SESSION CREATE
+/// DESTINATION=TRANSIENT` call is persisted (via [_persistKey] callback) and
+/// reused on subsequent runs so our public destination stays stable.
 class I2PTransport implements PhantomTransport {
   String host;
   final int samPort;
+  /// UDP port the SAM bridge listens on for outbound datagrams (sender side).
+  /// Defaults to samPort - 1 which matches i2pd / Java I2P out of the box.
+  final int samUdpPort;
+  /// Loader for a previously-persisted base64 SAM private-destination blob.
+  /// Returning null causes us to ask SAM for a fresh TRANSIENT one and then
+  /// persist it via [_persistKey].
+  final Future<String?> Function()? _loadKey;
+  final Future<void> Function(String b64)? _persistKey;
+
+  Socket? _control;
+  RawDatagramSocket? _udp;
   String? _myDest;
+  String? _myPrivKey;
   bool _disposed = false;
+  bool _ready = false;
+
+  final _incoming = StreamController<IncomingEnvelope>.broadcast();
+
+  static const _sessionId = 'phantom-main';
 
   @override
   final String name = 'i2p-sam';
 
   @override
-  bool get isAvailable => true;
+  bool get isAvailable => _ready;
 
-  I2PTransport({this.host = '127.0.0.1', this.samPort = 7656});
+  I2PTransport({
+    this.host = '127.0.0.1',
+    this.samPort = 7656,
+    int? samUdpPort,
+    Future<String?> Function()? loadKey,
+    Future<void> Function(String)? persistKey,
+  })  : samUdpPort = samUdpPort ?? (samPort - 1),
+        _loadKey = loadKey,
+        _persistKey = persistKey;
 
   String? get myDestination => _myDest;
 
@@ -1038,22 +1129,19 @@ class I2PTransport implements PhantomTransport {
     final hostsToTry = [
       host,
       if (Platform.isAndroid && host == '127.0.0.1') ...[
-        '10.0.2.2',      // Emulator host
-        '192.168.240.1', // Waydroid host
-        '172.17.0.1',    // Docker/Waydroid alternative
-        '172.33.0.1',    // Your current Waydroid gateway
-        '192.168.1.1',
-        '192.168.0.1',
+        '10.0.2.2', '192.168.240.1', '172.17.0.1',
+        '172.33.0.1', '192.168.1.1', '192.168.0.1',
       ],
     ];
 
     for (final h in hostsToTry) {
       try {
-        dbg.log('I2P: checking SAM bridge at $h:$samPort...');
-        final s = await Socket.connect(h, samPort, timeout: const Duration(milliseconds: 800));
-        await s.close();
-        host = h; 
-        dbg.log('I2P: SAM bridge found at $h');
+        dbg.log('I2P: probing SAM at $h:$samPort');
+        final probe = await Socket.connect(h, samPort,
+            timeout: const Duration(milliseconds: 1500));
+        await probe.close();
+        host = h;
+        dbg.log('I2P: SAM bridge reachable at $h');
         return true;
       } catch (_) {}
     }
@@ -1061,88 +1149,188 @@ class I2PTransport implements PhantomTransport {
     return false;
   }
 
-  /// Sends raw data to a specific I2P destination using DATAGRAM.
-  Future<void> publishToDest({required String dest, required Uint8List data}) async {
+  /// Brings up the SAM session: HELLO → SESSION CREATE → NAMING LOOKUP NAME=ME.
+  /// Idempotent — returns true if the session is alive after the call.
+  Future<bool> _ensureSession() async {
+    if (_ready && _control != null && _udp != null) return true;
     final dbg = TransportDebugger.instance;
     try {
-      dbg.log('I2P: sending datagram to ${dest.substring(0, 12)}...');
-      final s = await Socket.connect(host, samPort);
+      _udp ??= await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
+      _udp!.listen(_onUdpEvent, onError: (_) {}, cancelOnError: false);
+
+      final s = await Socket.connect(host, samPort,
+          timeout: const Duration(seconds: 5));
+      _control = s;
+
+      // SAM is line-oriented for control. Pipe replies into a broadcast
+      // stream so we can await named responses sequentially.
+      final lines = s
+          .cast<List<int>>()
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .asBroadcastStream();
+
+      Future<String> next(Duration timeout) =>
+          lines.first.timeout(timeout, onTimeout: () {
+            throw const TransportException('I2P SAM reply timeout');
+          });
+
       s.add(utf8.encode('HELLO VERSION MIN=3.3 MAX=3.3\n'));
-      s.add(utf8.encode('SESSION CREATE STYLE=DATAGRAM ID=phsend DESTINATION=TRANSIENT\n'));
-      s.add(utf8.encode('DATAGRAM SEND DESTINATION=$dest\n'));
-      s.add(data);
-      await s.flush();
-      await s.close();
-      dbg.log('I2P: datagram sent');
+      final hello = await next(const Duration(seconds: 5));
+      if (!hello.contains('RESULT=OK')) {
+        dbg.log('I2P: HELLO rejected: $hello');
+        await _teardown();
+        return false;
+      }
+
+      final restoredKey = _loadKey != null ? await _loadKey() : null;
+      final destArg = restoredKey ?? 'TRANSIENT';
+      final myUdp = _udp!.port;
+      final createCmd =
+          'SESSION CREATE STYLE=DATAGRAM ID=$_sessionId DESTINATION=$destArg '
+          'PORT=$myUdp HOST=127.0.0.1\n';
+      s.add(utf8.encode(createCmd));
+      final status = await next(const Duration(seconds: 20));
+      if (!status.contains('RESULT=OK')) {
+        dbg.log('I2P: SESSION CREATE rejected: $status');
+        await _teardown();
+        return false;
+      }
+
+      // SESSION STATUS RESULT=OK DESTINATION=<base64 priv keypair>
+      final destMatch = RegExp(r'DESTINATION=(\S+)').firstMatch(status);
+      if (destMatch != null) {
+        _myPrivKey = destMatch.group(1);
+        if (restoredKey == null && _persistKey != null && _myPrivKey != null) {
+          await _persistKey(_myPrivKey!);
+        }
+      }
+
+      s.add(utf8.encode('NAMING LOOKUP NAME=ME\n'));
+      final lookup = await next(const Duration(seconds: 10));
+      final valueMatch = RegExp(r'VALUE=(\S+)').firstMatch(lookup);
+      if (valueMatch == null) {
+        dbg.log('I2P: NAMING LOOKUP missing VALUE: $lookup');
+        await _teardown();
+        return false;
+      }
+      _myDest = valueMatch.group(1);
+      dbg.log('I2P: session ready — dest=${_myDest!.substring(0, 16)}…');
+
+      // Drain remaining control lines silently so the socket doesn't block.
+      lines.listen((_) {}, onError: (_) {});
+
+      _ready = true;
+      return true;
     } catch (e) {
-      dbg.log('I2P: send error: $e');
+      dbg.log('I2P: session setup failed: $e');
+      await _teardown();
+      return false;
+    }
+  }
+
+  void _onUdpEvent(RawSocketEvent event) {
+    if (event != RawSocketEvent.read) return;
+    final dg = _udp!.receive();
+    if (dg == null) return;
+    // SAM v3 forwarded datagram format: "<source_destination>\n<payload>".
+    final data = dg.data;
+    final nl = data.indexOf(10);
+    if (nl < 0 || nl >= data.length - 1) return;
+    final payload = Uint8List.fromList(data.sublist(nl + 1));
+    if (payload.isEmpty) return;
+    _incoming.add(IncomingEnvelope(
+      data: payload,
+      transportName: name,
+      receivedAt: DateTime.now(),
+    ));
+  }
+
+  /// Sends [data] to a known peer destination via the SAM datagram port.
+  Future<void> publishToDest({required String dest, required Uint8List data}) async {
+    final dbg = TransportDebugger.instance;
+    if (!await _ensureSession()) {
+      throw const TransportException('I2P session unavailable');
+    }
+    final header = utf8.encode('3.0 $_sessionId $dest\n');
+    final packet = Uint8List(header.length + data.length)
+      ..setRange(0, header.length, header)
+      ..setRange(header.length, header.length + data.length, data);
+    try {
+      final sent = _udp!.send(packet, InternetAddress(host), samUdpPort);
+      if (sent <= 0) {
+        throw const TransportException('I2P UDP send returned 0 bytes');
+      }
+      dbg.log('I2P: datagram out (${data.length} B → ${dest.substring(0, 12)}…)');
+    } catch (e) {
+      dbg.log('I2P: UDP send failed: $e');
+      rethrow;
     }
   }
 
   @override
   Future<void> publish({required String recipientId, required Uint8List encryptedEnvelope}) async {
-    // Fallback if no specific destination is known (requires I2P naming or DHT)
-    throw const TransportException('I2P requires a specific destination for handshakes');
+    throw const TransportException(
+        'I2P transport routes by destination; use publishToDest');
   }
 
+  bool _maintainerRunning = false;
+
   @override
-  Stream<IncomingEnvelope> subscribe({required String ourId}) async* {
-    final dbg = TransportDebugger.instance;
+  Stream<IncomingEnvelope> subscribe({required String ourId}) {
+    if (!_maintainerRunning) {
+      _maintainerRunning = true;
+      unawaited(_runMaintainer());
+    }
+    return _incoming.stream;
+  }
+
+  /// Background session keeper: brings up the SAM session if it's down and
+  /// reconnects when the control socket dies. Datagrams arrive independently
+  /// via the UDP socket listener and flow straight into _incoming.
+  Future<void> _runMaintainer() async {
     while (!_disposed) {
+      if (!await _ensureSession()) {
+        if (_disposed) return;
+        await Future.delayed(const Duration(seconds: 15));
+        continue;
+      }
+      final ctrl = _control;
+      if (ctrl == null) {
+        if (_disposed) return;
+        await Future.delayed(const Duration(seconds: 5));
+        continue;
+      }
       try {
-        final dbg = TransportDebugger.instance;
-        dbg.log('I2P: connecting to SAM bridge at $host:$samPort...');
-        final s = await Socket.connect(host, samPort, timeout: const Duration(seconds: 5));
-        s.add(utf8.encode('HELLO VERSION MIN=3.3 MAX=3.3\n'));
-        s.add(utf8.encode('SESSION CREATE STYLE=DATAGRAM ID=phantom DESTINATION=TRANSIENT\n'));
-        s.add(utf8.encode('NAMING LOOKUP NAME=ME\n'));
-        
-        dbg.log('I2P: session created, waiting for destination...');
-        await for (final data in s) {
-          if (_disposed) break;
-          
-          // Check for SAM control messages (ASCII)
-          try {
-            final str = utf8.decode(data);
-            if (str.contains('NAMING REPLY RESULT=OK NAME=ME VALUE=')) {
-              _myDest = str.split('VALUE=').last.trim();
-              continue;
-            }
-            
-            // Handle DATAGRAM RECEIVED headers
-            if (str.startsWith('DATAGRAM RECEIVED')) {
-              // The message data usually follows after the first newline in the same packet
-              // or the next one. SAM Datagrams are: "DATAGRAM RECEIVED DEST=... SIZE=...\n<data>"
-              final nlIdx = data.indexOf(10); // index of '\n'
-              if (nlIdx != -1 && nlIdx < data.length - 1) {
-                yield IncomingEnvelope(
-                  data: Uint8List.fromList(data.sublist(nlIdx + 1)),
-                  transportName: name,
-                  receivedAt: DateTime.now(),
-                );
-              }
-              continue;
-            }
-          } catch (_) {
-            // Binary data or malformed UTF8 - yield as is (fallback)
-          }
-          
-          yield IncomingEnvelope(
-            data: Uint8List.fromList(data),
-            transportName: name,
-            receivedAt: DateTime.now(),
-          );
-        }
-      } catch (e) {
-        dbg.log('I2P: connection error $e, retrying...');
-        await Future.delayed(const Duration(seconds: 10));
+        await ctrl.done;
+      } catch (_) {}
+      if (!_disposed) {
+        TransportDebugger.instance.log('I2P: control socket closed — reconnecting');
+        _ready = false;
+        _control = null;
+        await Future.delayed(const Duration(seconds: 5));
       }
     }
+    _maintainerRunning = false;
+  }
+
+  /// Direct hook used by TransportManager to merge our datagrams into the
+  /// global incoming stream.
+  Stream<IncomingEnvelope> get incoming => _incoming.stream;
+
+  Future<void> _teardown() async {
+    _ready = false;
+    try { await _control?.close(); } catch (_) {}
+    _control = null;
   }
 
   @override
   Future<void> dispose() async {
     _disposed = true;
+    await _teardown();
+    try { _udp?.close(); } catch (_) {}
+    _udp = null;
+    try { await _incoming.close(); } catch (_) {}
   }
 }
 

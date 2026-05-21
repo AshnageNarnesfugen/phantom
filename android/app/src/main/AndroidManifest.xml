@@ -113,6 +113,16 @@
             android:stopWithTask="false"
             android:foregroundServiceType="dataSync"/>
 
+        <!-- i2pd daemon — same survival strategy as IPFS, in its own process
+             so the SAM bridge stays up while the user is in another app.
+             Required for the control-plane (X3DH handshake) transport. -->
+        <service
+            android:name=".I2pdForegroundService"
+            android:exported="false"
+            android:process=":i2pd"
+            android:stopWithTask="false"
+            android:foregroundServiceType="dataSync"/>
+
         <!-- Message receiver — keeps the Dart isolate alive so ntfy delivers
              incoming messages and local notifications fire while backgrounded -->
         <service
@@ -138,6 +148,16 @@
             android:name=".IpfsBootReceiver"
             android:exported="true"
             android:process=":ipfs">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+            </intent-filter>
+        </receiver>
+
+        <!-- Restart i2pd daemon on device boot -->
+        <receiver
+            android:name=".I2pdBootReceiver"
+            android:exported="true"
+            android:process=":i2pd">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED"/>
             </intent-filter>
