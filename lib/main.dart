@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -26,13 +27,72 @@ void _stopMessagingService() {
   _messagingChannel.invokeMethod<void>('stopService').catchError((_) {});
 }
 
+/// Persists [error] + [stack] to `<app docs>/last_crash.txt` so we can read
+/// the next time the app launches (via [_dumpPreviousCrashIfAny]). This is
+/// the only viable diagnostic channel in release mode when the user can't
+/// run `adb logcat` — Dart's normal stderr is invisible there.
+Future<void> _writeCrashLog(Object error, StackTrace? stack) async {
+  try {
+    final dir = await getApplicationDocumentsDirectory();
+    final f = File('${dir.path}/last_crash.txt');
+    final ts = DateTime.now().toIso8601String();
+    await f.writeAsString(
+      '─── CRASH @ $ts ───\n$error\n$stack\n\n',
+      mode: FileMode.append,
+    );
+  } catch (_) {
+    // If even writing the crash log fails there's nothing left to do —
+    // swallowing the error here is intentional, we don't want a logging
+    // failure to take down the app.
+  }
+}
+
+/// On startup, if [_writeCrashLog] wrote anything in a previous run, surface
+/// it through debugPrint (and the in-app TransportDebugger) and then delete
+/// the file so it doesn't keep replaying on subsequent launches.
+Future<void> _dumpPreviousCrashIfAny() async {
+  try {
+    final dir = await getApplicationDocumentsDirectory();
+    final f = File('${dir.path}/last_crash.txt');
+    if (!await f.exists()) return;
+    final body = await f.readAsString();
+    debugPrint('═══ PREVIOUS-RUN CRASH LOG ═══\n$body═══ END CRASH LOG ═══');
+    await f.delete();
+  } catch (_) {}
+}
+
 void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-    statusBarColor: Colors.transparent,
-    statusBarIconBrightness: Brightness.light,
-  ));
-  runApp(const PhantomApp());
+  runZonedGuarded<void>(() {
+    WidgetsFlutterBinding.ensureInitialized();
+
+    // Any framework-level exception (assertion, build error, async surface)
+    // funnels through here. Persist it and still pass to the default handler
+    // so the console / red-screen behaviour you'd expect in debug remains.
+    FlutterError.onError = (FlutterErrorDetails details) {
+      _writeCrashLog(details.exception, details.stack);
+      FlutterError.presentError(details);
+    };
+
+    // Native side errors that reach Dart (PlatformDispatcher) — covers
+    // crashes from MethodChannel handlers and other engine-originated
+    // exceptions that don't go through FlutterError.
+    WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
+      _writeCrashLog(error, stack);
+      return true;
+    };
+
+    SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.light,
+    ));
+    _dumpPreviousCrashIfAny();
+    runApp(const PhantomApp());
+  }, (error, stack) {
+    // Any uncaught error in the zone — async errors with no awaiter, errors
+    // thrown out of timer callbacks, etc. This is the catch-all that kept
+    // release-mode crashes invisible before.
+    _writeCrashLog(error, stack);
+  });
 }
 
 class PhantomApp extends StatefulWidget {

@@ -26,7 +26,10 @@ class TransportDebugger {
     _entries.add(line);
     if (_entries.length > _max) _entries.removeAt(0);
     if (!_ctrl.isClosed) _ctrl.add(line);
-    if (kDebugMode) debugPrint('[Transport] $msg');
+    // Always emit to debugPrint so `flutter run --release` and `adb logcat`
+    // surface transport activity. The cost is negligible vs the value of
+    // being able to diagnose a release-only crash without a separate sink.
+    debugPrint('[Transport] $msg');
   }
 
   void clear() => _entries.clear();
