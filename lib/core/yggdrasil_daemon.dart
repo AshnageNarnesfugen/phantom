@@ -75,14 +75,23 @@ class YggdrasilDaemon {
 
   Future<bool> _startService() async {
     final cfg = await _loadOrGenerateConfig();
-    // Empty cfg.address means we are waiting for the Go side to pick one.
+    // Empty cfg.address means we don't yet have a real 0200::/7 from the Go
+    // side. The Kotlin VpnService.Builder.addAddress() rejects an empty
+    // string with IllegalArgumentException, so skip the start entirely in
+    // that case — the user can bring Yggdrasil up later from settings once
+    // the in-process router has produced an address.
     _address = cfg.address.isEmpty ? null : cfg.address;
+    if (_address == null) {
+      debugPrint('[YggDaemon] no persisted address yet — skipping VPN start; '
+          'Yggdrasil dormant until address is provisioned');
+      return false;
+    }
     try {
       await _ch.invokeMethod<void>('startService', {
         'configJson': cfg.json,
         'address':    cfg.address,
       });
-      debugPrint('[YggDaemon] service started — address=${_address ?? "(pending)"}');
+      debugPrint('[YggDaemon] service started — address=$_address');
       return true;
     } catch (e) {
       debugPrint('[YggDaemon] startService failed: $e');

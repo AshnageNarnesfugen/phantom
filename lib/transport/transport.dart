@@ -1155,8 +1155,15 @@ class I2PTransport implements PhantomTransport {
     if (_ready && _control != null && _udp != null) return true;
     final dbg = TransportDebugger.instance;
     try {
-      _udp ??= await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
-      _udp!.listen(_onUdpEvent, onError: (_) {}, cancelOnError: false);
+      // Bind+listen exactly once per process. RawDatagramSocket is a
+      // single-subscription stream; calling listen() twice (on a retry after
+      // SAM was down on first attempt) throws StateError. Previously the
+      // listen() call lived outside the `if (justBound)` guard, so any TCP
+      // reconnect cycle crashed the background maintainer.
+      if (_udp == null) {
+        _udp = await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
+        _udp!.listen(_onUdpEvent, onError: (_) {}, cancelOnError: false);
+      }
 
       final s = await Socket.connect(host, samPort,
           timeout: const Duration(seconds: 5));
