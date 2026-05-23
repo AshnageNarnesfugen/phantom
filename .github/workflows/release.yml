@@ -82,10 +82,11 @@ jobs:
           echo "✓ Static x86_64 kubo: $(du -sh android/app/src/main/jniLibs/x86_64/libkubo.so | cut -f1)"
 
       - name: Build release APK
+        # Diagnostic build: dropped --obfuscate and isMinifyEnabled in gradle.
+        # If this APK runs cleanly we know the original release crash was in
+        # the R8/obfuscation pipeline. Re-enable both once isolated.
         run: |
-          flutter build apk --release \
-            --obfuscate \
-            --split-debug-info=build/debug-info
+          flutter build apk --release
 
       - name: Sign APK with apksigner
         env:
