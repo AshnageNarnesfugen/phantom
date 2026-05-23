@@ -58,6 +58,11 @@ jobs:
           bash scripts/build_yggdrasil_mobile.sh android/app/libs/yggdrasil-mobile.aar
 
       - name: Download arm64 Kubo binary
+        # DIAG: temporarily disabled. The local flutter run --release build
+        # has no libkubo.so in jniLibs and boots cleanly; the CI APK does
+        # include it and crashes at startup before Dart runs. Skip the
+        # binary to confirm libkubo.so is the trigger.
+        if: false
         run: bash scripts/download_kubo.sh arm64-v8a
 
       - name: Bundle i2pd binaries (PurpleI2P)
@@ -69,11 +74,9 @@ jobs:
         run: bash scripts/download_i2pd.sh arm64-v8a x86_64
 
       - name: Build static x86_64 Kubo binary
+        # DIAG: temporarily disabled — see "Download arm64 Kubo binary".
+        if: false
         run: |
-          # go install doesn't work for Kubo because its go.mod has exclude
-          # directives — clone and build from source instead.
-          # CGO_ENABLED=0 produces a truly static ELF (no glibc / PT_INTERP),
-          # which is required on Android/Waydroid where ld-linux-x86-64 is absent.
           git clone --depth=1 --branch v0.41.0 \
             https://github.com/ipfs/kubo.git /tmp/kubo
           cd /tmp/kubo && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
