@@ -53,6 +53,7 @@ app.*.map.json
 *.der
 phantom-release.b64
 android/key.properties
+android/app/phantom-release.p12
 
 # Android Gradle build cache
 android/app/build/
