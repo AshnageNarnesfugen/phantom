@@ -98,10 +98,15 @@
             android:name="flutterEmbedding"
             android:value="2" />
 
-        <!-- Impeller: pre-compiles shaders → eliminates BackdropFilter/compositing jank -->
+        <!-- Impeller disabled — the Vulkan path crashed libflutter.so during
+             JNI attach on a Snapdragon 865 / Android 13 device (Retroid Pocket
+             Flip2), tombstone showed null deref at FlutterJNI.performNativeAttach.
+             Skia renderer is more compatible across older device drivers and
+             custom ROMs. Re-enable once we confirm Impeller works on the
+             affected hardware (or behind a per-device opt-in). -->
         <meta-data
             android:name="io.flutter.embedding.android.EnableImpeller"
-            android:value="true" />
+            android:value="false" />
 
         <!-- IPFS daemon — runs in a SEPARATE process (:ipfs) so it survives
              when the user swipes the app from recent tasks. Same technique

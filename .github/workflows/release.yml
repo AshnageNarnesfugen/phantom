@@ -23,10 +23,24 @@ jobs:
           java-version: "21"
 
       - name: Set up Flutter
+        # Pinned to a specific stable version so the libflutter.so embedded
+        # in our APK can't drift past what we've tested. `cache: false` to
+        # force a fresh extraction every run — caches that get corrupted
+        # mid-update silently ship an APK with a libflutter.so whose JNI
+        # signatures don't match the Dart entry, which crashes at attach
+        # time on the first launch.
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          cache: true
+          flutter-version: '3.32.0'
+          cache: false
+
+      - name: Log Flutter version
+        run: |
+          flutter --version
+          echo "---"
+          which flutter
+          ls -la $(dirname $(which flutter))/../
 
       - name: Set up Go (for static x86_64 Kubo build)
         uses: actions/setup-go@v5
