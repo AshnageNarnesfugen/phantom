@@ -23,16 +23,14 @@ jobs:
           java-version: "21"
 
       - name: Set up Flutter
-        # Pinned to a specific stable version so the libflutter.so embedded
-        # in our APK can't drift past what we've tested. `cache: false` to
-        # force a fresh extraction every run — caches that get corrupted
-        # mid-update silently ship an APK with a libflutter.so whose JNI
-        # signatures don't match the Dart entry, which crashes at attach
-        # time on the first launch.
+        # `cache: false` forces a fresh extraction every run. The previous
+        # cached install silently shipped an APK with a libflutter.so whose
+        # JNI signatures didn't match the Dart entry point — caused a null
+        # deref inside libflutter.so during FlutterJNI.performNativeAttach
+        # on first launch (see commit f9480ad message for the tombstone).
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: '3.32.0'
           cache: false
 
       - name: Log Flutter version
