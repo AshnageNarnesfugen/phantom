@@ -85,42 +85,29 @@ jobs:
           echo "✓ Static x86_64 kubo: $(du -sh android/app/src/main/jniLibs/x86_64/libkubo.so | cut -f1)"
 
       - name: Prepare signing keystore for gradle
-        # Build a PKCS12 keystore from the PEM secrets and write a
-        # key.properties that gradle reads from android/app/build.gradle.kts.
-        # Doing this BEFORE `flutter build apk` makes AGP sign the APK once,
-        # at build time, with the production key. The previous workflow
-        # built an APK signed with debug.keystore and then re-signed it with
-        # apksigner — that left half-stripped signature blocks behind that
-        # crashed the loader at startup on some Android versions.
-        env:
-          SIGNING_PRIVATE_KEY: ${{ secrets.SIGNING_PRIVATE_KEY }}
-          SIGNING_CERTIFICATE: ${{ secrets.SIGNING_CERTIFICATE }}
+        # DIAG: generate a fresh self-signed debug-style keystore on the
+        # runner instead of using the production cert. Local flutter run
+        # --release works with debug.keystore; if this APK boots cleanly
+        # the bug is in the production cert (format / fields / expiry).
+        # If it still crashes the bug is in some other CI-vs-local delta.
         run: |
-          echo "$SIGNING_PRIVATE_KEY" | base64 --decode > /tmp/signing-key-raw.pem
-          echo "$SIGNING_CERTIFICATE" | base64 --decode > /tmp/signing-cert.pem
-          # Normalize to a PKCS#8 PEM so openssl pkcs12 accepts both
-          # newer and older key formats.
-          openssl pkcs8 -topk8 -nocrypt \
-            -in /tmp/signing-key-raw.pem \
-            -out /tmp/signing-key-pkcs8.pem
-          # Bundle key + cert into a PKCS12 keystore. The password is
-          # ephemeral (lives only on this runner) so a fixed value is fine.
           KEYSTORE_PASS="phantom-ci-$(date +%s)"
-          openssl pkcs12 -export \
-            -inkey /tmp/signing-key-pkcs8.pem \
-            -in /tmp/signing-cert.pem \
-            -out android/app/phantom-release.p12 \
-            -name phantom-release \
-            -password "pass:${KEYSTORE_PASS}"
-          # key.properties is the standard AGP signing-config bridge file.
-          # gradle reads it in android/app/build.gradle.kts.
+          keytool -genkeypair \
+            -alias phantom-release \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 365 \
+            -storetype PKCS12 \
+            -keystore android/app/phantom-release.p12 \
+            -storepass "${KEYSTORE_PASS}" \
+            -keypass "${KEYSTORE_PASS}" \
+            -dname "CN=Phantom CI Diagnostic, OU=Phantom, O=Phantom, L=CI, ST=CI, C=US"
           cat > android/key.properties <<EOF
           storeFile=phantom-release.p12
           storePassword=${KEYSTORE_PASS}
           keyAlias=phantom-release
           keyPassword=${KEYSTORE_PASS}
           EOF
-          rm -f /tmp/signing-key-raw.pem /tmp/signing-key-pkcs8.pem /tmp/signing-cert.pem
 
       - name: Build release APK
         # Diagnostic build: dropped --obfuscate and isMinifyEnabled in gradle.
