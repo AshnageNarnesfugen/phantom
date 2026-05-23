@@ -55,12 +55,17 @@ dependencies:
   open_file: ^3.3.2
 
   # ── Local notifications ────────────────────────────────────────────────────
+  # Pinned to ^18.x — v19/20/21 changed initialize() to a named-arg signature
+  # and the AOT release build crashed at startup before any UI rendered when
+  # the call site (NotificationService.initialize) still used the v18 API.
+  # Bumping requires updating notification_service.dart in lockstep.
   flutter_local_notifications: ^18.0.1
 
   # ── Image picker (wallpaper + avatar) ──────────────────────────────────────
   image_picker: ^1.1.2
 
   # ── Media / file / audio ───────────────────────────────────────────────────
+  # file_picker pinned to 8.x — 9.x onwards removed FilePicker.platform.
   file_picker: ^8.1.6
   record: ^6.2.0
   audioplayers: ^6.1.0
@@ -75,7 +80,7 @@ dev_dependencies:
   # package:test is not used (conflicts with the analyzer version).
   flutter_test:
     sdk: flutter
-  flutter_lints: ^5.0.0
+  flutter_lints: ^6.0.0
 
 flutter:
   uses-material-design: true

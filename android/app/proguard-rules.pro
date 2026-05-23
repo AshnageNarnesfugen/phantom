@@ -68,3 +68,45 @@
 # Hive (real package id is io.isar.hive in v2 / hive_flutter)
 -keep class com.tekartik.** { *; }
 -keep class io.isar.** { *; }
+
+# ── Flutter plugins used at startup ─────────────────────────────────────────
+# Every plugin we instantiate before the loading screen renders must survive
+# R8 — if any of them gets renamed or has its FlutterPlugin entrypoint
+# stripped, the app dies before any Dart logging can run. Catch-all rule
+# below covers any FlutterPlugin subclass; explicit per-plugin rules below
+# guard against plugins that also use reflection internally.
+
+-keep class * extends io.flutter.embedding.engine.plugins.FlutterPlugin { *; }
+-keep class * implements io.flutter.plugin.common.MethodCallHandler { *; }
+-keep class io.flutter.plugins.GeneratedPluginRegistrant { *; }
+
+# path_provider
+-keep class io.flutter.plugins.pathprovider.** { *; }
+
+# flutter_local_notifications — uses GSON reflection on internal classes
+-keep class com.dexterous.flutterlocalnotifications.** { *; }
+-keepclassmembers class * { @com.dexterous.** *; }
+-keepattributes *Annotation*,Signature
+-keep class com.google.gson.** { *; }
+-dontwarn com.google.gson.**
+
+# image_picker / file_picker / record / audioplayers / gal / open_file /
+# package_info_plus — all use platform-channel reflection.
+-keep class io.flutter.plugins.imagepicker.** { *; }
+-keep class com.mr.flutter.plugin.filepicker.** { *; }
+-keep class com.llfbandit.record.** { *; }
+-keep class xyz.luan.audioplayers.** { *; }
+-keep class kk.eu.gal.** { *; }
+-keep class com.crazecoder.openfile.** { *; }
+-keep class dev.fluttercommunity.plus.packageinfo.** { *; }
+-keep class dev.fluttercommunity.plus.share.** { *; }
+
+# cryptography (which we use for AES-GCM in Hive cipher + HKDF + Ed25519)
+-keep class crypto.tink.** { *; }
+-keep class com.google.crypto.tink.** { *; }
+-dontwarn com.google.crypto.tink.**
+
+# Kotlin reflect / metadata — some plugins use Kotlin reflection at runtime
+-keep class kotlin.reflect.** { *; }
+-keep class kotlin.Metadata { *; }
+-dontwarn kotlin.reflect.**
