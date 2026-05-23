@@ -5,8 +5,11 @@ import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
 import 'core/phantom_core.dart';
+// ignore: unused_import
 import 'core/ipfs_daemon.dart';
+// ignore: unused_import
 import 'core/i2pd_daemon.dart';
+// ignore: unused_import
 import 'core/yggdrasil_daemon.dart';
 import 'core/notification_service.dart';
 import 'core_provider.dart';
@@ -141,16 +144,27 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
   }
 
   Future<void> _init() async {
-    NotificationService.initialize().catchError((_) {});
+    debugPrint('[DIAG] _init started');
+    // NotificationService.initialize().catchError((_) {});  // ← skipped for diagnostic
+    debugPrint('[DIAG] notifications skipped, loading theme');
     final persisted = await ThemeController.load();
     persisted.addListener(() { if (mounted) setState(() {}); });
     if (mounted) setState(() => _themeCtrl = persisted);
+    debugPrint('[DIAG] theme loaded');
+    // DIAGNOSTIC: all native daemon ensures disabled so we can confirm
+    // whether one of them is the source of the release-only startup crash.
+    // If this build shows onboarding successfully → re-enable them one at
+    // a time to find the culprit. If it still crashes → the bug is NOT
+    // in IpfsDaemon / I2pdDaemon / YggdrasilDaemon.
+    debugPrint('[DIAG] main reached _init — about to skip daemons');
     if (Platform.isAndroid) {
-      try { await IpfsDaemon.instance.ensure(); } catch (_) {}
-      try { await I2pdDaemon.instance.ensure(); } catch (_) {}
-      try { await YggdrasilDaemon.instance.ensure(); } catch (_) {}
+      debugPrint('[DIAG] would have called IpfsDaemon.ensure() but skipped');
+      debugPrint('[DIAG] would have called I2pdDaemon.ensure() but skipped');
+      debugPrint('[DIAG] would have called YggdrasilDaemon.ensure() but skipped');
     }
+    debugPrint('[DIAG] about to _tryRestoreAccount');
     await _tryRestoreAccount();
+    debugPrint('[DIAG] _tryRestoreAccount returned, _loading set to false');
   }
 
   Future<void> _tryRestoreAccount() async {
