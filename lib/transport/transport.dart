@@ -338,6 +338,13 @@ class IpfsTransport implements PhantomTransport {
   /// Messages that were published with 0 GossipSub peers (i.e. dropped into
   /// the void). The background retry loop republishes them once the mesh forms.
   final Map<String, List<Uint8List>> _retryQueue = {};
+
+  /// Total messages currently waiting in the IPFS retry queue across all
+  /// recipients. Exposed for the transport status sheet — the UI was showing
+  /// `queued messages: 0` from the BLE mesh store while IPFS quietly held a
+  /// dozen messages waiting for gossipsub mesh to form.
+  int get pendingRetryCount =>
+      _retryQueue.values.fold<int>(0, (sum, list) => sum + list.length);
   bool _retryLoopRunning = false;
 
   /// Starts the background retry loop if not already running.

@@ -1182,12 +1182,14 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
     if (core != null && mounted) {
       final ygg = core.transport.transports.whereType<YggdrasilTransport>().firstOrNull;
       final i2p = core.transport.transports.whereType<I2PTransport>().firstOrNull;
+      final ipfs = core.transport.transports.whereType<IpfsTransport>().firstOrNull;
       setState(() {
         _yggAddress = ygg?.address;
         _i2pSamReachable    = i2p?.isSamReachable    ?? false;
         _i2pSessionReady    = i2p?.isSessionReady    ?? false;
         _i2pFailureCount    = i2p?.sessionAttemptFailures ?? 0;
         _i2pDestPreview     = i2p?.myDestination?.substring(0, 16);
+        _ipfsRetryQueue     = ipfs?.pendingRetryCount ?? 0;
       });
     }
   }
@@ -1197,6 +1199,7 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
   bool _i2pSessionReady = false;
   int _i2pFailureCount = 0;
   String? _i2pDestPreview;
+  int _ipfsRetryQueue = 0;
 
   /// Three-state label for the I2P transport row. "active" alone hid the
   /// fact that the SAM bridge can be alive while i2pd is still building
@@ -1291,7 +1294,17 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
           ),
           _TransportRow(label: 'bluetooth mesh', value: s?.btMeshState == true ? 'active' : 'inactive', tokens: t),
           _TransportRow(label: 'bt peers nearby', value: '${s?.btPeerCount ?? 0}', tokens: t),
-          _TransportRow(label: 'queued messages', value: '${s?.pendingMessages ?? 0}', tokens: t),
+          // The BLE store and the IPFS retry queue are independent backlogs;
+          // both block message delivery and the user should see the combined
+          // total so they know how much is waiting on the network coming back.
+          _TransportRow(
+            label: 'queued messages',
+            value: _ipfsRetryQueue > 0
+                ? '${(s?.pendingMessages ?? 0) + _ipfsRetryQueue} '
+                    '(ipfs retry $_ipfsRetryQueue)'
+                : '${s?.pendingMessages ?? 0}',
+            tokens: t,
+          ),
           const SizedBox(height: 4),
           Text(
             s?.mode == TransportMode.offline

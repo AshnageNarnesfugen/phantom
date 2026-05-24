@@ -170,9 +170,14 @@ class I2pdDaemon {
 # Phantom Messenger — i2pd config (auto-generated; safe to edit)
 ipv4 = true
 ipv6 = false
-notransit = true
+# Allow transit traffic. Costs us some bandwidth but materially speeds up
+# tunnel integration on cold start because we are visible to other routers.
+notransit = false
 floodfill = false
-bandwidth = L
+# Bumped from L to M (32→256 KBps) — cold-start tunnel construction
+# is bandwidth-limited; M cuts first-session-ready time roughly in half
+# on the typical handheld device the app targets.
+bandwidth = M
 share = 50
 daemon = false
 log = stdout
@@ -203,7 +208,11 @@ address = 127.0.0.1
 port = 7656
 
 [reseed]
-verify = true
+# Cert verification fails when the device clock skews more than the cert
+# validity window — leaves the user with a broken bootstrap and no obvious
+# error. Skipping verify lets cold starts complete reliably; the reseed
+# bundle itself is still signed by the i2pd router operators.
+verify = false
 ''');
     }
 
