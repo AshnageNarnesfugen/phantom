@@ -23,14 +23,16 @@ jobs:
           java-version: "21"
 
       - name: Set up Flutter
-        # `cache: false` forces a fresh extraction every run. The previous
-        # cached install silently shipped an APK with a libflutter.so whose
-        # JNI signatures didn't match the Dart entry point — caused a null
-        # deref inside libflutter.so during FlutterJNI.performNativeAttach
-        # on first launch (see commit f9480ad message for the tombstone).
+        # Pinned to 3.41.9 — the same version the user runs locally where
+        # `flutter run --release` boots cleanly on the Snapdragon 865 /
+        # Android 13 device that the CI 3.44.0 APK kept crashing on
+        # (libflutter.so null deref inside FlutterJNI.performNativeAttach,
+        # see tombstone in commit f9480ad message). Bumping past 3.41.9
+        # requires re-testing on that hardware first.
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: '3.41.9'
           cache: false
 
       - name: Log Flutter version
