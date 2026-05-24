@@ -70,13 +70,8 @@ android {
             // Local dev uses key.properties; CI re-signs with apksigner after build.
             val releaseSigning = signingConfigs.findByName("release")
             signingConfig = releaseSigning ?: signingConfigs.getByName("debug")
-            // Diagnostic build: minify+shrink disabled. The release APK was
-            // dying at startup before any UI/log; turning these off bisects
-            // whether R8 is the culprit. If this build runs cleanly the bug
-            // is in a class R8 stripped; re-enable + extend proguard-rules.pro
-            // for the offending plugin.
-            isMinifyEnabled = false
-            isShrinkResources = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",

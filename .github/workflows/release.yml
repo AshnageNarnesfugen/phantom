@@ -72,11 +72,6 @@ jobs:
           bash scripts/build_yggdrasil_mobile.sh android/app/libs/yggdrasil-mobile.aar
 
       - name: Download arm64 Kubo binary
-        # DIAG: temporarily disabled. The local flutter run --release build
-        # has no libkubo.so in jniLibs and boots cleanly; the CI APK does
-        # include it and crashes at startup before Dart runs. Skip the
-        # binary to confirm libkubo.so is the trigger.
-        if: false
         run: bash scripts/download_kubo.sh arm64-v8a
 
       - name: Bundle i2pd binaries (PurpleI2P)
@@ -88,8 +83,6 @@ jobs:
         run: bash scripts/download_i2pd.sh arm64-v8a x86_64
 
       - name: Build static x86_64 Kubo binary
-        # DIAG: temporarily disabled — see "Download arm64 Kubo binary".
-        if: false
         run: |
           git clone --depth=1 --branch v0.41.0 \
             https://github.com/ipfs/kubo.git /tmp/kubo
@@ -99,36 +92,42 @@ jobs:
           echo "✓ Static x86_64 kubo: $(du -sh android/app/src/main/jniLibs/x86_64/libkubo.so | cut -f1)"
 
       - name: Prepare signing keystore for gradle
-        # DIAG: generate a fresh self-signed debug-style keystore on the
-        # runner instead of using the production cert. Local flutter run
-        # --release works with debug.keystore; if this APK boots cleanly
-        # the bug is in the production cert (format / fields / expiry).
-        # If it still crashes the bug is in some other CI-vs-local delta.
+        # Build a PKCS12 keystore from the PEM secrets and write a
+        # key.properties that AGP reads via android/app/build.gradle.kts.
+        # Doing this BEFORE `flutter build apk` makes gradle sign the APK
+        # once with the production key — the old workflow signed twice
+        # (debug.keystore at build then apksigner with prod cert) which
+        # left residual signature blocks that crashed the loader on some
+        # Android versions.
+        env:
+          SIGNING_PRIVATE_KEY: ${{ secrets.SIGNING_PRIVATE_KEY }}
+          SIGNING_CERTIFICATE: ${{ secrets.SIGNING_CERTIFICATE }}
         run: |
+          echo "$SIGNING_PRIVATE_KEY" | base64 --decode > /tmp/signing-key-raw.pem
+          echo "$SIGNING_CERTIFICATE" | base64 --decode > /tmp/signing-cert.pem
+          openssl pkcs8 -topk8 -nocrypt \
+            -in /tmp/signing-key-raw.pem \
+            -out /tmp/signing-key-pkcs8.pem
           KEYSTORE_PASS="phantom-ci-$(date +%s)"
-          keytool -genkeypair \
-            -alias phantom-release \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 365 \
-            -storetype PKCS12 \
-            -keystore android/app/phantom-release.p12 \
-            -storepass "${KEYSTORE_PASS}" \
-            -keypass "${KEYSTORE_PASS}" \
-            -dname "CN=Phantom CI Diagnostic, OU=Phantom, O=Phantom, L=CI, ST=CI, C=US"
+          openssl pkcs12 -export \
+            -inkey /tmp/signing-key-pkcs8.pem \
+            -in /tmp/signing-cert.pem \
+            -out android/app/phantom-release.p12 \
+            -name phantom-release \
+            -password "pass:${KEYSTORE_PASS}"
           cat > android/key.properties <<EOF
           storeFile=phantom-release.p12
           storePassword=${KEYSTORE_PASS}
           keyAlias=phantom-release
           keyPassword=${KEYSTORE_PASS}
           EOF
+          rm -f /tmp/signing-key-raw.pem /tmp/signing-key-pkcs8.pem /tmp/signing-cert.pem
 
       - name: Build release APK
-        # Diagnostic build: dropped --obfuscate and isMinifyEnabled in gradle.
-        # If this APK runs cleanly we know the original release crash was in
-        # the R8/obfuscation pipeline. Re-enable both once isolated.
         run: |
-          flutter build apk --release
+          flutter build apk --release \
+            --obfuscate \
+            --split-debug-info=build/debug-info
 
       - name: Rename APK with commit SHA
         id: apk
