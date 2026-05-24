@@ -1100,6 +1100,9 @@ class I2PTransport implements PhantomTransport {
   String? _myPrivKey;
   bool _disposed = false;
   bool _ready = false;
+  bool _samReachable = false;
+  int _consecutiveFailures = 0;
+  DateTime? _lastSessionAttemptAt;
 
   final _incoming = StreamController<IncomingEnvelope>.broadcast();
 
@@ -1113,8 +1116,26 @@ class I2PTransport implements PhantomTransport {
   @override
   final String name = 'i2p-sam';
 
+  /// Implements the abstract contract: "available" means the transport can
+  /// be used for outbound publish. That requires both SAM being reachable
+  /// AND our SESSION CREATE having completed (so we have a destination key
+  /// and an alive control socket).
   @override
   bool get isAvailable => _ready;
+
+  /// True if the SAM bridge TCP port is responding. Doesn't mean i2pd is
+  /// done bootstrapping; the SAM bridge accepts HELLO long before tunnels
+  /// are built. Surface this separately from [isAvailable] so the UI can
+  /// distinguish "bridge running, still bootstrapping" from "bridge down".
+  bool get isSamReachable => _samReachable;
+
+  /// True only after we have a working SESSION CREATE and a destination key
+  /// — i.e. we can actually send / receive I2P datagrams right now.
+  bool get isSessionReady => _ready;
+
+  /// Number of consecutive SESSION CREATE attempts that have failed since
+  /// the last success. Useful for the UI to show "still trying" vs "stuck".
+  int get sessionAttemptFailures => _consecutiveFailures;
 
   I2PTransport({
     this.host = '127.0.0.1',
@@ -1146,10 +1167,12 @@ class I2PTransport implements PhantomTransport {
             timeout: const Duration(milliseconds: 1500));
         await probe.close();
         host = h;
+        _samReachable = true;
         dbg.log('I2P: SAM bridge reachable at $h');
         return true;
       } catch (_) {}
     }
+    _samReachable = false;
     dbg.log('I2P: no SAM bridge reachable');
     return false;
   }
@@ -1159,6 +1182,7 @@ class I2PTransport implements PhantomTransport {
   Future<bool> _ensureSession() async {
     if (_ready && _control != null && _udp != null) return true;
     final dbg = TransportDebugger.instance;
+    _lastSessionAttemptAt = DateTime.now();
     // Fresh session name per attempt so a stalled previous SESSION CREATE
     // doesn't make us collide with our own zombie session on SAM's side.
     _sessionId = 'phantom-${DateTime.now().microsecondsSinceEpoch}';
@@ -1205,13 +1229,15 @@ class I2PTransport implements PhantomTransport {
           'SESSION CREATE STYLE=DATAGRAM ID=$_sessionId DESTINATION=$destArg '
           'PORT=$myUdp HOST=127.0.0.1\n';
       s.add(utf8.encode(createCmd));
-      // i2pd often takes 30-60 s on cold start before replying to SESSION
-      // CREATE (it has to reseed + build initial tunnels). A short timeout
-      // here means we try again with a new session id while the previous
-      // command is still being processed, and DUPLICATED_ID errors pile up.
-      final status = await next(const Duration(seconds: 90));
+      // Shorter timeout per attempt so a stuck SESSION CREATE doesn't
+      // block the maintainer for 90 s. The maintainer keeps retrying
+      // indefinitely with backoff, so giving each individual attempt 30 s
+      // lets i2pd's bootstrap progress get a fresh chance every minute or
+      // so without piling up zombie sessions.
+      final status = await next(const Duration(seconds: 30));
       if (!status.contains('RESULT=OK')) {
         dbg.log('I2P: SESSION CREATE rejected: $status');
+        _consecutiveFailures++;
         await _teardown();
         return false;
       }
@@ -1230,6 +1256,7 @@ class I2PTransport implements PhantomTransport {
       final valueMatch = RegExp(r'VALUE=(\S+)').firstMatch(lookup);
       if (valueMatch == null) {
         dbg.log('I2P: NAMING LOOKUP missing VALUE: $lookup');
+        _consecutiveFailures++;
         await _teardown();
         return false;
       }
@@ -1240,13 +1267,22 @@ class I2PTransport implements PhantomTransport {
       lines.listen((_) {}, onError: (_) {});
 
       _ready = true;
+      _consecutiveFailures = 0;
       return true;
     } catch (e) {
       dbg.log('I2P: session setup failed: $e');
+      _consecutiveFailures++;
       await _teardown();
       return false;
     }
   }
+
+  /// Time elapsed since the maintainer last tried to bring up SAM. UI uses
+  /// this to render "bootstrapping…" with a heartbeat.
+  Duration? get sinceLastSessionAttempt =>
+      _lastSessionAttemptAt == null
+          ? null
+          : DateTime.now().difference(_lastSessionAttemptAt!);
 
   void _onUdpEvent(RawSocketEvent event) {
     if (event != RawSocketEvent.read) return;

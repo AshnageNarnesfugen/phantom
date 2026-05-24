@@ -1148,6 +1148,7 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
   TransportStatus? _status;
   int _ipfsSwarmPeers = 0;
   bool _ipfsRunning = false;
+  Timer? _refreshTimer;
 
   @override
   void initState() {
@@ -1157,6 +1158,12 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
       if (mounted) setState(() => _status = widget.core?.transportStatus);
     });
     _fetchIpfsStatus();
+    // I2P bootstrap can take 1-5 min after first launch; refresh while the
+    // sheet is open so the user actually sees the status flip from
+    // "bootstrapping" to "ready" without closing and re-opening.
+    _refreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (mounted) _fetchIpfsStatus();
+    });
   }
 
   Future<void> _fetchIpfsStatus() async {
@@ -1177,17 +1184,39 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
       final i2p = core.transport.transports.whereType<I2PTransport>().firstOrNull;
       setState(() {
         _yggAddress = ygg?.address;
-        _i2pActive = i2p?.myDestination != null;
+        _i2pSamReachable    = i2p?.isSamReachable    ?? false;
+        _i2pSessionReady    = i2p?.isSessionReady    ?? false;
+        _i2pFailureCount    = i2p?.sessionAttemptFailures ?? 0;
+        _i2pDestPreview     = i2p?.myDestination?.substring(0, 16);
       });
     }
   }
 
   String? _yggAddress;
-  bool _i2pActive = false;
+  bool _i2pSamReachable = false;
+  bool _i2pSessionReady = false;
+  int _i2pFailureCount = 0;
+  String? _i2pDestPreview;
+
+  /// Three-state label for the I2P transport row. "active" alone hid the
+  /// fact that the SAM bridge can be alive while i2pd is still building
+  /// tunnels — the user sees "active" but messages mysteriously fall back
+  /// to IPFS because no session is actually established yet.
+  String _i2pStatusLabel() {
+    if (!_i2pSamReachable) return 'inactive';
+    if (_i2pSessionReady) {
+      final dest = _i2pDestPreview;
+      return dest != null ? 'ready · ${dest.substring(0, 8)}…' : 'ready';
+    }
+    return _i2pFailureCount > 0
+        ? 'bootstrapping (retry $_i2pFailureCount)'
+        : 'bootstrapping…';
+  }
 
   @override
   void dispose() {
     _sub?.cancel();
+    _refreshTimer?.cancel();
     super.dispose();
   }
 
@@ -1257,7 +1286,7 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
           ),
           _TransportRow(
             label: 'i2p',
-            value: _i2pActive ? 'active' : 'inactive',
+            value: _i2pStatusLabel(),
             tokens: t,
           ),
           _TransportRow(label: 'bluetooth mesh', value: s?.btMeshState == true ? 'active' : 'inactive', tokens: t),
