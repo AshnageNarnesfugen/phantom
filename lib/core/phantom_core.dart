@@ -102,6 +102,79 @@ class PhantomCore {
   static const _initRecentWindow = Duration(seconds: 60);
   final Map<String, DateTime> _lastInitSentAt = {};
 
+  // ── Handshake auto-retry ──────────────────────────────────────────────────
+  // After sending an INIT we sit waiting for the peer's handshakeAck. If
+  // tunnels haven't converged or the peer is briefly offline, the ack never
+  // arrives and the user has to manually tap "reset session" to retry.
+  // Auto-retry schedules a fresh INIT with exponential backoff until the
+  // session's pendingX3dhEphemeralKey flips to null (which only happens
+  // when the DH ratchet fires — i.e. the ack landed and we decrypted it).
+  static const _handshakeRetryBase = Duration(seconds: 60);
+  static const _handshakeRetryCap  = Duration(minutes: 8);
+  final Map<String, Timer> _handshakeRetryTimers = {};
+  final Map<String, int>   _handshakeRetryAttempts = {};
+  /// Emits a contactId whenever its handshake-ack state changes (start
+  /// awaiting, ack received, retry attempted). The chat screen listens to
+  /// re-render the "waiting for first response" banner.
+  final _handshakeStateController = StreamController<String>.broadcast();
+  Stream<String> get handshakeStateChanges => _handshakeStateController.stream;
+
+  /// True when we have sent an INIT to [contactId] and have not yet
+  /// received the handshakeAck (i.e. the Double Ratchet's pendingX3dhEk
+  /// hasn't been cleared by a successful inbound MSG decrypt).
+  bool isAwaitingHandshakeAck(String contactId) {
+    final session = _sessions[contactId];
+    return session != null && session.pendingX3dhEphemeralKey != null;
+  }
+
+  /// Current retry attempt count for [contactId]. 0 means no retry pending.
+  int handshakeRetryAttempt(String contactId) =>
+      _handshakeRetryAttempts[contactId] ?? 0;
+
+  void _scheduleHandshakeRetry(String contactId) {
+    _handshakeRetryTimers[contactId]?.cancel();
+    final attempt = (_handshakeRetryAttempts[contactId] ?? 0) + 1;
+    _handshakeRetryAttempts[contactId] = attempt;
+    final shift = (attempt - 1).clamp(0, 6);
+    final delaySecs =
+        (_handshakeRetryBase.inSeconds * (1 << shift)).clamp(
+            _handshakeRetryBase.inSeconds, _handshakeRetryCap.inSeconds);
+    _handshakeRetryTimers[contactId] = Timer(Duration(seconds: delaySecs), () {
+      unawaited(_runHandshakeRetry(contactId));
+    });
+    if (!_handshakeStateController.isClosed) {
+      _handshakeStateController.add(contactId);
+    }
+  }
+
+  Future<void> _runHandshakeRetry(String contactId) async {
+    if (_disposed) return;
+    if (!isAwaitingHandshakeAck(contactId)) {
+      _cancelHandshakeRetry(contactId);
+      return;
+    }
+    TransportDebugger.instance.log(
+        'HANDSHAKE: auto-retry #${_handshakeRetryAttempts[contactId]} for ${contactId.substring(0, 8)}');
+    try {
+      // Drain resendHandshake so its yields complete; we don't need the
+      // status strings here (they're for the UI's manual reset flow).
+      await resendHandshake(contactId).drain<void>();
+    } catch (_) {}
+    if (!_disposed && isAwaitingHandshakeAck(contactId)) {
+      _scheduleHandshakeRetry(contactId);
+    } else {
+      _cancelHandshakeRetry(contactId);
+    }
+  }
+
+  void _cancelHandshakeRetry(String contactId) {
+    _handshakeRetryTimers.remove(contactId)?.cancel();
+    _handshakeRetryAttempts.remove(contactId);
+    if (!_handshakeStateController.isClosed) {
+      _handshakeStateController.add(contactId);
+    }
+  }
+
   TransportStatus? get transportStatus => _transportV2?.status;
   Stream<TransportMode> get transportModeChanges =>
       _transportV2?.modeChanges ?? const Stream.empty();
@@ -479,6 +552,10 @@ class PhantomCore {
             final dbg = TransportDebugger.instance;
             dbg.log('DBG: before _sendConnectivityInfo, session.pendingX3dhEk is null? ${session.pendingX3dhEphemeralKey == null}');
             unawaited(_sendConnectivityInfo(recipientId));
+            // Arm the auto-retry: if the peer's handshakeAck never arrives
+            // (tunnels not converged, peer offline, etc) we resend the INIT
+            // on a backoff so the user doesn't have to hit "reset session".
+            _scheduleHandshakeRetry(recipientId);
           }
 
           return stored.copyWith(status: status);
@@ -498,6 +575,7 @@ class PhantomCore {
             final dbg = TransportDebugger.instance;
             dbg.log('DBG: before _sendConnectivityInfo, session.pendingX3dhEk is null? ${session.pendingX3dhEphemeralKey == null}');
             unawaited(_sendConnectivityInfo(recipientId));
+            _scheduleHandshakeRetry(recipientId);
             dbg.log('DBG: after unawaited, session.pendingX3dhEk is null? ${session.pendingX3dhEphemeralKey == null}');
           }
 
@@ -669,7 +747,7 @@ class PhantomCore {
   /// received our INIT and the session is stuck.
   Future<void> resetSession(String contactId) async {
     _sessions.remove(contactId);
-
+    _cancelHandshakeRetry(contactId);
     await storage.deleteSessionState(contactId);
     TransportDebugger.instance.log('SESSION: reset for ${contactId.substring(0, 8)} — next message will re-handshake');
   }
@@ -1744,6 +1822,9 @@ class PhantomCore {
         await _saveSession(entry.key, entry.value);
         await _dispatchIncoming(message, entry.key);
         dbg.log('MSG: ✓ MSG decrypted via session ${entry.key.substring(0, 8)}');
+        // Successful decrypt means the DH ratchet ran which means the
+        // handshakeAck path is complete. Cancel any pending auto-retry.
+        _cancelHandshakeRetry(entry.key);
         return true;
       } catch (e) {
         _sessions[entry.key] = await RatchetSession.fromJson(snapshot);
@@ -1907,6 +1988,12 @@ class PhantomCore {
     // Set the flag first so any in-flight _handleIncomingBytes returns before
     // we tear down storage / transports underneath them.
     _disposed = true;
+    for (final t in _handshakeRetryTimers.values) {
+      t.cancel();
+    }
+    _handshakeRetryTimers.clear();
+    _handshakeRetryAttempts.clear();
+    await _handshakeStateController.close();
     await _transportSub?.cancel();
     await _transportV2Sub?.cancel();
     await _meshStoreSub?.cancel();

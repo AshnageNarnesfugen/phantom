@@ -19,6 +19,7 @@ class _ChatScreenState extends State<ChatScreen> {
   List<StoredMessage>? _messages;
   StreamSubscription<StoredMessage>? _sub;
   StreamSubscription<String>? _presenceSub;
+  StreamSubscription<String>? _handshakeSub;
   StoredMessage? _replyTo;
   String?   _wallpaperPath;
   BoxFit    _bgFit       = BoxFit.cover;
@@ -46,6 +47,11 @@ class _ChatScreenState extends State<ChatScreen> {
         if (msg.conversationId == widget.contactId) _loadMessages(core);
       });
       _presenceSub = core.presenceChanges.listen((id) {
+        if (id == widget.contactId && mounted) setState(() {});
+      });
+      // Re-render when the handshake-ack state flips so the "waiting for
+      // first response" banner appears / disappears in real time.
+      _handshakeSub = core.handshakeStateChanges.listen((id) {
         if (id == widget.contactId && mounted) setState(() {});
       });
       _loadMessages(core);
@@ -314,6 +320,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _core?.setActiveChat(null);
     _sub?.cancel();
     _presenceSub?.cancel();
+    _handshakeSub?.cancel();
     _scrollCtrl.dispose();
     _blurredBg?.dispose();
     // _noiseImage is shared via NoiseImageCache — do not dispose it here.
@@ -413,12 +420,20 @@ class _ChatScreenState extends State<ChatScreen> {
           : null,
     );
 
+    final awaitingAck =
+        core?.isAwaitingHandshakeAck(widget.contactId) ?? false;
+    final retryAttempt = core?.handshakeRetryAttempt(widget.contactId) ?? 0;
+    final handshakeBanner = awaitingAck
+        ? _HandshakeWaitingBanner(tokens: t, retryAttempt: retryAttempt)
+        : null;
+
     final scaffold = Scaffold(
       backgroundColor: g ? Colors.transparent : t.bgBase,
       appBar: appBar,
       body: Column(
         children: [
           Expanded(child: messageList),
+          if (handshakeBanner != null) handshakeBanner,
           inputBar,
         ],
       ),
@@ -1141,6 +1156,55 @@ class _MenuItem extends StatelessWidget {
       title: Text(label, style: TextStyle(color: color, fontFamily: 'monospace', fontSize: 14)),
       dense: true,
       onTap: onTap,
+    );
+  }
+}
+
+/// Thin notice bar shown above the input when we are waiting for the
+/// peer's handshakeAck. PhantomCore retries the INIT on a backoff in the
+/// background; this just tells the user it's happening so they don't
+/// wonder why their first message hasn't gone through.
+class _HandshakeWaitingBanner extends StatelessWidget {
+  final PhantomTokens tokens;
+  final int retryAttempt;
+  const _HandshakeWaitingBanner({
+    required this.tokens,
+    required this.retryAttempt,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final detail = retryAttempt > 0
+        ? 'waiting for first response · retry $retryAttempt'
+        : 'waiting for first response…';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: tokens.bgBase.withValues(alpha: 0.6),
+        border: Border(top: BorderSide(color: tokens.divider, width: 0.5)),
+      ),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 12, height: 12,
+            child: CircularProgressIndicator(
+              color: tokens.accentLight,
+              strokeWidth: 1.2,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              detail,
+              style: TextStyle(
+                color: tokens.textSecondary,
+                fontFamily: 'monospace',
+                fontSize: 11,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
