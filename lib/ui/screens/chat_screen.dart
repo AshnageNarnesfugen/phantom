@@ -627,30 +627,17 @@ class _ChatScreenState extends State<ChatScreen> {
                   Navigator.pop(context);
                   _showGlassSettings(context, t, core);
                 }),
-              _MenuItem(icon: Icons.electrical_services_outlined, label: 'revive connection', tokens: t,
+              // Single reconnect entry — reviveConnection already does the
+              // full sequence (disconnect → re-subscribe → DHT discovery →
+              // wait for gossipsub mesh → reset session → fresh INIT), so
+              // the old separate 'reset session' button was a strict subset.
+              // Auto-retry handles the silent case in the background; this
+              // button forces an immediate kick.
+              _MenuItem(icon: Icons.sync_outlined, label: 'reconnect', tokens: t,
                 onTap: () async {
                   Navigator.pop(context);
                   if (core == null) return;
                   _showReviveDialog(context, t, core, widget.contactId);
-                }),
-              _MenuItem(icon: Icons.sync_outlined, label: 'reset session', tokens: t,
-                onTap: () async {
-                  Navigator.pop(context);
-                  if (core == null) return;
-                  await showDialog(
-                    context: context,
-                    barrierDismissible: false,
-                    builder: (_) => _ReviveDialog(
-                      contactId: widget.contactId,
-                      core: core,
-                      t: t,
-                      title: 'Resetting Session',
-                      successMessage: 'session re-established',
-                      failureMessage: 'reset failed — peer did not respond',
-                      streamBuilder: (c, id) => c.resendHandshake(id),
-                    ),
-                  );
-                  if (mounted) _loadMessages(core);
                 }),
               _MenuItem(icon: Icons.delete_outline, label: 'clear history', tokens: t,
                 onTap: () async {

@@ -498,24 +498,11 @@ class _ReviveDialog extends StatefulWidget {
   final String contactId;
   final PhantomCore core;
   final PhantomTokens t;
-  /// Title rendered in the dialog. Defaults to the revive flow.
-  final String title;
-  /// Final-success message shown for 2s before auto-dismiss.
-  final String successMessage;
-  /// Final-failure message.
-  final String failureMessage;
-  /// Stream factory: builds the progress stream when the dialog mounts.
-  /// Defaults to [PhantomCore.reviveConnection].
-  final Stream<String> Function(PhantomCore core, String contactId)? streamBuilder;
 
   const _ReviveDialog({
     required this.contactId,
     required this.core,
     required this.t,
-    this.title = 'Reviving Connection',
-    this.successMessage = 'connection revived!',
-    this.failureMessage = 'revive failed',
-    this.streamBuilder,
   });
 
   @override
@@ -545,14 +532,12 @@ class _ReviveDialogState extends State<_ReviveDialog> with SingleTickerProviderS
   }
 
   void _startRevive() async {
-    final stream = widget.streamBuilder != null
-        ? widget.streamBuilder!(widget.core, widget.contactId)
-        : widget.core.reviveConnection(widget.contactId);
+    final stream = widget.core.reviveConnection(widget.contactId);
     await for (final status in stream) {
       if (!mounted) break;
       if (status == 'success') {
         setState(() {
-          _status = widget.successMessage;
+          _status = 'connection revived!';
           _finished = true;
           _success = true;
         });
@@ -562,7 +547,7 @@ class _ReviveDialogState extends State<_ReviveDialog> with SingleTickerProviderS
         break;
       } else if (status == 'failed') {
         setState(() {
-          _status = widget.failureMessage;
+          _status = 'revive failed';
           _finished = true;
           _success = false;
         });
@@ -606,31 +591,7 @@ class _ReviveDialogState extends State<_ReviveDialog> with SingleTickerProviderS
           mainAxisSize: MainAxisSize.min,
           children: [
             if (!_finished)
-              RotationTransition(
-                turns: _controller,
-                child: Container(
-                  width: 60, height: 60,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: LinearGradient(
-                      colors: [t.accentLight, t.accentLight.withValues(alpha: 0)],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                    ),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.all(2),
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: t.bgSurface,
-                        shape: BoxShape.circle,
-                      ),
-                      child: Icon(Icons.electrical_services_outlined,
-                          color: t.accentLight, size: 28),
-                    ),
-                  ),
-                ),
-              )
+              _OnionRouteAnimation(controller: _controller, tokens: t)
             else
               Container(
                 width: 60, height: 60,
@@ -646,7 +607,7 @@ class _ReviveDialogState extends State<_ReviveDialog> with SingleTickerProviderS
               ),
             const SizedBox(height: 24),
             Text(
-              widget.title,
+              'Reconnecting',
               style: TextStyle(
                 color: t.textPrimary,
                 fontFamily: 'monospace',
@@ -688,6 +649,126 @@ class _ReviveDialogState extends State<_ReviveDialog> with SingleTickerProviderS
             ],
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ── Onion route animation ────────────────────────────────────────────────────
+
+/// Symbolic visualisation of a message hopping through the privacy network.
+/// Renders 4 nodes in a row with a moving packet that lights each node as
+/// it passes. Purely cosmetic — does not reflect real tunnel state (i2pd
+/// doesn't expose hop info via SAM), but gives the user a sense that work
+/// is happening during the otherwise opaque reconnect flow.
+class _OnionRouteAnimation extends StatelessWidget {
+  final AnimationController controller;
+  final PhantomTokens tokens;
+  static const int _nodeCount = 4;
+  static const double _nodeSize = 14;
+  static const double _gap = 20;
+  static const double _packetSize = 8;
+
+  const _OnionRouteAnimation({required this.controller, required this.tokens});
+
+  @override
+  Widget build(BuildContext context) {
+    final width = _nodeCount * _nodeSize + (_nodeCount - 1) * _gap;
+    return SizedBox(
+      width: width,
+      height: 36,
+      child: AnimatedBuilder(
+        animation: controller,
+        builder: (_, __) {
+          final t = controller.value;
+          final activeF = t * (_nodeCount - 1);
+          final activeIdx = activeF.floor();
+          final activeFrac = activeF - activeIdx;
+          return Stack(
+            alignment: Alignment.center,
+            children: [
+              Container(
+                width: width - _nodeSize,
+                height: 1,
+                color: tokens.divider,
+              ),
+              for (int i = 0; i < _nodeCount; i++)
+                Positioned(
+                  left: i * (_nodeSize + _gap),
+                  child: _OnionNode(
+                    size: _nodeSize,
+                    glow: _glowFor(i, activeIdx, activeFrac),
+                    tokens: tokens,
+                  ),
+                ),
+              Positioned(
+                left: _packetXFor(t, width),
+                child: Container(
+                  width: _packetSize,
+                  height: _packetSize,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: tokens.accentLight,
+                    boxShadow: [
+                      BoxShadow(
+                        color: tokens.accentLight.withValues(alpha: 0.6),
+                        blurRadius: 6,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// Glow strength 0..1 for a node given the packet's current position.
+  static double _glowFor(int nodeIdx, int activeIdx, double activeFrac) {
+    if (nodeIdx == activeIdx) return 1.0 - activeFrac * 0.5;
+    if (nodeIdx == activeIdx + 1) return activeFrac;
+    return 0.0;
+  }
+
+  /// X offset of the packet's top-left corner so its centre slides linearly
+  /// from the first node's centre to the last node's centre across [width].
+  static double _packetXFor(double t, double width) {
+    final centerSpan = width - _nodeSize;
+    final centerX = (_nodeSize / 2) + centerSpan * t;
+    return centerX - _packetSize / 2;
+  }
+}
+
+class _OnionNode extends StatelessWidget {
+  final double size;
+  final double glow;
+  final PhantomTokens tokens;
+  const _OnionNode({
+    required this.size,
+    required this.glow,
+    required this.tokens,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final ringColor = Color.lerp(tokens.divider, tokens.accentLight, glow)!;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: tokens.bgSurface,
+        border: Border.all(color: ringColor, width: 1.5),
+        boxShadow: glow > 0.1
+            ? [
+                BoxShadow(
+                  color: tokens.accentLight.withValues(alpha: 0.4 * glow),
+                  blurRadius: 8 * glow,
+                ),
+              ]
+            : null,
       ),
     );
   }

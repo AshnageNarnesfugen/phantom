@@ -8,6 +8,7 @@ import 'core/phantom_core.dart';
 import 'core/ipfs_daemon.dart';
 import 'core/i2pd_daemon.dart';
 import 'core/yggdrasil_daemon.dart';
+import 'core/yggdrasil_peers.dart';
 import 'core/notification_service.dart';
 import 'core_provider.dart';
 import 'ui/theme/phantom_theme.dart';
@@ -148,9 +149,78 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
     if (Platform.isAndroid) {
       try { await IpfsDaemon.instance.ensure(); } catch (_) {}
       try { await I2pdDaemon.instance.ensure(); } catch (_) {}
-      try { await YggdrasilDaemon.instance.ensure(); } catch (_) {}
+      try { await _prepareYggdrasilAndEnsure(); } catch (_) {}
     }
     await _tryRestoreAccount();
+  }
+
+  /// Reads Yggdrasil user preferences from secure storage, prepares the
+  /// peer list (custom slots or freshly-fetched dynamic public list), hands
+  /// the result to [YggdrasilDaemon.setPeerOverride], and finally invokes
+  /// `ensure()`. When Yggdrasil is disabled in settings we just skip the
+  /// daemon entirely so the VPN permission never gets requested.
+  Future<void> _prepareYggdrasilAndEnsure() async {
+    // Storage isn't initialized until the user has an account, so on the
+    // first launch (pre-onboarding) we skip and fall back to the daemon's
+    // built-in bootstrap peers. Settings will pick this up on the next
+    // launch after onboarding writes the seed + initializes storage.
+    bool storageReady = true;
+    try { PhantomStorage.instance; } catch (_) { storageReady = false; }
+    if (!storageReady) {
+      await YggdrasilDaemon.instance.ensure();
+      return;
+    }
+
+    final storage = PhantomStorage.instance;
+    final enabled = await storage.getYggEnabled().catchError((_) => false);
+    if (!enabled) {
+      // User has Yggdrasil off — don't start the VPN service at all.
+      return;
+    }
+
+    final useCustom = await storage.getYggUseCustomPeers().catchError((_) => false);
+    List<String> peers;
+    if (useCustom) {
+      peers = (await storage.getYggCustomPeers().catchError((_) => <String>[]))
+          .where((p) => p.trim().isNotEmpty)
+          .toList();
+      if (peers.isEmpty) {
+        peers = YggdrasilPeerCatalog.fallback;
+      }
+    } else {
+      peers = await _resolvePublicYggPeers(storage);
+    }
+    YggdrasilDaemon.instance.setPeerOverride(peers);
+    await YggdrasilDaemon.instance.ensure();
+  }
+
+  /// Returns the peer list to inject into yggdrasil-go: cache when fresh,
+  /// upstream fetch when stale, hard-coded fallback when both fail. Each
+  /// call shuffles + trims down to a small subset so we rotate fairly.
+  Future<List<String>> _resolvePublicYggPeers(PhantomStorage storage) async {
+    final stale = await storage.isYggPeerCacheStale().catchError((_) => true);
+    if (!stale) {
+      final cached = await storage.getYggCachedPeers().catchError((_) => null);
+      if (cached != null && cached.peers.isNotEmpty) {
+        return YggdrasilPeerCatalog.pickRandom(
+            cached.peers, YggdrasilPeerCatalog.defaultPickCount);
+      }
+    }
+    final catalog = YggdrasilPeerCatalog();
+    try {
+      final fresh = await catalog.fetchUpstream();
+      if (fresh.isNotEmpty) {
+        await storage.setYggCachedPeers(fresh).catchError((_) {});
+        return YggdrasilPeerCatalog.pickRandom(
+            fresh, YggdrasilPeerCatalog.defaultPickCount);
+      }
+    } catch (_) {}
+    final cached = await storage.getYggCachedPeers().catchError((_) => null);
+    if (cached != null && cached.peers.isNotEmpty) {
+      return YggdrasilPeerCatalog.pickRandom(
+          cached.peers, YggdrasilPeerCatalog.defaultPickCount);
+    }
+    return YggdrasilPeerCatalog.fallback;
   }
 
   Future<void> _tryRestoreAccount() async {

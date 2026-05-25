@@ -307,6 +307,61 @@ class PhantomStorage {
     return Map<String, dynamic>.from(data as Map);
   }
 
+  // ── Yggdrasil preferences ─────────────────────────────────────────────────
+  // Settings tied to the optional Yggdrasil VPN transport. Toggled from the
+  // network section of the settings screen; the actual restart of the
+  // bundled router happens on the next app launch (changing peer lists
+  // mid-session would require tearing down the active TUN device).
+
+  Future<bool> getYggEnabled() async =>
+      (await getSetting<bool>('ygg_enabled')) ?? false;
+  Future<void> setYggEnabled(bool v) => setSetting('ygg_enabled', v);
+
+  /// When true, only the custom peers list is used. When false (default),
+  /// the daemon picks from the cached dynamic list fetched at startup.
+  Future<bool> getYggUseCustomPeers() async =>
+      (await getSetting<bool>('ygg_use_custom_peers')) ?? false;
+  Future<void> setYggUseCustomPeers(bool v) =>
+      setSetting('ygg_use_custom_peers', v);
+
+  Future<List<String>> getYggCustomPeers() async {
+    final raw = await getSetting<List<dynamic>>('ygg_custom_peers');
+    if (raw == null) return const [];
+    return raw.map((e) => e as String).toList();
+  }
+  Future<void> setYggCustomPeers(List<String> peers) =>
+      setSetting('ygg_custom_peers', peers);
+
+  /// Cached dynamic peer list with the wall-clock time we last fetched.
+  /// We refresh from the upstream once every [_yggPeerCacheTtl]; otherwise
+  /// reuse the cache so cold starts are still fast when the network is
+  /// flaky.
+  static const _yggPeerCacheTtl = Duration(hours: 6);
+
+  Future<({List<String> peers, DateTime fetchedAt})?> getYggCachedPeers() async {
+    final raw = await getSetting<Map<dynamic, dynamic>>('ygg_cached_peers');
+    if (raw == null) return null;
+    final tsUs = raw['ts'] as int?;
+    final list = (raw['list'] as List?)?.cast<String>();
+    if (tsUs == null || list == null) return null;
+    return (
+      peers: list,
+      fetchedAt: DateTime.fromMicrosecondsSinceEpoch(tsUs),
+    );
+  }
+  Future<void> setYggCachedPeers(List<String> peers) =>
+      setSetting('ygg_cached_peers', {
+        'ts': DateTime.now().microsecondsSinceEpoch,
+        'list': peers,
+      });
+
+  /// True when the cached list is older than [_yggPeerCacheTtl] or missing.
+  Future<bool> isYggPeerCacheStale() async {
+    final cached = await getYggCachedPeers();
+    if (cached == null) return true;
+    return DateTime.now().difference(cached.fetchedAt) > _yggPeerCacheTtl;
+  }
+
   // ── I2P persistent destination keypair ───────────────────────────────────────
   // The SAM bridge returns a base64-encoded full destination (private+public)
   // when SESSION CREATE uses DESTINATION=TRANSIENT. Persisting it here means

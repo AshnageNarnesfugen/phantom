@@ -34,6 +34,19 @@ class YggdrasilDaemon {
   /// Yggdrasil IPv6 we're advertising on the mesh, or null if not running.
   String? get address => _address;
 
+  /// Peers (multiaddr-style strings) that override the in-file defaults.
+  /// Caller is expected to compute these from user prefs + fetched dynamic
+  /// list before invoking [ensure]. When empty / null the daemon uses the
+  /// hard-coded fallback set baked into [_loadOrGenerateConfig].
+  List<String>? _pendingPeers;
+
+  /// Replaces the peer list used by the next [ensure] / re-launch. Pass
+  /// null to clear the override and fall back to the file's existing
+  /// peer list (or hard-coded fallback if there's no file yet).
+  void setPeerOverride(List<String>? peers) {
+    _pendingPeers = peers;
+  }
+
   /// Idempotent setup. Generates a config on first run and starts the VPN
   /// service if we already have permission. Otherwise the user must invoke
   /// [requestPermissionAndStart] from the settings UI.
@@ -101,28 +114,49 @@ class YggdrasilDaemon {
 
   // ── Config ──────────────────────────────────────────────────────────────────
 
+  /// Peer set used when the caller hasn't set an override yet AND no
+  /// previous config file exists. Same stable community peers that have
+  /// been online for years. The runtime catalog
+  /// ([YggdrasilPeerCatalog.fallback]) keeps a copy of this list — they
+  /// should stay in sync.
+  static const List<String> _bootstrapPeers = [
+    'tls://ygg-ukfi.incognet.io:8884',
+    'tls://ygg-ukcov.incognet.io:8884',
+    'tls://uk1.servers.devices.cwinfo.net:58226',
+  ];
+
   Future<_YggConfig> _loadOrGenerateConfig() async {
     final dir = await getApplicationSupportDirectory();
     final f = File('${dir.path}/yggdrasil.conf.json');
+    Map<String, dynamic>? existing;
     if (await f.exists()) {
       try {
-        final json = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
-        final addr = json['_phantom_address'] as String?;
-        if (addr != null && addr.isNotEmpty && _isYggAddress(addr)) {
-          return _YggConfig(json: jsonEncode(json), address: addr);
-        }
+        existing = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
       } catch (_) {}
     }
+
+    // If a peer override was supplied (from settings UI / startup wiring),
+    // it always wins over whatever is currently on disk. That way changes
+    // to the user's custom peer list or to the dynamic public-peer cache
+    // take effect on the next launch without manual config editing.
+    final peers = _pendingPeers != null && _pendingPeers!.isNotEmpty
+        ? _pendingPeers!
+        : (existing?['Peers'] as List?)?.cast<String>() ?? _bootstrapPeers;
+
+    if (existing != null) {
+      final addr = existing['_phantom_address'] as String?;
+      // Refresh the peer list in the file so it survives across runs.
+      existing['Peers'] = peers;
+      await f.writeAsString(jsonEncode(existing));
+      if (addr != null && addr.isNotEmpty && _isYggAddress(addr)) {
+        return _YggConfig(json: jsonEncode(existing), address: addr);
+      }
+    }
+
     // First run / corrupt config: ship a minimal config and let mobile.Yggdrasil
     // fill in the real keypair + 0200::/7 address on its first startJSON call.
-    // We persist the empty `_phantom_address` so the next launch knows to look
-    // up the real address from the TUN scan rather than re-trusting the file.
     final config = <String, dynamic>{
-      'Peers': [
-        'tls://ygg-ukfi.incognet.io:8884',
-        'tls://ygg-ukcov.incognet.io:8884',
-        'tls://uk1.servers.devices.cwinfo.net:58226',
-      ],
+      'Peers': peers,
       'PeersByListenAddress': <String, dynamic>{},
       'IfMTU': 1280,
       'NodeInfoPrivacy': true,

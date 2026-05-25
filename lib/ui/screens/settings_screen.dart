@@ -588,6 +588,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
           ),
+          _SettingTile(
+            icon: Icons.hub_outlined,
+            label: 'yggdrasil peers',
+            tokens: t,
+            onTap: () => _showYggdrasilPeersSheet(context, t),
+          ),
 
           // ── About ─────────────────────────────────────────────
           _SectionHeader('about', t),
@@ -731,6 +737,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  void _showYggdrasilPeersSheet(BuildContext context, PhantomTokens t) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: t.bgSurface,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(t.radiusCard)),
+      ),
+      isScrollControlled: true,
+      constraints: const BoxConstraints(maxWidth: 560),
+      builder: (_) => SafeArea(
+        child: SingleChildScrollView(
+          padding: EdgeInsets.only(
+            bottom: MediaQuery.of(context).viewInsets.bottom,
+          ),
+          child: _YggdrasilPeersSheet(tokens: t),
+        ),
+      ),
+    );
+  }
+
   void _showTransportSheet(BuildContext context, PhantomTokens t, PhantomCore? core) {
     showModalBottomSheet(
       context: context,
@@ -738,7 +764,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(t.radiusCard)),
       ),
-      builder: (_) => _TransportStatusSheet(tokens: t, core: core),
+      // isScrollControlled lets the sheet grow past the default half-screen
+      // cap — in landscape that cap was clipping our content. The maxWidth
+      // constraint keeps it readable on wide tablets / unfolded foldables.
+      isScrollControlled: true,
+      constraints: const BoxConstraints(maxWidth: 560),
+      builder: (_) => SafeArea(
+        child: SingleChildScrollView(
+          child: _TransportStatusSheet(tokens: t, core: core),
+        ),
+      ),
     );
   }
 
@@ -1336,6 +1371,309 @@ class _TransportRow extends StatelessWidget {
           Text(label, style: TextStyle(color: tokens.textSecondary, fontFamily: 'monospace', fontSize: 13)),
           const Spacer(),
           Text(value,  style: TextStyle(color: tokens.textPrimary,   fontFamily: 'monospace', fontSize: 13)),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Yggdrasil peers configuration sheet ─────────────────────────────────────
+
+/// Bottom-sheet UI that exposes the Yggdrasil controls: a master enable
+/// switch, a use-custom-peers switch, and an editable list of slots.
+///
+/// All writes go through PhantomStorage; changes only take effect on the
+/// next app launch because the yggdrasil-go router has already grabbed
+/// the TUN device and re-reading peers mid-run is not supported by
+/// mobile.Yggdrasil. The sheet shows that warning inline.
+class _YggdrasilPeersSheet extends StatefulWidget {
+  final PhantomTokens tokens;
+  const _YggdrasilPeersSheet({required this.tokens});
+
+  @override
+  State<_YggdrasilPeersSheet> createState() => _YggdrasilPeersSheetState();
+}
+
+class _YggdrasilPeersSheetState extends State<_YggdrasilPeersSheet> {
+  static const int _defaultSlots = 4;
+
+  bool _loaded = false;
+  bool _enabled = false;
+  bool _useCustom = false;
+  /// One TextEditingController per slot — owned by this state so they get
+  /// disposed cleanly and don't lose cursor position on each setState.
+  final List<TextEditingController> _slots = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    for (final c in _slots) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final storage = PhantomStorage.instance;
+    final enabled   = await storage.getYggEnabled();
+    final useCustom = await storage.getYggUseCustomPeers();
+    final peers     = await storage.getYggCustomPeers();
+    final padded = List<String>.from(peers);
+    while (padded.length < _defaultSlots) {
+      padded.add('');
+    }
+    if (!mounted) return;
+    setState(() {
+      _enabled   = enabled;
+      _useCustom = useCustom;
+      _slots
+        ..clear()
+        ..addAll(padded.map((p) => TextEditingController(text: p)));
+      _loaded = true;
+    });
+  }
+
+  Future<void> _persistPeers() async {
+    final list = _slots
+        .map((c) => c.text.trim())
+        .where((s) => s.isNotEmpty)
+        .toList();
+    await PhantomStorage.instance.setYggCustomPeers(list);
+  }
+
+  void _addSlot() {
+    setState(() => _slots.add(TextEditingController()));
+  }
+
+  void _removeSlot(int i) {
+    _slots[i].dispose();
+    setState(() => _slots.removeAt(i));
+    unawaited(_persistPeers());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = widget.tokens;
+    if (!_loaded) {
+      return Padding(
+        padding: const EdgeInsets.all(24),
+        child: Center(
+          child: CircularProgressIndicator(color: t.accentLight, strokeWidth: 1),
+        ),
+      );
+    }
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Center(
+            child: Container(
+              width: 36, height: 3,
+              decoration: BoxDecoration(
+                color: t.divider, borderRadius: BorderRadius.circular(2)),
+            ),
+          ),
+          const SizedBox(height: 20),
+          Row(
+            children: [
+              Icon(Icons.hub_outlined, color: t.accentLight, size: 18),
+              const SizedBox(width: 10),
+              Text('yggdrasil peers',
+                  style: TextStyle(
+                      color: t.textPrimary,
+                      fontFamily: 'monospace',
+                      fontSize: 16)),
+            ],
+          ),
+          const SizedBox(height: 16),
+          _YggSwitchRow(
+            label: 'enable yggdrasil',
+            value: _enabled,
+            tokens: t,
+            onChanged: (v) {
+              setState(() => _enabled = v);
+              unawaited(PhantomStorage.instance.setYggEnabled(v));
+            },
+          ),
+          _YggSwitchRow(
+            label: 'use custom peers',
+            value: _useCustom,
+            enabled: _enabled,
+            tokens: t,
+            onChanged: (v) {
+              setState(() => _useCustom = v);
+              unawaited(PhantomStorage.instance.setYggUseCustomPeers(v));
+            },
+          ),
+          const SizedBox(height: 8),
+          Text(
+            _useCustom
+                ? '// using your slots below'
+                : '// auto-pulling fresh peers from publicpeers.neilalexander.dev (cached 6h)',
+            style: TextStyle(
+                color: t.textDisabled, fontFamily: 'monospace', fontSize: 10),
+          ),
+          const SizedBox(height: 16),
+          IgnorePointer(
+            ignoring: !_useCustom,
+            child: Opacity(
+              opacity: _useCustom ? 1.0 : 0.4,
+              child: Column(
+                children: [
+                  for (int i = 0; i < _slots.length; i++)
+                    _PeerSlotRow(
+                      controller: _slots[i],
+                      index: i,
+                      tokens: t,
+                      onChanged: (_) => unawaited(_persistPeers()),
+                      onRemove: _slots.length > 1 ? () => _removeSlot(i) : null,
+                    ),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: _addSlot,
+                      icon: Icon(Icons.add, color: t.accentLight, size: 16),
+                      label: Text(
+                        'add slot',
+                        style: TextStyle(
+                            color: t.accentLight,
+                            fontFamily: 'monospace',
+                            fontSize: 12),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            '// peer format: tls://host:port  (also tcp:// quic:// ws:// wss://)\n'
+            '// changes take effect on next app launch',
+            style: TextStyle(
+                color: t.textDisabled,
+                fontFamily: 'monospace',
+                fontSize: 10,
+                height: 1.6),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _YggSwitchRow extends StatelessWidget {
+  final String label;
+  final bool value;
+  final bool enabled;
+  final PhantomTokens tokens;
+  final ValueChanged<bool> onChanged;
+  const _YggSwitchRow({
+    required this.label,
+    required this.value,
+    required this.tokens,
+    required this.onChanged,
+    this.enabled = true,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              label,
+              style: TextStyle(
+                color: enabled ? tokens.textPrimary : tokens.textDisabled,
+                fontFamily: 'monospace',
+                fontSize: 13,
+              ),
+            ),
+          ),
+          Switch(
+            value: value,
+            onChanged: enabled ? onChanged : null,
+            activeThumbColor: tokens.accentLight,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PeerSlotRow extends StatelessWidget {
+  final TextEditingController controller;
+  final int index;
+  final PhantomTokens tokens;
+  final ValueChanged<String> onChanged;
+  final VoidCallback? onRemove;
+  const _PeerSlotRow({
+    required this.controller,
+    required this.index,
+    required this.tokens,
+    required this.onChanged,
+    this.onRemove,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 28,
+            child: Text('${index + 1}.',
+                style: TextStyle(
+                    color: tokens.textDisabled,
+                    fontFamily: 'monospace',
+                    fontSize: 12)),
+          ),
+          Expanded(
+            child: TextField(
+              controller: controller,
+              onChanged: onChanged,
+              style: TextStyle(
+                  color: tokens.textPrimary,
+                  fontFamily: 'monospace',
+                  fontSize: 12),
+              decoration: InputDecoration(
+                hintText: 'tls://host:port',
+                hintStyle: TextStyle(
+                    color: tokens.textDisabled,
+                    fontFamily: 'monospace',
+                    fontSize: 12),
+                isDense: true,
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                enabledBorder: OutlineInputBorder(
+                  borderSide: BorderSide(color: tokens.inputBorder),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderSide: BorderSide(color: tokens.accentLight),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+              ),
+            ),
+          ),
+          if (onRemove != null)
+            IconButton(
+              icon: Icon(Icons.close, color: tokens.textDisabled, size: 16),
+              onPressed: onRemove,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            ),
         ],
       ),
     );
