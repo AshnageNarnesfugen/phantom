@@ -21,10 +21,16 @@ import 'package:bs58check/bs58check.dart' as bs58check;
 ///
 /// The PhantomEnvelope is always opaque (encrypted + MACed).
 
-const int _kInit          = 0x49; // 'I'
-const int _kHybridInit    = 0x48; // 'H'
-const int _kHybridInitOpk = 0x47; // 'G' — hybrid INIT carrying a one-time prekey id
-const int _kMsg           = 0x4D; // 'M'
+const int _kInit            = 0x49; // 'I'
+const int _kHybridInit      = 0x48; // 'H'
+const int _kHybridInitOpk   = 0x47; // 'G' — hybrid INIT carrying a one-time prekey id
+/// Hybrid INIT carrying OPK + sender's current transport endpoints
+/// (I2P destination, IPFS peer id, Yggdrasil address) as a cleartext
+/// trailer. Lets the receiver refresh their stale contact record before
+/// they send the handshakeAck back — fixes the case where the peer
+/// imported our ContactAddress when we had different addresses.
+const int _kHybridInitFull  = 0x46; // 'F'
+const int _kMsg             = 0x4D; // 'M'
 
 class WireFrame {
   const WireFrame._();
@@ -118,6 +124,72 @@ class WireFrame {
     return buf.toBytes();
   }
 
+  /// Hybrid INIT carrying OPK + sender's current transport endpoints.
+  ///
+  /// Format:
+  ///   [1='F'][32 IK][32 EK]
+  ///   [2 kyber_len][kyber]
+  ///   [2 CA_len][CA]
+  ///   [4 opk_id]
+  ///   [2 i2p_len][i2p_dest]            // empty → 0-length
+  ///   [2 ipfs_len][ipfs_peer_id]       // empty → 0-length
+  ///   [2 ygg_len][ygg_addr]            // empty → 0-length
+  ///   [payload]
+  ///
+  /// Endpoint strings are ASCII (UTF-8 fits trivially); the receiver uses
+  /// them to refresh their saved contact record before sending the
+  /// handshakeAck back, which fixes the "stale dest after peer reinstall"
+  /// dead-letter problem on the very first round trip.
+  static Uint8List wrapHybridInitFull({
+    required Uint8List senderIdentityKeyBytes,
+    required Uint8List senderEphemeralKeyBytes,
+    required Uint8List kyberCipherBytes,
+    required Uint8List senderContactAddressBytes,
+    required int opkId,
+    required String senderI2pDest,
+    required String senderIpfsPeerId,
+    required String senderYggAddr,
+    required Uint8List envelopeBytes,
+  }) {
+    assert(senderIdentityKeyBytes.length  == 32);
+    assert(senderEphemeralKeyBytes.length == 32);
+    assert(opkId >= 0 && opkId <= 0xFFFFFFFF);
+
+    final kyberLen = kyberCipherBytes.length;
+    final caLen    = senderContactAddressBytes.length;
+    final i2pBytes  = senderI2pDest.codeUnits;
+    final ipfsBytes = senderIpfsPeerId.codeUnits;
+    final yggBytes  = senderYggAddr.codeUnits;
+    assert(i2pBytes.length  <= 0xFFFF);
+    assert(ipfsBytes.length <= 0xFFFF);
+    assert(yggBytes.length  <= 0xFFFF);
+
+    final buf = BytesBuilder();
+    buf.addByte(_kHybridInitFull);
+    buf.add(senderIdentityKeyBytes);
+    buf.add(senderEphemeralKeyBytes);
+
+    buf.add((ByteData(2)..setUint16(0, kyberLen, Endian.big)).buffer.asUint8List());
+    buf.add(kyberCipherBytes);
+
+    buf.add((ByteData(2)..setUint16(0, caLen, Endian.big)).buffer.asUint8List());
+    buf.add(senderContactAddressBytes);
+
+    buf.add((ByteData(4)..setUint32(0, opkId, Endian.big)).buffer.asUint8List());
+
+    buf.add((ByteData(2)..setUint16(0, i2pBytes.length, Endian.big)).buffer.asUint8List());
+    buf.add(i2pBytes);
+
+    buf.add((ByteData(2)..setUint16(0, ipfsBytes.length, Endian.big)).buffer.asUint8List());
+    buf.add(ipfsBytes);
+
+    buf.add((ByteData(2)..setUint16(0, yggBytes.length, Endian.big)).buffer.asUint8List());
+    buf.add(yggBytes);
+
+    buf.add(envelopeBytes);
+    return buf.toBytes();
+  }
+
   static Uint8List wrapMsg({required Uint8List envelopeBytes}) {
     final out = Uint8List(1 + envelopeBytes.length);
     out[0] = _kMsg;
@@ -146,9 +218,13 @@ class WireFrame {
         payload:                   Uint8List.fromList(bytes.sublist(230)),
       );
 
-    } else if (type == _kHybridInit || type == _kHybridInitOpk) {
+    } else if (type == _kHybridInit ||
+               type == _kHybridInitOpk ||
+               type == _kHybridInitFull) {
       // 'H': [1][32 IK][32 EK][2 kyber_len][kyber][2 CA_len][CA][payload]
-      // 'G': [1][32 IK][32 EK][2 kyber_len][kyber][2 CA_len][CA][4 opk_id][payload]
+      // 'G': 'H' format + [4 opk_id] before payload
+      // 'F': 'G' format + [2 i2p_len][i2p][2 ipfs_len][ipfs][2 ygg_len][ygg]
+      //      before payload
       const base = 1 + 32 + 32; // 65
       if (bytes.length < base + 4) {
         throw FrameException('HYBRID_INIT frame too short: ${bytes.length}');
@@ -173,12 +249,34 @@ class WireFrame {
       offset  += caLen;
 
       int? opkId;
-      if (type == _kHybridInitOpk) {
+      if (type == _kHybridInitOpk || type == _kHybridInitFull) {
         if (bytes.length < offset + 4) {
           throw const FrameException('HYBRID_INIT_OPK opk_id truncated');
         }
         opkId = bd.getUint32(offset, Endian.big);
         offset += 4;
+      }
+
+      String? senderI2pDest;
+      String? senderIpfsPeerId;
+      String? senderYggAddr;
+      if (type == _kHybridInitFull) {
+        for (final assign in <void Function(String)>[
+          (v) => senderI2pDest = v,
+          (v) => senderIpfsPeerId = v,
+          (v) => senderYggAddr = v,
+        ]) {
+          if (bytes.length < offset + 2) {
+            throw const FrameException('HYBRID_INIT_FULL endpoint length truncated');
+          }
+          final len = bd.getUint16(offset, Endian.big);
+          offset += 2;
+          if (bytes.length < offset + len) {
+            throw const FrameException('HYBRID_INIT_FULL endpoint truncated');
+          }
+          assign(String.fromCharCodes(bytes.sublist(offset, offset + len)));
+          offset += len;
+        }
       }
 
       final payload = Uint8List.fromList(bytes.sublist(offset));
@@ -191,6 +289,9 @@ class WireFrame {
         kyberCipherBytes:          kyberCipher,
         senderContactAddressBytes: ca,
         opkId:                     opkId,
+        senderI2pDest:             senderI2pDest,
+        senderIpfsPeerId:          senderIpfsPeerId,
+        senderYggAddr:             senderYggAddr,
         payload:                   payload,
       );
 
@@ -219,6 +320,15 @@ class ParsedFrame {
   final Uint8List? kyberCipherBytes;
   /// One-time prekey id consumed for X3DH DH4. Present on HYBRID_INIT_OPK only.
   final int? opkId;
+  /// Sender's current I2P destination. Present on HYBRID_INIT_FULL only.
+  /// Used by the receiver to refresh their saved contact record before
+  /// sending the handshakeAck back — so the ack goes to the live dest
+  /// even if the original ContactAddress import is stale.
+  final String? senderI2pDest;
+  /// Sender's current IPFS peer id. Same purpose as [senderI2pDest].
+  final String? senderIpfsPeerId;
+  /// Sender's current Yggdrasil IPv6 address. Same purpose as [senderI2pDest].
+  final String? senderYggAddr;
   final Uint8List payload;
 
   ParsedFrame._({
@@ -229,6 +339,9 @@ class ParsedFrame {
     this.senderContactAddressBytes,
     this.kyberCipherBytes,
     this.opkId,
+    this.senderI2pDest,
+    this.senderIpfsPeerId,
+    this.senderYggAddr,
     required this.payload,
   });
 

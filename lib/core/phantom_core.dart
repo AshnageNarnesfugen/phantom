@@ -465,12 +465,19 @@ class PhantomCore {
     final Uint8List wire;
     if (x3dhEk != null) {
       if (kyberCipher != null && opkId != null) {
-        wire = WireFrame.wrapHybridInitWithOpk(
+        // Embed our current transport endpoints in cleartext so the receiver
+        // can refresh their saved contact record BEFORE they send the
+        // handshakeAck — fixes the dead-letter case where the receiver
+        // imported our ContactAddress with previous-install endpoints.
+        wire = WireFrame.wrapHybridInitFull(
           senderIdentityKeyBytes:    identity.encryptionPublicKeyBytes,
           senderEphemeralKeyBytes:   x3dhEk,
           kyberCipherBytes:          kyberCipher,
           senderContactAddressBytes: await _getMyContactAddressBytes(),
           opkId:                     opkId,
+          senderI2pDest:             _myI2pDest() ?? '',
+          senderIpfsPeerId:          await getMyIpfsPeerId() ?? '',
+          senderYggAddr:             _myYggAddr() ?? '',
           envelopeBytes:             envelopeBytes,
         );
       } else if (kyberCipher != null) {
@@ -606,6 +613,20 @@ class PhantomCore {
     // All attempts exhausted
     await storage.updateMessageStatus(recipientId, message.id, MessageStatus.failed);
     return stored.copyWith(status: MessageStatus.failed);
+  }
+
+  /// Current I2P destination as advertised by our local SAM session, or
+  /// null if I2P isn't initialised / session not ready. Used to embed our
+  /// live endpoint in HYBRID_INIT_FULL frames.
+  String? _myI2pDest() {
+    final i2p = transport.transports.whereType<I2PTransport>().firstOrNull;
+    return i2p?.myDestination;
+  }
+
+  /// Current Yggdrasil IPv6, or null when the VPN service isn't up.
+  String? _myYggAddr() {
+    final ygg = transport.transports.whereType<YggdrasilTransport>().firstOrNull;
+    return ygg?.address;
   }
 
   /// Builds the raw ContactAddress bytes to embed in an INIT frame.
@@ -1434,6 +1455,47 @@ class PhantomCore {
     // Notify UI/Streams if necessary
   }
 
+  /// Pulls the sender's cleartext endpoint metadata out of a HYBRID_INIT_FULL
+  /// frame and updates the contact record so the immediately-following
+  /// handshakeAck (and any subsequent control frames) hit fresh addresses
+  /// instead of the stale ones we may have imported originally. No-ops
+  /// silently when [frame] is an older format that doesn't carry endpoints.
+  Future<void> _refreshContactEndpointsFromInit(
+      String contactId, ParsedFrame frame) async {
+    final i2p  = frame.senderI2pDest;
+    final ipfs = frame.senderIpfsPeerId;
+    final ygg  = frame.senderYggAddr;
+    // None set → older frame format or sender had no endpoints to share.
+    if ((i2p == null || i2p.isEmpty) &&
+        (ipfs == null || ipfs.isEmpty) &&
+        (ygg == null || ygg.isEmpty)) {
+      return;
+    }
+    try {
+      final contact = await storage.getContact(contactId);
+      if (contact == null) return;
+      final updated = contact.copyWith(
+        i2pDestination:   (i2p  != null && i2p.isNotEmpty)  ? i2p  : null,
+        ipfsPeerId:       (ipfs != null && ipfs.isNotEmpty) ? ipfs : null,
+        yggdrasilAddress: (ygg  != null && ygg.isNotEmpty)  ? ygg  : null,
+      );
+      await storage.saveContact(updated);
+      if (updated.i2pDestination != null) {
+        transport.setContactI2PDestination(contactId, updated.i2pDestination!);
+      }
+      if (updated.ipfsPeerId != null) {
+        transport.setContactIpfsPeerId(contactId, updated.ipfsPeerId!);
+      }
+      if (updated.yggdrasilAddress != null) {
+        transport.setContactYggAddress(contactId, updated.yggdrasilAddress!);
+      }
+      TransportDebugger.instance.log(
+          'INIT: refreshed contact endpoints for ${contactId.substring(0, 8)} '
+          '(i2p=${i2p?.isNotEmpty == true} ipfs=${ipfs?.isNotEmpty == true} '
+          'ygg=${ygg?.isNotEmpty == true})');
+    } catch (_) {}
+  }
+
   /// Clears all messages and the session for a contact, but keeps the contact.
   Future<void> deleteConversation(String contactId) async {
     await storage.clearMessages(contactId);
@@ -1716,11 +1778,19 @@ class PhantomCore {
       unawaited(_replenishAndAdvertiseOpks(senderPhantomId));
     }
 
+    // Refresh the contact's transport endpoints from the cleartext header
+    // the sender embedded in the HYBRID_INIT_FULL frame. This is the fix
+    // for the dead-letter case: when the sender has reinstalled and we
+    // hold a stale I2P destination / IPFS peer id from their old install,
+    // the ack we're about to send would otherwise go into the void on
+    // every channel. Updating BEFORE the ack lets the very first round
+    // trip complete cleanly.
+    await _refreshContactEndpointsFromInit(senderPhantomId, frame);
+
     // Auto-acknowledge so the sender's resendHandshake stream knows the INIT
-    // landed and a session was actually established. Send via I2P first
-    // (control priority) so the ack travels independently of IPFS mesh
-    // formation — without this, an established session could appear "failed"
-    // for 30 s while gossipsub bootstraps on the responder's side.
+    // landed and a session was actually established. Hedged across every
+    // backend in parallel (TransportPriority.broadcast) so even if one
+    // endpoint is stale the ack still lands via the others.
     //
     // Piggy-back our own connectivityInfo on the same wake-up so the sender
     // learns our I2P / IPFS / Ygg endpoints in one round trip instead of
