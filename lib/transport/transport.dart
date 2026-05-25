@@ -45,11 +45,17 @@ abstract class PhantomTransport {
 /// Classification used by [TransportManager.publish] to choose which backend
 /// gets the first attempt. See the doc on `publish` for the policy.
 enum TransportPriority {
-  /// X3DH INIT, handshakeAck, preKeyShare, connectivityInfo — anything that
-  /// negotiates or maintains session state. Sent over I2P when possible.
+  /// X3DH INIT, preKeyShare, connectivityInfo — session-establishment frames
+  /// where I2P is the preferred backend for sender anonymity. Falls back to
+  /// IPFS+Yggdrasil if I2P is unavailable or the contact has no I2P dest.
   control,
   /// Regular text / file payloads. Sent over IPFS (+ Yggdrasil) only.
   data,
+  /// Fan-out send: fire on every available backend in parallel. Used for
+  /// handshakeAck where we don't yet know if the peer's record of our
+  /// addresses is fresh — sending to all of them maximises the chance that
+  /// at least one channel actually delivers.
+  broadcast,
 }
 
 @immutable
@@ -184,15 +190,21 @@ class TransportManager {
   /// Routes a payload over the network. Behaviour depends on [priority]:
   ///
   ///   * `TransportPriority.control` — used for session-establishment frames
-  ///     (X3DH INIT, handshakeAck, preKeyShare, connectivityInfo). I2P is the
-  ///     preferred backend; we try it first because it gives stronger sender
-  ///     anonymity for the key-exchange flow. On failure (or when we don't
-  ///     know the contact's I2P destination, or when no SAM bridge is up) we
-  ///     fall back to IPFS / Yggdrasil in parallel.
+  ///     (X3DH INIT, preKeyShare, connectivityInfo). I2P is the preferred
+  ///     backend; we try it first because it gives stronger sender anonymity
+  ///     for the key-exchange flow. On failure (or when we don't know the
+  ///     contact's I2P destination, or when no SAM bridge is up) we fall
+  ///     back to IPFS / Yggdrasil in parallel.
   ///
   ///   * `TransportPriority.data` — used for regular text/file payloads.
   ///     Skips I2P entirely and publishes via IPFS (+ Yggdrasil when an
   ///     address is known) in parallel. Faster, higher bandwidth.
+  ///
+  ///   * `TransportPriority.broadcast` — used for handshakeAck. Fans out to
+  ///     every backend (I2P + IPFS + Yggdrasil) simultaneously without
+  ///     fallback semantics. The receiver's record of our addresses can be
+  ///     stale (peer reinstalls) so we hedge by sending everywhere; whichever
+  ///     channel still works lands the ack.
   ///
   /// Throws [TransportException] only when *every* attempt fails — the caller
   /// then falls back to BLE mesh / persistent store.
@@ -231,6 +243,28 @@ class TransportManager {
 
     final futures = <Future<void>>[];
 
+    // Broadcast hedges: also fire I2P even though we'd normally only use it
+    // for the control branch above. Each transport keeps its own queue /
+    // retry logic so it's safe to fire all of them at once.
+    if (priority == TransportPriority.broadcast) {
+      final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
+      final dest = _i2pDests[recipientId];
+      if (i2p != null && dest != null && i2p.isAvailable) {
+        futures.add(() async {
+          dbg.log('TRANSPORT: broadcast via I2P → ${dest.substring(0, 12)}…');
+          try {
+            await i2p
+                .publishToDest(dest: dest, data: encryptedEnvelope)
+                .timeout(const Duration(seconds: 12));
+            dbg.log('TRANSPORT: broadcast I2P delivery OK');
+          } catch (e) {
+            dbg.log('TRANSPORT: broadcast I2P failed ($e)');
+            rethrow;
+          }
+        }());
+      }
+    }
+
     final ygg = _activeTransports.whereType<YggdrasilTransport>().firstOrNull;
     final yggAddr = _yggAddrs[recipientId];
     if (ygg != null && yggAddr != null) {
@@ -248,7 +282,9 @@ class TransportManager {
 
     final ipfsList = _activeTransports.whereType<IpfsTransport>();
     for (final ipfs in ipfsList) {
-      if (isHandshake || priority == TransportPriority.control) {
+      if (isHandshake ||
+          priority == TransportPriority.control ||
+          priority == TransportPriority.broadcast) {
         ipfs.markNextPublishAsHandshake();
       }
       futures.add(() async {

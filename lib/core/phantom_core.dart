@@ -518,14 +518,21 @@ class PhantomCore {
     }
 
     // Classify the outbound frame so the transport layer can pick the right
-    // backend: control plane (X3DH INIT + housekeeping) goes via I2P first,
-    // data plane (text / files) goes via IPFS (+ Yggdrasil). See
-    // [TransportManager.publish] for the full routing policy.
-    final isControl = isHandshake ||
-        message.type == MessageType.handshakeAck ||
+    // backend. handshakeAck is special: when we're about to send it, the
+    // *peer's* record of our addresses may be stale (they imported our
+    // ContactAddress with a previous I2P destination, etc), so the ack
+    // hedges by going out on every backend in parallel. Everything else
+    // splits cleanly into control (I2P preferred) and data (IPFS only).
+    final TransportPriority priority;
+    if (message.type == MessageType.handshakeAck) {
+      priority = TransportPriority.broadcast;
+    } else if (isHandshake ||
         message.type == MessageType.preKeyShare ||
-        message.type == MessageType.connectivityInfo;
-    final priority = isControl ? TransportPriority.control : TransportPriority.data;
+        message.type == MessageType.connectivityInfo) {
+      priority = TransportPriority.control;
+    } else {
+      priority = TransportPriority.data;
+    }
 
     // For handshake INIT frames, retry up to 3 times with exponential backoff.
     final maxAttempts = isHandshake ? 3 : 1;
