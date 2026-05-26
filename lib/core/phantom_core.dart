@@ -1576,9 +1576,49 @@ class PhantomCore {
     }
   }
 
+  // ── Frame deduplication ──────────────────────────────────────────────────
+  // Multiple transports (I2P + IPFS + Yggdrasil) often deliver the same frame
+  // multiple times. Each redundant copy triggers a snapshot/restore cycle on
+  // the Double Ratchet session, which corrupts internal state via unmodifiable
+  // list references. Dedup by payload hash with a 60s TTL.
+  static const _dedupeMaxSize = 100;
+  static const _dedupeTtl = Duration(seconds: 60);
+  final Map<String, DateTime> _recentFrameHashes = {};
+
+  bool _isDuplicateFrame(Uint8List data) {
+    // Fast hash: use first 16 + last 16 bytes + length as fingerprint
+    final len = data.length;
+    final buf = StringBuffer();
+    buf.write(len);
+    buf.write(':');
+    for (int i = 0; i < 16 && i < len; i++) {
+      buf.write(data[i].toRadixString(16).padLeft(2, '0'));
+    }
+    buf.write(':');
+    for (int i = (len - 16).clamp(0, len); i < len; i++) {
+      buf.write(data[i].toRadixString(16).padLeft(2, '0'));
+    }
+    final hash = buf.toString();
+
+    final now = DateTime.now();
+
+    // Evict expired entries
+    if (_recentFrameHashes.length > _dedupeMaxSize) {
+      _recentFrameHashes.removeWhere((_, t) => now.difference(t) > _dedupeTtl);
+    }
+
+    if (_recentFrameHashes.containsKey(hash)) return true;
+    _recentFrameHashes[hash] = now;
+    return false;
+  }
+
   Future<void> _handleIncomingBytes(Uint8List data) async {
     if (_disposed) return;
     final dbg = TransportDebugger.instance;
+
+    // Deduplicate: same frame arriving via multiple transports
+    if (_isDuplicateFrame(data)) return;
+
     try {
       final frame = WireFrame.parse(data);
       if (frame.isInit) {
