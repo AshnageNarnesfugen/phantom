@@ -103,6 +103,12 @@ class PhantomCore {
   static const _initRecentWindow = Duration(seconds: 60);
   final Map<String, DateTime> _lastInitSentAt = {};
 
+  // ── Auto-revive on ratchet desync ─────────────────────────────────────────
+  // When an incoming MSG frame can't be decrypted by any session, the ratchet
+  // has drifted. We auto-reset the session and re-handshake, but limit this
+  // to once every 2 minutes per contact to avoid infinite loops.
+  final Map<String, DateTime> _autoReviveCooldowns = {};
+
   // ── Handshake auto-retry ──────────────────────────────────────────────────
   // After sending an INIT we sit waiting for the peer's handshakeAck. If
   // tunnels haven't converged or the peer is briefly offline, the ack never
@@ -1925,6 +1931,44 @@ class PhantomCore {
       }
     }
     dbg.log('MSG: ✗ no session could decrypt this MSG frame');
+
+    // ── Auto-revive: detect ratchet desync and re-handshake ──────────────
+    // If we have a session for the sender but decryption fails, the ratchet
+    // has drifted (e.g. one side sent messages the other never received).
+    // Instead of silently discarding the message, we reset the session and
+    // send a fresh X3DH INIT so both sides can re-sync automatically.
+    if (_sessions.isNotEmpty) {
+      // Pick the session that most likely sent this frame — the one we
+      // have an active ratchet for. In 1:1 chat there's typically one.
+      for (final contactId in _sessions.keys) {
+        final now = DateTime.now();
+        final lastRevive = _autoReviveCooldowns[contactId];
+
+        // Rate limit: at most 1 auto-revive per contact per 2 minutes
+        if (lastRevive != null &&
+            now.difference(lastRevive) < const Duration(minutes: 2)) {
+          dbg.log('MSG: auto-revive skipped for ${contactId.substring(0, 8)} '
+              '(cooldown ${120 - now.difference(lastRevive).inSeconds}s)');
+          continue;
+        }
+
+        _autoReviveCooldowns[contactId] = now;
+        dbg.log('MSG: ⚡ auto-revive triggered for ${contactId.substring(0, 8)} '
+            '— resetting session and re-handshaking');
+
+        // Fire-and-forget: reset + re-handshake in background
+        unawaited(() async {
+          try {
+            await resendHandshake(contactId).drain<void>();
+            dbg.log('MSG: auto-revive handshake sent for ${contactId.substring(0, 8)}');
+          } catch (e) {
+            dbg.log('MSG: auto-revive failed for ${contactId.substring(0, 8)}: $e');
+          }
+        }());
+        break; // Only revive one session per failed frame
+      }
+    }
+
     return false;
   }
 
