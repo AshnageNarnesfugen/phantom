@@ -63,11 +63,19 @@ class IncomingEnvelope {
   final Uint8List data;
   final String transportName;
   final DateTime receivedAt;
+  /// I2P source destination from the SAM v3 forwarded datagram header.
+  /// Only populated for envelopes received over I2P — null for other
+  /// transports. Lets the upper layer discover a contact's I2P dest the
+  /// first time they reach us, fixing the asymmetry where one side knew
+  /// the other's dest via QR but the reverse direction never learned it
+  /// (forcing all replies through the unreliable IPFS gossipsub path).
+  final String? i2pSourceDestination;
 
   const IncomingEnvelope({
     required this.data,
     required this.transportName,
     required this.receivedAt,
+    this.i2pSourceDestination,
   });
 }
 
@@ -1358,12 +1366,14 @@ class I2PTransport implements PhantomTransport {
     final data = dg.data;
     final nl = data.indexOf(10);
     if (nl < 0 || nl >= data.length - 1) return;
+    final sourceDest = utf8.decode(data.sublist(0, nl), allowMalformed: true).trim();
     final payload = Uint8List.fromList(data.sublist(nl + 1));
     if (payload.isEmpty) return;
     _incoming.add(IncomingEnvelope(
       data: payload,
       transportName: name,
       receivedAt: DateTime.now(),
+      i2pSourceDestination: sourceDest.isEmpty ? null : sourceDest,
     ));
   }
 

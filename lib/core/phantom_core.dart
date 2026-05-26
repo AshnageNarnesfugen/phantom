@@ -1455,7 +1455,10 @@ class PhantomCore {
 
     // v1 internet transport
     _transportSub = transport.incoming.listen(
-      (envelope) => _handleIncomingBytes(envelope.data),
+      (envelope) => _handleIncomingBytes(
+        envelope.data,
+        i2pSourceDest: envelope.i2pSourceDestination,
+      ),
       onError: (_) {},
     );
 
@@ -1692,7 +1695,7 @@ class PhantomCore {
     return false;
   }
 
-  Future<void> _handleIncomingBytes(Uint8List data) async {
+  Future<void> _handleIncomingBytes(Uint8List data, {String? i2pSourceDest}) async {
     if (_disposed) return;
     final dbg = TransportDebugger.instance;
 
@@ -1704,14 +1707,41 @@ class PhantomCore {
       if (frame.isInit) {
         dbg.log('MSG: ← INIT frame (${data.length} bytes, hybrid=${frame.isHybrid})');
         dbg.log('MSG:   sender = ${frame.senderPhantomId.substring(0, 8)}…');
+        if (i2pSourceDest != null) {
+          await _learnI2pDestFromIncoming(frame.senderPhantomId, i2pSourceDest);
+        }
         await _handleInitFrame(frame);
       } else {
         dbg.log('MSG: ← MSG frame (${data.length} bytes)');
-        await _handleMsgFrame(frame);
+        // MSG frames don't carry sender identity in cleartext, so we can't
+        // attribute the I2P source dest until after decrypt. _handleMsgFrame
+        // takes the dest and pins it to whichever session successfully
+        // decodes the frame.
+        await _handleMsgFrame(frame, i2pSourceDest: i2pSourceDest);
       }
     } catch (e) {
       dbg.log('MSG: ✗ frame parse/handle error: $e');
     }
+  }
+
+  /// Saves [i2pDest] as [contactId]'s I2P destination if we don't already
+  /// have one (or it changed), and propagates to the transport map so
+  /// outbound replies can use I2P from now on. Fixes the asymmetric case
+  /// where the peer learned our dest via QR / cleartext INIT_FULL but we
+  /// never learned theirs because their connectivityInfo got lost in
+  /// gossipsub mesh failures.
+  Future<void> _learnI2pDestFromIncoming(String contactId, String i2pDest) async {
+    if (i2pDest.isEmpty) return;
+    final contact = await storage.getContact(contactId);
+    if (contact == null) return;
+    if (contact.i2pDestination == i2pDest) return;
+    try {
+      await storage.saveContact(contact.copyWith(i2pDestination: i2pDest));
+      transport.setContactI2PDestination(contactId, i2pDest);
+      _notifyContactUpdated(contactId);
+      TransportDebugger.instance.log(
+          'I2P: learned dest for ${contactId.substring(0, 8)} from incoming frame');
+    } catch (_) {}
   }
 
   /// Handle an INIT frame: run X3DH respond, create receiver session, decrypt.
@@ -2063,7 +2093,7 @@ class PhantomCore {
   /// Returns true on the first successful decrypt. Does NOT trigger auto-revive
   /// on failure — caller decides whether to escalate (used by the known-EK
   /// INIT path where a failure is a legit transport replay, not desync).
-  Future<bool> _tryDecryptAsMsg(ParsedFrame frame) async {
+  Future<bool> _tryDecryptAsMsg(ParsedFrame frame, {String? i2pSourceDest}) async {
     final dbg = TransportDebugger.instance;
     for (final entry in List.of(_sessions.entries)) {
       final snapshot = entry.value.takeSnapshot();
@@ -2076,6 +2106,9 @@ class PhantomCore {
         dbg.log('MSG: ✓ MSG decrypted via session ${entry.key.substring(0, 8)}');
         _lastSuccessfulDecryptAt[entry.key] = DateTime.now();
         _cancelHandshakeRetry(entry.key);
+        if (i2pSourceDest != null) {
+          await _learnI2pDestFromIncoming(entry.key, i2pSourceDest);
+        }
         return true;
       } catch (e) {
         _sessions[entry.key] = await RatchetSession.fromJson(snapshot);
@@ -2085,10 +2118,10 @@ class PhantomCore {
     return false;
   }
 
-  Future<bool> _handleMsgFrame(ParsedFrame frame) async {
+  Future<bool> _handleMsgFrame(ParsedFrame frame, {String? i2pSourceDest}) async {
     final dbg = TransportDebugger.instance;
     dbg.log('MSG: trying ${_sessions.length} session(s) for MSG decrypt');
-    if (await _tryDecryptAsMsg(frame)) return true;
+    if (await _tryDecryptAsMsg(frame, i2pSourceDest: i2pSourceDest)) return true;
     dbg.log('MSG: ✗ no session could decrypt this MSG frame');
 
     // ── Auto-revive: detect ratchet desync and re-handshake ──────────────
