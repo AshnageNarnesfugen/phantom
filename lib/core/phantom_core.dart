@@ -16,6 +16,7 @@ import 'storage/phantom_storage.dart';
 import 'storage/backup_manager.dart';
 import 'presence_service.dart';
 import 'notification_service.dart';
+import 'ipfs_daemon.dart';
 import 'transport_debugger.dart';
 import '../transport/transport.dart';
 import '../transport/transport_manager_v2.dart' hide IncomingEnvelope;
