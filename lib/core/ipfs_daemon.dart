@@ -20,7 +20,8 @@ import 'package:path_provider/path_provider.dart';
 /// back to BLE mesh automatically when IPFS is unavailable.
 class IpfsDaemon {
   static const _ch     = MethodChannel('phantom/ipfs_daemon');
-  static const apiUrl  = 'http://127.0.0.1:5001';
+  static String? _dynamicApiUrl;
+  static String get apiUrl => _dynamicApiUrl ?? 'http://127.0.0.1:5001';
 
   // How long to wait for the foreground service to bring the API up before
   // falling back to a direct Dart process spawn.
@@ -128,8 +129,68 @@ class IpfsDaemon {
     _directProcess = null;
     try {
       await _ch.invokeMethod<void>('stopService');
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[IpfsDaemon] stopService error: $e');
+    }
     _ensured = false;
+  }
+
+  // ── On-Demand File Management ──────────────────────────────────────────────
+
+  Timer? _idleTimer;
+
+  void scheduleIdleShutdown() {
+    _idleTimer?.cancel();
+    // Apagar IPFS automáticamente después de 5 minutos sin uso
+    _idleTimer = Timer(const Duration(minutes: 5), () {
+      debugPrint('[IpfsDaemon] Idle timeout reached, shutting down...');
+      stop();
+    });
+  }
+
+  Future<String> uploadFile(Uint8List bytes, String fileName) async {
+    _idleTimer?.cancel(); 
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+    
+    final req = await client.postUrl(Uri.parse('$apiUrl/api/v0/add?pin=true'));
+    final boundary = '----PhantomBoundary${DateTime.now().millisecondsSinceEpoch}';
+    req.headers.contentType = ContentType('multipart', 'form-data', parameters: {'boundary': boundary});
+    
+    final header = '--$boundary\r\nContent-Disposition: form-data; name="file"; filename="$fileName"\r\nContent-Type: application/octet-stream\r\n\r\n';
+    req.write(header);
+    req.add(bytes);
+    req.write('\r\n--$boundary--\r\n');
+    
+    final resp = await req.close();
+    final body = await resp.transform(utf8.decoder).join();
+    client.close(force: true);
+    
+    if (resp.statusCode != 200) {
+      throw Exception('IPFS upload failed: HTTP ${resp.statusCode}\n$body');
+    }
+    
+    final json = jsonDecode(body);
+    return json['Hash'] as String;
+  }
+
+  Future<Uint8List> downloadFile(String cid) async {
+    _idleTimer?.cancel();
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
+    final req = await client.postUrl(Uri.parse('$apiUrl/api/v0/cat?arg=$cid'));
+    final resp = await req.close();
+    
+    if (resp.statusCode != 200) {
+      final body = await resp.transform(utf8.decoder).join();
+      client.close(force: true);
+      throw Exception('IPFS download failed: HTTP ${resp.statusCode}\n$body');
+    }
+    
+    final builder = BytesBuilder();
+    await for (final chunk in resp) {
+      builder.add(chunk);
+    }
+    client.close(force: true);
+    return builder.toBytes();
   }
 
   // ── Internals ──────────────────────────────────────────────────────────────
@@ -178,6 +239,8 @@ class IpfsDaemon {
       ['config', '--json', 'Discovery.MDNS.Enabled', 'true'],
       // Disable resource manager — saves ~30 MB RSS on mobile
       ['config', '--json', 'Swarm.ResourceMgr.Enabled', 'false'],
+      // Security: use dynamic port for API to prevent other apps on localhost from accessing it
+      ['config', 'Addresses.API', '/ip4/127.0.0.1/tcp/0'],
     ];
     for (final args in configs) {
       await Process.run(binary, args, environment: env);
@@ -188,8 +251,18 @@ class IpfsDaemon {
   /// Polls the IPFS HTTP API once per second for up to [seconds] seconds.
   /// Returns true as soon as the API responds with HTTP 200.
   Future<bool> _waitForApi({required int seconds}) async {
+    final repo = await _repoPath();
+    final apiFile = File('$repo/api');
+
     for (var i = 0; i < seconds; i++) {
       try {
+        if (apiFile.existsSync()) {
+          final maddr = await apiFile.readAsString();
+          final parts = maddr.trim().split('/');
+          if (parts.length >= 5 && parts[1] == 'ip4' && parts[3] == 'tcp') {
+            _dynamicApiUrl = 'http://${parts[2]}:${parts[4]}';
+          }
+        }
         final client = HttpClient()
           ..connectionTimeout = const Duration(seconds: 1);
         final req  = await client.postUrl(Uri.parse('$apiUrl/api/v0/id'));
@@ -197,7 +270,9 @@ class IpfsDaemon {
         await resp.drain<void>();
         client.close(force: true);
         if (resp.statusCode == 200) return true;
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('[IpfsDaemon] wait API error: $e');
+      }
       await Future.delayed(const Duration(seconds: 1));
     }
     return false;
@@ -270,7 +345,8 @@ class IpfsDaemon {
       client.close(force: true);
       final count = ((jsonDecode(body) as Map<String, dynamic>)['Peers'] as List?)?.length ?? 0;
       return (running: true, peers: count);
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[IpfsDaemon] status error: $e');
       return (running: false, peers: 0);
     }
   }

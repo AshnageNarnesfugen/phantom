@@ -6,6 +6,7 @@ import 'package:cryptography/cryptography.dart';
 import 'package:http/http.dart' as http;
 import 'package:meta/meta.dart';
 import '../core/transport_debugger.dart';
+import '../core/waku_daemon.dart';
 
 /// Abstract transport layer.
 ///
@@ -104,6 +105,8 @@ class TransportManager {
     Future<String?> Function()? i2pLoadKey,
     Future<void> Function(String)? i2pPersistKey,
   }) : _transports = [
+          // Waku: primary messaging transport (text, handshakes, metadata)
+          WakuTransport(),
           YggdrasilTransport(address: yggdrasilAddress),
           I2PTransport(
             host:        i2pSamHost ?? '127.0.0.1',
@@ -111,6 +114,7 @@ class TransportManager {
             loadKey:     i2pLoadKey,
             persistKey:  i2pPersistKey,
           ),
+          // IPFS: now relegated to file transfer only (on-demand)
           IpfsTransport(apiUrl: ipfsApiUrl ?? 'http://127.0.0.1:5001'),
         ];
 
@@ -243,6 +247,21 @@ class TransportManager {
 
     final futures = <Future<void>>[];
 
+    // ── Waku: preferred for text messages and handshakes ──────────────────
+    final waku = _activeTransports.whereType<WakuTransport>().firstOrNull;
+    if (waku != null && waku.isAvailable) {
+      futures.add(() async {
+        dbg.log('TRANSPORT: firing Waku for ${recipientId.substring(0, 8)}…');
+        try {
+          await waku.publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope);
+          dbg.log('TRANSPORT: Waku delivery OK');
+        } catch (e) {
+          dbg.log('TRANSPORT: Waku failed ($e)');
+          rethrow;
+        }
+      }());
+    }
+
     // Broadcast hedges: also fire I2P even though we'd normally only use it
     // for the control branch above. Each transport keeps its own queue /
     // retry logic so it's safe to fire all of them at once.
@@ -280,23 +299,26 @@ class TransportManager {
       }());
     }
 
+    // IPFS: only used as fallback when Waku is unavailable, or for broadcast
     final ipfsList = _activeTransports.whereType<IpfsTransport>();
-    for (final ipfs in ipfsList) {
-      if (isHandshake ||
-          priority == TransportPriority.control ||
-          priority == TransportPriority.broadcast) {
-        ipfs.markNextPublishAsHandshake();
-      }
-      futures.add(() async {
-        dbg.log('TRANSPORT: firing IPFS PubSub for ${recipientId.substring(0, 8)}…');
-        try {
-          await ipfs.publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope);
-          dbg.log('TRANSPORT: IPFS delivery OK');
-        } catch (e) {
-          dbg.log('TRANSPORT: IPFS failed ($e)');
-          rethrow;
+    if (waku == null || !waku.isAvailable || priority == TransportPriority.broadcast) {
+      for (final ipfs in ipfsList) {
+        if (isHandshake ||
+            priority == TransportPriority.control ||
+            priority == TransportPriority.broadcast) {
+          ipfs.markNextPublishAsHandshake();
         }
-      }());
+        futures.add(() async {
+          dbg.log('TRANSPORT: firing IPFS PubSub for ${recipientId.substring(0, 8)}…');
+          try {
+            await ipfs.publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope);
+            dbg.log('TRANSPORT: IPFS delivery OK');
+          } catch (e) {
+            dbg.log('TRANSPORT: IPFS failed ($e)');
+            rethrow;
+          }
+        }());
+      }
     }
 
     if (futures.isEmpty) {
@@ -735,7 +757,9 @@ class IpfsTransport implements PhantomTransport {
           await _client.post(Uri.parse(
               '$_apiUrl/api/v0/swarm/disconnect?arg=/p2p/$knownPeerId'))
               .timeout(const Duration(seconds: 5));
-        } catch (_) {}
+        } catch (e) {
+          dbg.log('IPFS: swarm disconnect error for $knownPeerId: $e');
+        }
         await Future.delayed(const Duration(seconds: 1));
       }
       // Fetch current relay addresses via findpeer, then connect.
@@ -1639,6 +1663,116 @@ class YggdrasilTransport implements PhantomTransport {
   Future<void> dispose() async {
     _disposed = true;
     await _server?.close();
+  }
+}
+
+// ── Waku Transport ────────────────────────────────────────────────────────────
+
+/// Transport over Waku relay + store protocol.
+///
+/// Waku is the primary messaging transport for Phantom. Unlike IPFS PubSub,
+/// Waku provides:
+///   - Store-and-forward: messages persist on relay nodes for offline delivery
+///   - Lightweight: designed for mobile, minimal CPU/memory/battery
+///   - Content topics: each PhantomID maps to /phantom/1/{phantomId}/proto
+///
+/// IPFS is relegated to file transfer only (on-demand).
+class WakuTransport implements PhantomTransport {
+  bool _available = false;
+  bool _disposed = false;
+  final _daemon = WakuDaemon.instance;
+
+  /// Content topic format following Waku naming convention.
+  /// /phantom/1/{phantomId}/proto
+  String _contentTopic(String phantomId) => '/phantom/1/$phantomId/proto';
+
+  @override
+  String get name => 'Waku';
+
+  @override
+  bool get isAvailable => _available;
+
+  @override
+  Future<bool> checkAvailability() async {
+    if (_disposed) return false;
+    try {
+      final status = await _daemon.status();
+      _available = status.running;
+      return _available;
+    } catch (e) {
+      debugPrint('[WakuTransport] availability check failed: $e');
+      _available = false;
+      return false;
+    }
+  }
+
+  @override
+  Future<void> publish({
+    required String recipientId,
+    required Uint8List encryptedEnvelope,
+  }) async {
+    if (_disposed) throw const TransportException('WakuTransport disposed');
+
+    final topic = _contentTopic(recipientId);
+    final ok = await _daemon.relayPublish(
+      contentTopic: topic,
+      payload: encryptedEnvelope,
+    );
+    if (!ok) {
+      throw const TransportException('Waku relay publish failed');
+    }
+  }
+
+  @override
+  Stream<IncomingEnvelope> subscribe({required String ourId}) {
+    final topic = _contentTopic(ourId);
+    final dbg = TransportDebugger.instance;
+    dbg.log('Waku: subscribing to $topic');
+
+    final controller = StreamController<IncomingEnvelope>();
+
+    // 1. First, query the Store for any messages we missed while offline
+    () async {
+      try {
+        dbg.log('Waku: querying store for offline messages…');
+        final stored = await _daemon.storeQuery(contentTopic: topic);
+        dbg.log('Waku: store returned ${stored.length} messages');
+        for (final payload in stored) {
+          if (!controller.isClosed) {
+            controller.add(IncomingEnvelope(
+              data: payload,
+              transportName: 'Waku-Store',
+              receivedAt: DateTime.now(),
+            ));
+          }
+        }
+      } catch (e) {
+        dbg.log('Waku: store query error: $e');
+      }
+
+      // 2. Then subscribe to live relay messages
+      try {
+        final stream = _daemon.relaySubscribe(contentTopic: topic);
+        await for (final payload in stream) {
+          if (_disposed || controller.isClosed) break;
+          controller.add(IncomingEnvelope(
+            data: payload,
+            transportName: name,
+            receivedAt: DateTime.now(),
+          ));
+        }
+      } catch (e) {
+        dbg.log('Waku: relay subscription error: $e');
+      }
+      if (!controller.isClosed) await controller.close();
+    }();
+
+    return controller.stream;
+  }
+
+  @override
+  Future<void> dispose() async {
+    _disposed = true;
   }
 }
 

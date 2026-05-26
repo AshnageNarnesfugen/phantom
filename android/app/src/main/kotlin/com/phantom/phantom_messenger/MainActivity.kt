@@ -205,6 +205,48 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // ── Waku daemon channel ───────────────────────────────────────────────
+        MethodChannel(
+            flutterEngine!!.dartExecutor.binaryMessenger,
+            "phantom/waku_daemon",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getNativeLibDir" -> {
+                    result.success(applicationContext.applicationInfo.nativeLibraryDir)
+                }
+                "startService" -> {
+                    try {
+                        val args       = call.arguments as Map<*, *>
+                        val binaryPath = args["binaryPath"] as String
+                        val dataDir    = args["dataDir"]    as String
+                        val intent     = WakuForegroundService.startIntent(
+                            applicationContext, binaryPath, dataDir,
+                        )
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("WAKU_START_FAILED", e.message, null)
+                    }
+                }
+                "stopService" -> {
+                    startService(WakuForegroundService.stopIntent(applicationContext))
+                    result.success(null)
+                }
+                "getApiPort" -> {
+                    // Read the dynamically assigned REST port from SharedPreferences
+                    val port = getSharedPreferences(
+                        WakuForegroundService.PREFS_NAME, Context.MODE_PRIVATE
+                    ).getString(WakuForegroundService.KEY_API_PORT, null)
+                    result.success(port)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         // ── Messaging service channel ─────────────────────────────────────────
         MethodChannel(
             flutterEngine!!.dartExecutor.binaryMessenger,

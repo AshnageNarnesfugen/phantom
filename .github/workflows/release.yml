@@ -82,6 +82,24 @@ jobs:
         continue-on-error: true
         run: bash scripts/download_i2pd.sh arm64-v8a x86_64
 
+      - name: Build go-waku mobile library (gomobile)
+        # Waku handles all real-time messaging + store-and-forward for offline
+        # delivery. IPFS is relegated to file transfer only.
+        # Non-blocking: if the upstream repo or gomobile breaks, the build
+        # still ships — Waku features simply stay dormant and the app falls
+        # back to IPFS pubsub for messaging until Waku is available.
+        continue-on-error: true
+        run: |
+          export ANDROID_NDK_HOME=$(ls -d "$ANDROID_HOME/ndk/"*/ 2>/dev/null | sort -V | tail -1 || true)
+          export ANDROID_NDK_HOME=${ANDROID_NDK_HOME%/}
+          if [ -z "$ANDROID_NDK_HOME" ]; then
+            sdkmanager --install "ndk;26.3.11579264"
+            export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/26.3.11579264"
+          fi
+          echo "Using NDK: $ANDROID_NDK_HOME"
+          mkdir -p android/app/libs
+          bash scripts/build_waku_mobile.sh android/app/libs/gowaku.aar
+
       - name: Build static x86_64 Kubo binary
         run: |
           git clone --depth=1 --branch v0.41.0 \

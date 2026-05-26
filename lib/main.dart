@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'core/phantom_core.dart';
 import 'core/ipfs_daemon.dart';
 import 'core/i2pd_daemon.dart';
+import 'core/waku_daemon.dart';
 import 'core/yggdrasil_daemon.dart';
 import 'core/yggdrasil_peers.dart';
 import 'core/notification_service.dart';
@@ -42,7 +43,9 @@ Future<void> _writeCrashLog(Object error, StackTrace? stack) async {
     final dir = await getApplicationDocumentsDirectory();
     final f = File('${dir.path}/last_crash.txt');
     await f.writeAsString(body, mode: FileMode.append);
-  } catch (_) {}
+  } catch (e) {
+    debugPrint('Failed to write crash log: $e');
+  }
 
   // 2. Public Downloads via MediaStore — survives uninstall and is readable
   // from any file manager without root or adb. This is the diagnostic
@@ -52,7 +55,9 @@ Future<void> _writeCrashLog(Object error, StackTrace? stack) async {
     try {
       await _diagnosticsChannel
           .invokeMethod<String>('writeCrashToDownloads', {'body': body});
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('Failed to write crash to downloads: $e');
+    }
   }
 }
 
@@ -67,7 +72,9 @@ Future<void> _dumpPreviousCrashIfAny() async {
     final body = await f.readAsString();
     debugPrint('═══ PREVIOUS-RUN CRASH LOG ═══\n$body═══ END CRASH LOG ═══');
     await f.delete();
-  } catch (_) {}
+  } catch (e) {
+    debugPrint('Failed to dump previous crash: $e');
+  }
 }
 
 void main() {
@@ -147,9 +154,14 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
     persisted.addListener(() { if (mounted) setState(() {}); });
     if (mounted) setState(() => _themeCtrl = persisted);
     if (Platform.isAndroid) {
-      try { await IpfsDaemon.instance.ensure(); } catch (_) {}
-      try { await I2pdDaemon.instance.ensure(); } catch (_) {}
-      try { await _prepareYggdrasilAndEnsure(); } catch (_) {}
+      // Waku starts FIRST — it's the primary messaging transport and is
+      // lightweight enough to run permanently without draining the battery.
+      try { await WakuDaemon.instance.ensure(); } catch (e) { debugPrint('Waku error: $e'); }
+      // IPFS is now ON-DEMAND only (for file transfer). It will be started
+      // by IpfsDaemon.instance.ensure() when sendFile() is called.
+      // We skip auto-starting it here to save battery.
+      try { await I2pdDaemon.instance.ensure(); } catch (e) { debugPrint('I2pd error: $e'); }
+      try { await _prepareYggdrasilAndEnsure(); } catch (e) { debugPrint('Ygg error: $e'); }
     }
     await _tryRestoreAccount();
   }
@@ -214,7 +226,9 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
         return YggdrasilPeerCatalog.pickRandom(
             fresh, YggdrasilPeerCatalog.defaultPickCount);
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('Yggdrasil upstream fetch error: $e');
+    }
     final cached = await storage.getYggCachedPeers().catchError((_) => null);
     if (cached != null && cached.peers.isNotEmpty) {
       return YggdrasilPeerCatalog.pickRandom(
@@ -236,7 +250,8 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
         if (mounted) setState(() => _core = core);
         NotificationService.requestPermission();
       }
-    } catch (_) {
+    } catch (e) {
+      debugPrint('Account restore error: $e');
       // Seed corrupted or storage error — fall through to onboarding.
     } finally {
       if (mounted) setState(() => _loading = false);

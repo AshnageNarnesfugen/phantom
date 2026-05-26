@@ -148,6 +148,17 @@
             </intent-filter>
         </service>
 
+        <!-- Waku relay node — lightweight P2P messaging with store-and-forward.
+             Runs in its own process (:waku) for the same survival reasons as
+             IPFS, but consumes far less memory and battery since Waku is
+             designed for resource-constrained mobile devices. -->
+        <service
+            android:name=".WakuForegroundService"
+            android:exported="false"
+            android:process=":waku"
+            android:stopWithTask="false"
+            android:foregroundServiceType="dataSync"/>
+
         <!-- Restart IPFS daemon on device boot -->
         <receiver
             android:name=".IpfsBootReceiver"

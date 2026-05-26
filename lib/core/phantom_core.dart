@@ -415,32 +415,38 @@ class PhantomCore {
     required Uint8List bytes,
     required String fileName,
   }) async {
-    if (bytes.length > 15 * 1024 * 1024) {
-      throw const PhantomCoreException('File too large — maximum 15 MB');
-    }
+    // 1. IPFS On-Demand: Ensure the daemon is running only when needed
+    await IpfsDaemon.instance.ensure();
 
+    // 2. Upload file to IPFS and pin it locally
+    final cid = await IpfsDaemon.instance.uploadFile(bytes, fileName);
+
+    // 3. Prepare the Waku message containing only the CID + filename
     final lower = fileName.toLowerCase();
     final isImage = lower.endsWith('.jpg') || lower.endsWith('.jpeg') ||
         lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp');
 
-    final Uint8List content;
-    MessageType type;
-    if (isImage) {
-      type    = MessageType.image;
-      content = bytes;
-    } else {
-      type = MessageType.file;
-      final nameBytes = utf8.encode(fileName);
-      content = Uint8List(nameBytes.length + 1 + bytes.length)
-        ..setAll(0, nameBytes)
-        ..[nameBytes.length] = 0
-        ..setAll(nameBytes.length + 1, bytes);
-    }
+    final type = isImage ? MessageType.image : MessageType.file;
+    
+    // Wire format for files: [name_len(1)][fileName][CID]
+    // (CID is small enough that Waku easily handles it)
+    final nameBytes = utf8.encode(fileName);
+    final cidBytes = utf8.encode(cid);
+    final content = Uint8List(1 + nameBytes.length + cidBytes.length)
+      ..[0] = nameBytes.length
+      ..setAll(1, nameBytes)
+      ..setAll(1 + nameBytes.length, cidBytes);
 
-    return _sendPhantomMessage(
+    // 4. Send CID via Waku (WakuTransport will handle this in _sendPhantomMessage)
+    final stored = await _sendPhantomMessage(
       recipientId: recipientId,
       message: PhantomMessage(type: type, content: content),
     );
+
+    // 5. Schedule IPFS shutdown (5 minutes idle)
+    IpfsDaemon.instance.scheduleIdleShutdown();
+
+    return stored;
   }
 
   Future<StoredMessage> _sendPhantomMessage({
