@@ -13,7 +13,7 @@ class _TransportDebugScreen extends StatefulWidget {
 }
 
 class _TransportDebugScreenState extends State<_TransportDebugScreen> {
-  static const _apiBase = 'http://127.0.0.1:5001/api/v0';
+  String get _apiBase => '${IpfsDaemon.apiUrl}/api/v0';
   final _client         = http.Client();
   final _logScroll      = ScrollController();
   StreamSubscription<String>? _logSub;

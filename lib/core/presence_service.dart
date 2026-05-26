@@ -3,10 +3,10 @@ import 'dart:convert';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'ipfs_daemon.dart';
 
 /// Lightweight presence layer using the bundled IPFS daemon as a pubsub bus.
 class PresenceService {
-  static const _defaultApiUrl        = 'http://127.0.0.1:5001';
   static const _interval             = Duration(minutes: 2);
   static const _threshold            = Duration(minutes: 7);
   static const _dhtAdvertiseInterval = Duration(minutes: 20);
@@ -34,7 +34,7 @@ class PresenceService {
   Stream<String> get changes => _changesCtrl.stream;
 
   PresenceService(this._myId, {String? ipfsApiUrl})
-      : _apiUrl = ipfsApiUrl ?? _defaultApiUrl;
+      : _apiUrl = ipfsApiUrl ?? IpfsDaemon.apiUrl;
 
   Future<void> start(List<String> contactIds) async {
     _subscribeAll(contactIds);

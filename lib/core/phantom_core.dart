@@ -207,7 +207,7 @@ class PhantomCore {
       storage:  PhantomStorage.instance,
       transport: transport,
     );
-    core._ipfsApiUrl  = transportConfig?.ipfsApiUrl ?? 'http://127.0.0.1:5001';
+    core._ipfsApiUrl  = IpfsDaemon.apiUrl;
     core._transportV2 = _buildTransportV2(transport, core.myId);
 
     // Derive Kyber-768 keypair deterministically from the seed phrase.
@@ -238,7 +238,7 @@ class PhantomCore {
       storage:  PhantomStorage.instance,
       transport: transport,
     );
-    core._ipfsApiUrl  = transportConfig?.ipfsApiUrl ?? 'http://127.0.0.1:5001';
+    core._ipfsApiUrl  = IpfsDaemon.apiUrl;
     core._transportV2 = _buildTransportV2(transport, core.myId);
 
     await core._initKyberKeys(seedPhrase);
@@ -883,7 +883,7 @@ class PhantomCore {
   Stream<String> reviveConnection(String contactId) async* {
     final dbg = TransportDebugger.instance;
     final short = contactId.substring(0, 8);
-    final ipfsApiUrl = _ipfsApiUrl ?? 'http://127.0.0.1:5001';
+    final ipfsApiUrl = _ipfsApiUrl ?? IpfsDaemon.apiUrl;
     final client = http.Client();
 
     try {
@@ -1016,7 +1016,7 @@ class PhantomCore {
           final topic = 'msg$contactId';
           final encodedTopic = 'u${base64Url.encode(utf8.encode(topic)).replaceAll('=', '')}';
           try {
-            final uri = Uri.parse('${_ipfsApiUrl ?? "http://127.0.0.1:5001"}/api/v0/pubsub/sub?arg=${Uri.encodeComponent(encodedTopic)}');
+            final uri = Uri.parse('${_ipfsApiUrl ?? IpfsDaemon.apiUrl}/api/v0/pubsub/sub?arg=${Uri.encodeComponent(encodedTopic)}');
             final request = http.Request('POST', uri);
             final response = await http.Client().send(request)
                 .timeout(const Duration(seconds: 5));
