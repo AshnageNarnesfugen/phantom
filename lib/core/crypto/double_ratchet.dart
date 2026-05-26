@@ -524,27 +524,27 @@ class RatchetSession {
   /// Used by [PhantomCore._handleMsgFrame] to restore state if decryption fails
   /// on the wrong session, preventing ratchet state corruption.
   Map<String, dynamic> takeSnapshot() {
-    final dhPub = Uint8List.fromList(_dhSendingKP.publicKey.bytes);
+    final dhPub = Uint8List.fromList(List<int>.from(_dhSendingKP.publicKey.bytes));
     return {
-      'rk':        _hexOf(_rootKey),
-      'sck':       _sendingChainKey   != null ? _hexOf(_sendingChainKey!)   : null,
-      'rck':       _receivingChainKey != null ? _hexOf(_receivingChainKey!) : null,
-      'dhsk_priv': _hexOf(Uint8List.fromList(_dhSendingKP.bytes)),
+      'rk':        _hexOf(Uint8List.fromList(_rootKey)),
+      'sck':       _sendingChainKey   != null ? _hexOf(Uint8List.fromList(_sendingChainKey!))   : null,
+      'rck':       _receivingChainKey != null ? _hexOf(Uint8List.fromList(_receivingChainKey!)) : null,
+      'dhsk_priv': _hexOf(Uint8List.fromList(List<int>.from(_dhSendingKP.bytes))),
       'dhsk_pub':  _hexOf(dhPub),
-      'dhrpk':     _dhRemotePublicKey != null ? _hexOf(_dhRemotePublicKey!) : null,
+      'dhrpk':     _dhRemotePublicKey != null ? _hexOf(Uint8List.fromList(_dhRemotePublicKey!)) : null,
       'sn':        _sendingN,
       'rn':        _receivingN,
       'psn':       _previousSendingN,
-      'shk':       _sendingHeaderKey       != null ? _hexOf(_sendingHeaderKey!)       : null,
-      'rhk':       _receivingHeaderKey     != null ? _hexOf(_receivingHeaderKey!)     : null,
-      'nshk':      _nextSendingHeaderKey   != null ? _hexOf(_nextSendingHeaderKey!)   : null,
-      'nrhk':      _nextReceivingHeaderKey != null ? _hexOf(_nextReceivingHeaderKey!) : null,
-      'x3dh_ek':    pendingX3dhEphemeralKey != null ? _hexOf(pendingX3dhEphemeralKey!) : null,
-      'kyber_cipher': pendingKyberCipherBytes != null ? _hexOf(pendingKyberCipherBytes!) : null,
+      'shk':       _sendingHeaderKey       != null ? _hexOf(Uint8List.fromList(_sendingHeaderKey!))       : null,
+      'rhk':       _receivingHeaderKey     != null ? _hexOf(Uint8List.fromList(_receivingHeaderKey!))     : null,
+      'nshk':      _nextSendingHeaderKey   != null ? _hexOf(Uint8List.fromList(_nextSendingHeaderKey!))   : null,
+      'nrhk':      _nextReceivingHeaderKey != null ? _hexOf(Uint8List.fromList(_nextReceivingHeaderKey!)) : null,
+      'x3dh_ek':    pendingX3dhEphemeralKey != null ? _hexOf(Uint8List.fromList(pendingX3dhEphemeralKey!)) : null,
+      'kyber_cipher': pendingKyberCipherBytes != null ? _hexOf(Uint8List.fromList(pendingKyberCipherBytes!)) : null,
       'opk_id': pendingOpkId,
-      'sk': Map.fromEntries(_skippedKeys.entries.map((e) => MapEntry(e.key, {
-        'ek': _hexOf(e.value.encKey),
-        'hk': _hexOf(e.value.headerKey),
+      'sk': Map<String, dynamic>.fromEntries(_skippedKeys.entries.map((e) => MapEntry(e.key, <String, String>{
+        'ek': _hexOf(Uint8List.fromList(e.value.encKey)),
+        'hk': _hexOf(Uint8List.fromList(e.value.headerKey)),
       }))),
     };
   }
@@ -578,37 +578,39 @@ class RatchetSession {
   }
 
   static Future<RatchetSession> fromJson(Map<String, dynamic> j) async {
-    final privBytes = _unhexOf(j['dhsk_priv'] as String);
-    final pubBytes  = _unhexOf(j['dhsk_pub']  as String);
-    final pub = SimplePublicKey(pubBytes, type: KeyPairType.x25519);
-    final kp  = SimpleKeyPairData(privBytes, publicKey: pub, type: KeyPairType.x25519);
+    final privBytes = Uint8List.fromList(_unhexOf(j['dhsk_priv'] as String));
+    final pubBytes  = Uint8List.fromList(_unhexOf(j['dhsk_pub']  as String));
+    final pub = SimplePublicKey(List<int>.from(pubBytes), type: KeyPairType.x25519);
+    final kp  = SimpleKeyPairData(List<int>.from(privBytes), publicKey: pub, type: KeyPairType.x25519);
 
     final session = RatchetSession._(
-      rootKey:           _unhexOf(j['rk'] as String),
+      rootKey:           Uint8List.fromList(_unhexOf(j['rk'] as String)),
       dhSendingKP:       kp,
-      dhRemotePublicKey: j['dhrpk'] != null ? _unhexOf(j['dhrpk'] as String) : null,
-      sendingChainKey:   j['sck']  != null ? _unhexOf(j['sck']  as String) : null,
-      receivingChainKey: j['rck']  != null ? _unhexOf(j['rck']  as String) : null,
+      dhRemotePublicKey: j['dhrpk'] != null ? Uint8List.fromList(_unhexOf(j['dhrpk'] as String)) : null,
+      sendingChainKey:   j['sck']  != null ? Uint8List.fromList(_unhexOf(j['sck']  as String)) : null,
+      receivingChainKey: j['rck']  != null ? Uint8List.fromList(_unhexOf(j['rck']  as String)) : null,
     );
 
     session._sendingN          = j['sn']  as int;
     session._receivingN        = j['rn']  as int;
     session._previousSendingN  = j['psn'] as int;
 
-    session._sendingHeaderKey       = j['shk']  != null ? _unhexOf(j['shk']  as String) : null;
-    session._receivingHeaderKey     = j['rhk']  != null ? _unhexOf(j['rhk']  as String) : null;
-    session._nextSendingHeaderKey   = j['nshk'] != null ? _unhexOf(j['nshk'] as String) : null;
-    session._nextReceivingHeaderKey = j['nrhk'] != null ? _unhexOf(j['nrhk'] as String) : null;
-    session.pendingX3dhEphemeralKey = j['x3dh_ek']      != null ? _unhexOf(j['x3dh_ek']      as String) : null;
-    session.pendingKyberCipherBytes = j['kyber_cipher'] != null ? _unhexOf(j['kyber_cipher'] as String) : null;
+    session._sendingHeaderKey       = j['shk']  != null ? Uint8List.fromList(_unhexOf(j['shk']  as String)) : null;
+    session._receivingHeaderKey     = j['rhk']  != null ? Uint8List.fromList(_unhexOf(j['rhk']  as String)) : null;
+    session._nextSendingHeaderKey   = j['nshk'] != null ? Uint8List.fromList(_unhexOf(j['nshk'] as String)) : null;
+    session._nextReceivingHeaderKey = j['nrhk'] != null ? Uint8List.fromList(_unhexOf(j['nrhk'] as String)) : null;
+    session.pendingX3dhEphemeralKey = j['x3dh_ek']      != null ? Uint8List.fromList(_unhexOf(j['x3dh_ek']      as String)) : null;
+    session.pendingKyberCipherBytes = j['kyber_cipher'] != null ? Uint8List.fromList(_unhexOf(j['kyber_cipher'] as String)) : null;
     session.pendingOpkId            = j['opk_id'] as int?;
 
-    final skMap = j['sk'] as Map? ?? {};
+    final skMap = (j['sk'] as Map?) ?? <String, dynamic>{};
     for (final entry in skMap.entries) {
-      final v = Map<String, dynamic>.from(entry.value as Map);
+      final v = entry.value is Map<String, dynamic>
+          ? entry.value as Map<String, dynamic>
+          : Map<String, dynamic>.from(entry.value as Map);
       session._skippedKeys[entry.key as String] = MessageKey(
-        encKey:    _unhexOf(v['ek'] as String),
-        headerKey: _unhexOf(v['hk'] as String),
+        encKey:    Uint8List.fromList(_unhexOf(v['ek'] as String)),
+        headerKey: Uint8List.fromList(_unhexOf(v['hk'] as String)),
       );
     }
 
