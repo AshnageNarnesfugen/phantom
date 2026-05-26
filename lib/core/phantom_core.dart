@@ -109,6 +109,13 @@ class PhantomCore {
   // to once every 2 minutes per contact to avoid infinite loops.
   final Map<String, DateTime> _autoReviveCooldowns = {};
 
+  // ── Per-sender INIT processing lock ────────────────────────────────────────
+  // Prevents concurrent X3DH respond for the same sender when multiple INIT
+  // frames arrive simultaneously (e.g. text + connectivity info in the same
+  // burst). Without this, both INITs pass the isKnownEk check before either
+  // stores the EK, creating two incompatible sessions.
+  final Map<String, Future<void>> _initProcessingLocks = {};
+
   // ── Handshake auto-retry ──────────────────────────────────────────────────
   // After sending an INIT we sit waiting for the peer's handshakeAck. If
   // tunnels haven't converged or the peer is briefly offline, the ack never
@@ -1636,6 +1643,25 @@ class PhantomCore {
 
   /// Handle an INIT frame: run X3DH respond, create receiver session, decrypt.
   Future<void> _handleInitFrame(ParsedFrame frame) async {
+    final senderPhantomId = frame.senderPhantomId;
+
+    // Serialize INIT processing per sender to prevent the concurrent-session
+    // creation race. Wait for any in-flight INIT processing to complete first.
+    while (_initProcessingLocks.containsKey(senderPhantomId)) {
+      try { await _initProcessingLocks[senderPhantomId]; } catch (_) {}
+    }
+
+    final completer = Completer<void>();
+    _initProcessingLocks[senderPhantomId] = completer.future;
+    try {
+      await _handleInitFrameInner(frame);
+    } finally {
+      _initProcessingLocks.remove(senderPhantomId);
+      completer.complete();
+    }
+  }
+
+  Future<void> _handleInitFrameInner(ParsedFrame frame) async {
     final dbg = TransportDebugger.instance;
     final senderIkBytes   = frame.senderIdentityKeyBytes!;
     final senderEkBytes   = frame.senderEphemeralKeyBytes!;
