@@ -116,6 +116,17 @@ class PhantomCore {
   // stores the EK, creating two incompatible sessions.
   final Map<String, Future<void>> _initProcessingLocks = {};
 
+  // ── Per-recipient session-creation lock ───────────────────────────────────
+  // Outgoing counterpart to [_initProcessingLocks]. When the user types a
+  // message and we fire connectivityInfo + preKeyShare advertisements right
+  // after, multiple _sendPhantomMessage calls race through _getOrCreateSession
+  // before any of them has stored a session in [_sessions]. Each call then
+  // runs X3DH initiate with a different ephemeral key, producing several
+  // sessions with mismatched EKs — the peer receives the first INIT, builds
+  // a receiver session for EK_A, but a later INIT with EK_B overwrites it,
+  // leaving the two sides on incompatible ratchets.
+  final Map<String, Future<void>> _sessionCreationLocks = {};
+
   // ── Handshake auto-retry ──────────────────────────────────────────────────
   // After sending an INIT we sit waiting for the peer's handshakeAck. If
   // tunnels haven't converged or the peer is briefly offline, the ack never
@@ -1302,11 +1313,31 @@ class PhantomCore {
   }
 
   Future<RatchetSession> _getOrCreateSession(String recipientId) async {
-    // In-memory cache
+    // Wait for any in-flight creation for this recipient to complete first.
+    // Without this serialization, a burst of outbound messages (text +
+    // connectivityInfo + preKeyShare advertisements) can race here and each
+    // run their own X3DH initiate, producing multiple sessions with different
+    // ephemeral keys that desync the peer.
+    while (_sessionCreationLocks.containsKey(recipientId)) {
+      try { await _sessionCreationLocks[recipientId]; } catch (_) {}
+    }
+
+    // Re-check cache after waiting — a prior holder may have just populated it.
     if (_sessions.containsKey(recipientId)) {
       return _sessions[recipientId]!;
     }
 
+    final completer = Completer<void>();
+    _sessionCreationLocks[recipientId] = completer.future;
+    try {
+      return await _getOrCreateSessionInner(recipientId);
+    } finally {
+      _sessionCreationLocks.remove(recipientId);
+      completer.complete();
+    }
+  }
+
+  Future<RatchetSession> _getOrCreateSessionInner(String recipientId) async {
     // Try to restore from persistent storage
     final savedState = await storage.getSessionState(recipientId);
     if (savedState != null) {
@@ -1681,12 +1712,21 @@ class PhantomCore {
         .join();
     final isKnownEk = await storage.isKnownInitEk(senderPhantomId, incomingEkHex);
 
-    // Known EK → confirmed replay. The original INIT was already processed
-    // and created a valid session. Trying to decrypt replays as MSG triggers
-    // a snapshot/restore cycle that corrupts the ratchet session because
-    // SimpleKeyPairData wraps bytes in UnmodifiableListView. Drop silently.
+    // Known EK → same handshake we already processed. The peer's session is
+    // still embedding the pending X3DH EK on every outbound frame until the
+    // first DH ratchet step lands (see _maxInitResends in double_ratchet.dart),
+    // so subsequent messages (connectivityInfo, preKeyShare, plain text typed
+    // while the ack is in flight) all arrive wrapped as INIT with the original
+    // EK. The X3DH respond path would create a brand-new receiver session and
+    // wipe out the live ratchet state, so route the inner payload through the
+    // existing session via the MSG path instead. If decrypt fails it's a true
+    // transport replay of a frame we already consumed — drop silently without
+    // arming auto-revive.
     if (isKnownEk) {
-      dbg.log('MSG: replay (known EK) — dropping duplicate');
+      final ok = await _tryDecryptAsMsg(frame);
+      dbg.log(ok
+          ? 'MSG: known-EK INIT payload decrypted via existing session'
+          : 'MSG: replay (known EK) — dropping duplicate');
       return;
     }
 
@@ -1976,9 +2016,13 @@ class PhantomCore {
   /// Each attempt snapshots the session state before trying and restores it on
   /// failure, preventing ratchet state corruption if header decryption succeeds
   /// on the wrong session before the body MAC fails.
-  Future<bool> _handleMsgFrame(ParsedFrame frame) async {
+  /// Tries to decrypt [frame] with every loaded session, restoring snapshot
+  /// state on failure so a wrong-session attempt can't corrupt the ratchet.
+  /// Returns true on the first successful decrypt. Does NOT trigger auto-revive
+  /// on failure — caller decides whether to escalate (used by the known-EK
+  /// INIT path where a failure is a legit transport replay, not desync).
+  Future<bool> _tryDecryptAsMsg(ParsedFrame frame) async {
     final dbg = TransportDebugger.instance;
-    dbg.log('MSG: trying ${_sessions.length} session(s) for MSG decrypt');
     for (final entry in List.of(_sessions.entries)) {
       final snapshot = entry.value.takeSnapshot();
       try {
@@ -1988,16 +2032,20 @@ class PhantomCore {
         await _saveSession(entry.key, entry.value);
         await _dispatchIncoming(message, entry.key);
         dbg.log('MSG: ✓ MSG decrypted via session ${entry.key.substring(0, 8)}');
-        // Successful decrypt means the DH ratchet ran which means the
-        // handshakeAck path is complete. Cancel any pending auto-retry.
         _cancelHandshakeRetry(entry.key);
         return true;
       } catch (e) {
         _sessions[entry.key] = await RatchetSession.fromJson(snapshot);
-        dbg.log('MSG:   session ${entry.key.substring(0, 8)} failed: $e');
         continue;
       }
     }
+    return false;
+  }
+
+  Future<bool> _handleMsgFrame(ParsedFrame frame) async {
+    final dbg = TransportDebugger.instance;
+    dbg.log('MSG: trying ${_sessions.length} session(s) for MSG decrypt');
+    if (await _tryDecryptAsMsg(frame)) return true;
     dbg.log('MSG: ✗ no session could decrypt this MSG frame');
 
     // ── Auto-revive: detect ratchet desync and re-handshake ──────────────

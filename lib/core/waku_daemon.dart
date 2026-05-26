@@ -268,13 +268,13 @@ class WakuDaemon {
       final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
       final req = await client.getUrl(Uri.parse('$apiUrl/debug/v1/info'));
       final resp = await req.close();
-      final body = await resp.transform(utf8.decoder).join();
+      await resp.drain<void>();
       client.close(force: true);
 
       if (resp.statusCode != 200) return (running: false, peers: 0);
 
-      // Parse peer count from info response
-      final json = jsonDecode(body) as Map<String, dynamic>;
+      // We only need the peers list — info response is checked for HTTP 200
+      // above to confirm the node is responsive.
       final peersReq = await HttpClient().getUrl(Uri.parse('$apiUrl/admin/v1/peers'));
       final peersResp = await peersReq.close();
       final peersBody = await peersResp.transform(utf8.decoder).join();
