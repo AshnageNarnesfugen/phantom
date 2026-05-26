@@ -109,6 +109,16 @@ class PhantomCore {
   // to once every 2 minutes per contact to avoid infinite loops.
   final Map<String, DateTime> _autoReviveCooldowns = {};
 
+  // Tracks the last successful MSG decrypt per contact. When a fresh handshake
+  // completes (e.g. after auto-revive) the peer may still emit stale frames
+  // encrypted with the previous session; those will fail to decrypt here but
+  // they are NOT desync — just stragglers from before the new ratchet locked
+  // in. Triggering another auto-revive on them produces churn. If we see a
+  // successful decrypt within [_recentDecryptWindow], we drop subsequent
+  // failures silently for the same contact.
+  static const _recentDecryptWindow = Duration(seconds: 30);
+  final Map<String, DateTime> _lastSuccessfulDecryptAt = {};
+
   // ── Per-sender INIT processing lock ────────────────────────────────────────
   // Prevents concurrent X3DH respond for the same sender when multiple INIT
   // frames arrive simultaneously (e.g. text + connectivity info in the same
@@ -178,13 +188,33 @@ class PhantomCore {
       _cancelHandshakeRetry(contactId);
       return;
     }
-    TransportDebugger.instance.log(
-        'HANDSHAKE: auto-retry #${_handshakeRetryAttempts[contactId]} for ${contactId.substring(0, 8)}');
+    final dbg = TransportDebugger.instance;
+    dbg.log('HANDSHAKE: auto-retry #${_handshakeRetryAttempts[contactId]} for ${contactId.substring(0, 8)}');
     try {
-      // Drain resendHandshake so its yields complete; we don't need the
-      // status strings here (they're for the UI's manual reset flow).
-      await resendHandshake(contactId).drain<void>();
-    } catch (_) {}
+      // Crucially do NOT call resendHandshake here — that would resetSession
+      // and produce a brand-new X3DH ephemeral key. When the transport queue
+      // is backed up (gossipsub mesh slow to form), each auto-retry was
+      // generating a new EK while older INITs with the OLD EK sat queued.
+      // When the mesh finally formed, several different EKs flushed to the
+      // peer; the last one wins and the previous sessions become unsendable.
+      //
+      // Instead we re-send a no-op message through the existing session. As
+      // long as the DH ratchet hasn't run (no ack received), the session
+      // still has pendingX3dhEphemeralKey set, so _sendPhantomMessage will
+      // wrap it as another INIT carrying the SAME EK — just nudging the
+      // transport to publish without disturbing the X3DH state on either
+      // side. The receiver's known-EK path (see _handleInitFrame) will
+      // recognise it as a replay/follow-up of the original handshake.
+      await _sendPhantomMessage(
+        recipientId: contactId,
+        message: PhantomMessage(
+          type: MessageType.handshakeAck,
+          content: utf8.encode('auto-retry'),
+        ),
+      );
+    } catch (e) {
+      dbg.log('HANDSHAKE: auto-retry send failed: $e');
+    }
     if (!_disposed && isAwaitingHandshakeAck(contactId)) {
       _scheduleHandshakeRetry(contactId);
     } else {
@@ -2032,6 +2062,7 @@ class PhantomCore {
         await _saveSession(entry.key, entry.value);
         await _dispatchIncoming(message, entry.key);
         dbg.log('MSG: ✓ MSG decrypted via session ${entry.key.substring(0, 8)}');
+        _lastSuccessfulDecryptAt[entry.key] = DateTime.now();
         _cancelHandshakeRetry(entry.key);
         return true;
       } catch (e) {
@@ -2058,6 +2089,21 @@ class PhantomCore {
       // have an active ratchet for. In 1:1 chat there's typically one.
       for (final contactId in _sessions.keys) {
         final now = DateTime.now();
+
+        // Straggler guard: if we successfully decrypted a frame from this
+        // contact recently, this failed frame is almost certainly a leftover
+        // from a previous session that the peer encrypted before our newer
+        // handshake locked in. Reviving here would only undo the freshly
+        // established ratchet. Drop it silently — the sender will resend
+        // anything important via the new session.
+        final lastOk = _lastSuccessfulDecryptAt[contactId];
+        if (lastOk != null && now.difference(lastOk) < _recentDecryptWindow) {
+          dbg.log('MSG: auto-revive skipped for ${contactId.substring(0, 8)} '
+              '— stale-session straggler (${now.difference(lastOk).inSeconds}s '
+              'since last good decrypt)');
+          continue;
+        }
+
         final lastRevive = _autoReviveCooldowns[contactId];
 
         // Rate limit: at most 1 auto-revive per contact per 2 minutes
