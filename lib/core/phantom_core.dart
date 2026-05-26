@@ -57,6 +57,18 @@ class PhantomCore {
   final _incomingController = StreamController<StoredMessage>.broadcast();
   Stream<StoredMessage> get incomingMessages => _incomingController.stream;
 
+  /// Fires the [phantomId] of a contact whenever any of its stored fields
+  /// (nickname, alias, avatar, transport endpoints, ...) changes. Screens
+  /// that mirror contact data subscribe so edits land in the UI immediately
+  /// instead of waiting for the user to back out and re-enter.
+  final _contactChangesController = StreamController<String>.broadcast();
+  Stream<String> get contactChanges => _contactChangesController.stream;
+  void notifyContactChanged(String contactId) {
+    if (!_contactChangesController.isClosed) {
+      _contactChangesController.add(contactId);
+    }
+  }
+
   StreamSubscription? _transportSub;
   TransportManagerV2? _transportV2;
   StreamSubscription? _transportV2Sub;
@@ -1541,7 +1553,7 @@ class PhantomCore {
   }
 
   void _notifyContactUpdated(String contactId) {
-    // Notify UI/Streams if necessary
+    notifyContactChanged(contactId);
   }
 
   /// Pulls the sender's cleartext endpoint metadata out of a HYBRID_INIT_FULL
@@ -2141,6 +2153,7 @@ class PhantomCore {
   Future<void> _dispatchIncoming(PhantomMessage message, String senderId) async {
     if (message.type == MessageType.avatarData) {
       await storage.saveContactAvatar(senderId, message.content);
+      _notifyContactUpdated(senderId);
       _incomingController.add(StoredMessage.fromPhantomMessage(
         msg: message, conversationId: senderId,
         direction: MessageDirection.incoming, status: MessageStatus.delivered,
@@ -2300,6 +2313,7 @@ class PhantomCore {
     _presence?.dispose();
     await storage.close();
     await _incomingController.close();
+    await _contactChangesController.close();
   }
 }
 

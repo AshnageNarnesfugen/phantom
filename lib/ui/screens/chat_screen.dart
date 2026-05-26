@@ -20,6 +20,11 @@ class _ChatScreenState extends State<ChatScreen> {
   StreamSubscription<StoredMessage>? _sub;
   StreamSubscription<String>? _presenceSub;
   StreamSubscription<String>? _handshakeSub;
+  StreamSubscription<String>? _contactSub;
+  // Live display name. Starts with widget.contactName but tracks subsequent
+  // edits via the contactChanges stream so the AppBar refreshes the moment
+  // the user saves a new nickname instead of waiting for the next entry.
+  String? _displayName;
   StoredMessage? _replyTo;
   String?   _wallpaperPath;
   BoxFit    _bgFit       = BoxFit.cover;
@@ -54,10 +59,23 @@ class _ChatScreenState extends State<ChatScreen> {
       _handshakeSub = core.handshakeStateChanges.listen((id) {
         if (id == widget.contactId && mounted) setState(() {});
       });
+      // Reload contact-derived display name when nickname/alias change so
+      // the AppBar updates without a screen pop/push.
+      _contactSub = core.contactChanges.listen((id) {
+        if (id == widget.contactId) _refreshDisplayName(core);
+      });
+      _refreshDisplayName(core);
       _loadMessages(core);
       _loadWallpaper(core);
       _loadGlass(core);
     }
+  }
+
+  Future<void> _refreshDisplayName(PhantomCore core) async {
+    final c = await core.storage.getContact(widget.contactId);
+    if (!mounted) return;
+    final newName = c?.displayName ?? widget.contactName;
+    if (newName != _displayName) setState(() => _displayName = newName);
   }
 
   Future<void> _loadWallpaper(PhantomCore core) async {
@@ -339,6 +357,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _sub?.cancel();
     _presenceSub?.cancel();
     _handshakeSub?.cancel();
+    _contactSub?.cancel();
     _scrollCtrl.dispose();
     _blurredBg?.dispose();
     // _noiseImage is shared via NoiseImageCache — do not dispose it here.
@@ -385,7 +404,7 @@ class _ChatScreenState extends State<ChatScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(widget.contactName,
+                Text(_displayName ?? widget.contactName,
                     style: TextStyle(
                         color: t.textPrimary,
                         fontFamily: 'monospace',
@@ -921,6 +940,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       nickname: nick.isEmpty ? null : nick,
                     ),
                   );
+                  core.notifyContactChanged(widget.contactId);
                 }
               }
               if (ctx.mounted) Navigator.pop(ctx);

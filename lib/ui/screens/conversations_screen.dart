@@ -17,6 +17,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
   final Map<String, Uint8List?> _avatars = {};
   StreamSubscription<StoredMessage>? _msgSub;
   StreamSubscription<String>? _presenceSub;
+  StreamSubscription<String>? _contactSub;
   bool _showArchived = false;
   UpdateInfo? _updateInfo;
   bool _updateChecked = false;
@@ -38,6 +39,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
     if (core != null && _msgSub == null) {
       _msgSub = core.incomingMessages.listen((_) => _loadData(core));
       _presenceSub = core.presenceChanges.listen((_) { if (mounted) setState(() {}); });
+      _contactSub = core.contactChanges.listen((_) => _loadData(core));
       _loadData(core);
       _loadGlass(core);
     }
@@ -138,6 +140,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
   void dispose() {
     _msgSub?.cancel();
     _presenceSub?.cancel();
+    _contactSub?.cancel();
     super.dispose();
   }
 
