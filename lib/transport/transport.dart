@@ -263,26 +263,26 @@ class TransportManager {
       }());
     }
 
-    // Broadcast hedges: also fire I2P even though we'd normally only use it
-    // for the control branch above. Each transport keeps its own queue /
-    // retry logic so it's safe to fire all of them at once.
-    if (priority == TransportPriority.broadcast) {
-      final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
-      final dest = _i2pDests[recipientId];
-      if (i2p != null && dest != null && i2p.isAvailable) {
-        futures.add(() async {
-          dbg.log('TRANSPORT: broadcast via I2P → ${dest.substring(0, 12)}…');
-          try {
-            await i2p
-                .publishToDest(dest: dest, data: encryptedEnvelope)
-                .timeout(const Duration(seconds: 12));
-            dbg.log('TRANSPORT: broadcast I2P delivery OK');
-          } catch (e) {
-            dbg.log('TRANSPORT: broadcast I2P failed ($e)');
-            rethrow;
-          }
-        }());
-      }
+    // ── I2P: always fire when available ─────────────────────────────────────
+    // GossipSub mesh formation over IPFS circuit relays is unreliable and
+    // often one-directional. I2P has proven reliable in both directions,
+    // so we fire it for ALL message types as an additional delivery path.
+    // The receiver deduplicates by message ID, so double delivery is safe.
+    final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
+    final dest = _i2pDests[recipientId];
+    if (i2p != null && dest != null && i2p.isAvailable) {
+      futures.add(() async {
+        dbg.log('TRANSPORT: firing I2P → ${dest.substring(0, 12)}…');
+        try {
+          await i2p
+              .publishToDest(dest: dest, data: encryptedEnvelope)
+              .timeout(const Duration(seconds: 12));
+          dbg.log('TRANSPORT: I2P delivery OK');
+        } catch (e) {
+          dbg.log('TRANSPORT: I2P failed ($e)');
+          rethrow;
+        }
+      }());
     }
 
     final ygg = _activeTransports.whereType<YggdrasilTransport>().firstOrNull;
