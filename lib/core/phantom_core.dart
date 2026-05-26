@@ -819,8 +819,8 @@ class PhantomCore {
       await _sendPhantomMessage(
         recipientId: contactId,
         message: PhantomMessage(
-          type: MessageType.text,
-          content: utf8.encode('[session reset]'),
+          type: MessageType.handshakeAck,
+          content: utf8.encode('session-reset'),
         ),
       );
       dbg.log('SESSION: INIT re-sent to $short — waiting for ack…');
