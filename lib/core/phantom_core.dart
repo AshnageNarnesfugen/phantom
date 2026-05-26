@@ -1655,10 +1655,12 @@ class PhantomCore {
         .join();
     final isKnownEk = await storage.isKnownInitEk(senderPhantomId, incomingEkHex);
 
-    // Known EK → confirmed replay. Use existing session.
+    // Known EK → confirmed replay. The original INIT was already processed
+    // and created a valid session. Trying to decrypt replays as MSG triggers
+    // a snapshot/restore cycle that corrupts the ratchet session because
+    // SimpleKeyPairData wraps bytes in UnmodifiableListView. Drop silently.
     if (isKnownEk) {
-      dbg.log('MSG: replay detected (known EK) → trying as MSG');
-      await _handleMsgFrame(frame);
+      dbg.log('MSG: replay (known EK) — dropping duplicate');
       return;
     }
 
