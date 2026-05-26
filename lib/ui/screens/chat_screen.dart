@@ -182,8 +182,26 @@ class _ChatScreenState extends State<ChatScreen> {
     for (final id in unread) {
       await core.storage.updateMessageStatus(widget.contactId, id, MessageStatus.read);
     }
-    if (unread.isNotEmpty) {
-      core.sendReadReceipts(widget.contactId, unread); // fire-and-forget
+
+    // Re-fire receipts for recent incoming messages even if already marked
+    // read locally. The first batch can get lost when the initial handshake
+    // is still churning (auto-revive resets the session right after the
+    // receipt goes out, leaving it undecryptable on the sender side). The
+    // sender treats duplicate receipts as no-ops, so this is safe.
+    final recentRead = msgs
+        .where((m) =>
+            m.direction == MessageDirection.incoming &&
+            m.status == MessageStatus.read &&
+            !unread.contains(m.id))
+        .map((m) => m.id)
+        .toList()
+        .reversed
+        .take(10)
+        .toList();
+
+    final toAck = <String>{...unread, ...recentRead}.toList();
+    if (toAck.isNotEmpty) {
+      core.sendReadReceipts(widget.contactId, toAck); // fire-and-forget
     }
   }
 

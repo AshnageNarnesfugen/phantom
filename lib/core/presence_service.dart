@@ -30,6 +30,12 @@ class PresenceService {
   Timer? _dhtDiscoverTimer;
   bool _disposed = false;
 
+  /// Tracks whether the user's app is currently in the foreground. When false,
+  /// the periodic heartbeat publishes offline so contacts don't see a stale
+  /// green dot just because our timer kept firing every 2 minutes regardless
+  /// of app state (the previous behaviour overrode goOffline almost immediately).
+  bool _isForeground = true;
+
   bool get isRateLimited => false;
   Stream<String> get changes => _changesCtrl.stream;
 
@@ -39,8 +45,8 @@ class PresenceService {
   Future<void> start(List<String> contactIds) async {
     _subscribeAll(contactIds);
     await _publishHeartbeat();
-    Timer(const Duration(seconds: 10), _publishHeartbeat);
-    _heartbeatTimer = Timer.periodic(_interval, (_) => _publishHeartbeat());
+    Timer(const Duration(seconds: 10), () => _publishHeartbeat(online: _isForeground));
+    _heartbeatTimer = Timer.periodic(_interval, (_) => _publishHeartbeat(online: _isForeground));
 
     unawaited(_advertiseOnDht());
     Timer(const Duration(seconds: 15), _advertiseOnDht);
@@ -64,8 +70,14 @@ class PresenceService {
     return last != null && DateTime.now().difference(last) < _threshold;
   }
 
-  Future<void> goOffline()     => _publishHeartbeat(online: false);
-  Future<void> publishOnline() => _publishHeartbeat(online: true);
+  Future<void> goOffline() {
+    _isForeground = false;
+    return _publishHeartbeat(online: false);
+  }
+  Future<void> publishOnline() {
+    _isForeground = true;
+    return _publishHeartbeat(online: true);
+  }
 
   void _subscribeAll(List<String> ids) {
     for (final id in ids) {
