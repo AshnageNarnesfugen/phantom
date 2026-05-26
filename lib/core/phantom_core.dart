@@ -275,8 +275,16 @@ class PhantomCore {
   }
 
   static TransportManager _buildTransport(TransportConfig? config) {
+    // Use the dynamic IPFS API URL discovered by IpfsDaemon.ensure() (which
+    // reads the actual port from the repo/api file after the daemon binds to
+    // tcp/0). Fall back to the config value or 5001 only if the daemon hasn't
+    // resolved a port yet.
+    final ipfsUrl = IpfsDaemon.apiUrl != 'http://127.0.0.1:5001'
+        ? IpfsDaemon.apiUrl
+        : (config?.ipfsApiUrl ?? 'http://127.0.0.1:5001');
+
     return TransportManager(
-      ipfsApiUrl:       config?.ipfsApiUrl,
+      ipfsApiUrl:       ipfsUrl,
       i2pSamHost:       config?.i2pSamHost,
       i2pSamPort:       config?.i2pSamPort,
       yggdrasilAddress: config?.yggdrasilAddress,
