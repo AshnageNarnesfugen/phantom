@@ -154,12 +154,25 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
     persisted.addListener(() { if (mounted) setState(() {}); });
     if (mounted) setState(() => _themeCtrl = persisted);
     if (Platform.isAndroid) {
-      // Waku starts FIRST — it's the primary messaging transport and is
-      // lightweight enough to run permanently without draining the battery.
-      try { await WakuDaemon.instance.ensure(); } catch (e) { debugPrint('Waku error: $e'); }
-      // IPFS is now ON-DEMAND only (for file transfer). It will be started
-      // by IpfsDaemon.instance.ensure() when sendFile() is called.
-      // We skip auto-starting it here to save battery.
+      // Try Waku first — it's the primary messaging transport when available.
+      bool wakuReady = false;
+      try {
+        await WakuDaemon.instance.ensure();
+        final status = await WakuDaemon.instance.status();
+        wakuReady = status.running;
+      } catch (e) { debugPrint('Waku error: $e'); }
+
+      if (!wakuReady) {
+        // Waku not available (libgowaku.so missing or daemon failed) —
+        // fall back to IPFS as the messaging transport. Once Waku is
+        // compiled and deployed, this branch will stop executing and
+        // IPFS will only start on-demand for file transfers.
+        debugPrint('[init] Waku unavailable — starting IPFS as messaging fallback');
+        try { await IpfsDaemon.instance.ensure(); } catch (e) { debugPrint('Ipfs error: $e'); }
+      } else {
+        debugPrint('[init] Waku active — IPFS will start on-demand for files only');
+      }
+
       try { await I2pdDaemon.instance.ensure(); } catch (e) { debugPrint('I2pd error: $e'); }
       try { await _prepareYggdrasilAndEnsure(); } catch (e) { debugPrint('Ygg error: $e'); }
     }
