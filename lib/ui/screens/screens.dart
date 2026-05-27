@@ -13,6 +13,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import '../../core_provider.dart';
 import '../../core/ipfs_daemon.dart';
+import '../../core/waku_daemon.dart';
 import '../../core/phantom_core.dart';
 import '../../core/transport_debugger.dart';
 import '../../core/update_service.dart';

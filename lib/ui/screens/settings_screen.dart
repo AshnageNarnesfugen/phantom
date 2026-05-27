@@ -311,33 +311,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             tokens: t,
             onTap: () => _showSeedWarning(t),
           ),
-          _SettingTile(
-            icon: Icons.wifi,
-            label: 'transport',
-            value: core?.isTransportAvailable == true ? 'connected' : 'offline',
-            tokens: t,
-            onTap: () => _showTransportSheet(context, t, core),
-          ),
-          _SettingTile(
-            icon: _ipfsRunning == true ? Icons.hub : Icons.hub_outlined,
-            label: 'ipfs node',
-            value: _ipfsRunning == null
-                ? 'checking...'
-                : _ipfsRunning!
-                    ? 'running · $_ipfsPeers peer${_ipfsPeers == 1 ? '' : 's'}'
-                    : 'offline',
-            tokens: t,
-            onTap: () => _showIpfsDiagnostics(context, t),
-          ),
-          _SettingTile(
-            icon: Icons.bug_report_outlined,
-            label: 'transport debugger',
-            tokens: t,
-            onTap: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => _TransportDebugScreen(core: core)),
-            ),
-          ),
           // ── Appearance ───────────────────────────────────────
           _SectionHeader('appearance', t),
           _SettingTile(
@@ -570,37 +543,43 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ],
 
           // ── Network ───────────────────────────────────────────
+          // The detailed per-transport status (waku/ipfs/yggdrasil/i2p/BT)
+          // lives in the modal opened by 'transport status' below — keeping
+          // it in one place stops it from drifting out of sync as new
+          // transports get added (Waku missed both sites before this).
           _SectionHeader('network', t),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('transport status',
-                    style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 14)),
-                const SizedBox(height: 4),
-                Text('all transports are auto-configured — no manual setup required',
-                    style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 11)),
-                const SizedBox(height: 12),
-                _StatusLine(label: 'ipfs', value: _ipfsRunning == true ? 'running · $_ipfsPeers peers' : 'offline', ok: _ipfsRunning == true, tokens: t),
-                if (core != null) ...[
-                  Builder(builder: (_) {
-                    final ygg = core.transport.transports.whereType<YggdrasilTransport>().firstOrNull;
-                    return _StatusLine(label: 'yggdrasil', value: ygg?.address ?? 'auto-detect', ok: ygg?.address != null, tokens: t);
-                  }),
-                  Builder(builder: (_) {
-                    final i2p = core.transport.transports.whereType<I2PTransport>().firstOrNull;
-                    return _StatusLine(label: 'i2p', value: i2p?.myDestination != null ? 'connected' : 'inactive', ok: i2p?.myDestination != null, tokens: t);
-                  }),
-                ],
-              ],
-            ),
+          _SettingTile(
+            icon: Icons.wifi,
+            label: 'transport status',
+            value: core?.isTransportAvailable == true ? 'connected' : 'offline',
+            tokens: t,
+            onTap: () => _showTransportSheet(context, t, core),
+          ),
+          _SettingTile(
+            icon: _ipfsRunning == true ? Icons.hub : Icons.hub_outlined,
+            label: 'ipfs diagnostics',
+            value: _ipfsRunning == null
+                ? 'checking...'
+                : _ipfsRunning!
+                    ? 'running · $_ipfsPeers peer${_ipfsPeers == 1 ? '' : 's'}'
+                    : 'offline',
+            tokens: t,
+            onTap: () => _showIpfsDiagnostics(context, t),
           ),
           _SettingTile(
             icon: Icons.hub_outlined,
             label: 'yggdrasil peers',
             tokens: t,
             onTap: () => _showYggdrasilPeersSheet(context, t),
+          ),
+          _SettingTile(
+            icon: Icons.bug_report_outlined,
+            label: 'transport debugger',
+            tokens: t,
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => _TransportDebugScreen(core: core)),
+            ),
           ),
 
           // ── About ─────────────────────────────────────────────
@@ -1031,48 +1010,6 @@ class _SettingTile extends StatelessWidget {
 // SHARED WIDGETS (local to screens)
 // ─────────────────────────────────────────────────────────────────────────────
 
-class _StatusLine extends StatelessWidget {
-  final String label;
-  final String value;
-  final bool ok;
-  final PhantomTokens tokens;
-
-  const _StatusLine({required this.label, required this.value, required this.ok, required this.tokens});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: Row(
-        children: [
-          Container(
-            width: 6, height: 6,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: ok ? const Color(0xFF4CAF50) : tokens.textDisabled,
-            ),
-          ),
-          const SizedBox(width: 10),
-          SizedBox(
-            width: 80,
-            child: Text(label,
-              style: TextStyle(color: tokens.textSecondary, fontFamily: 'monospace', fontSize: 12)),
-          ),
-          Expanded(
-            child: Text(value,
-              style: TextStyle(
-                color: ok ? tokens.accentLight : tokens.textDisabled,
-                fontFamily: 'monospace', fontSize: 12,
-              ),
-              maxLines: 1, overflow: TextOverflow.ellipsis,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 class _PhantomButton extends StatelessWidget {
   final String label;
   final VoidCallback? onTap;
@@ -1191,6 +1128,9 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
   TransportStatus? _status;
   int _ipfsSwarmPeers = 0;
   bool _ipfsRunning = false;
+  bool _wakuRunning = false;
+  int _wakuPeers = 0;
+  bool _wakuBinaryMissing = false;
   Timer? _refreshTimer;
 
   @override
@@ -1216,6 +1156,21 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
         setState(() {
           _ipfsRunning = s.running;
           _ipfsSwarmPeers = s.peers;
+        });
+      }
+    } catch (_) {}
+
+    // Waku status: peers + running. Also surface whether the libgowaku.so
+    // binary is actually bundled — without it the daemon will never start
+    // regardless of platform support, so the user shouldn't see a generic
+    // "offline" that suggests a runtime/connectivity issue.
+    try {
+      final ws = await WakuDaemon.instance.status();
+      if (mounted) {
+        setState(() {
+          _wakuRunning = ws.running;
+          _wakuPeers   = ws.peers;
+          _wakuBinaryMissing = WakuDaemon.instance.binaryMissing;
         });
       }
     } catch (_) {}
@@ -1315,6 +1270,15 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
             ],
           ),
           const SizedBox(height: 20),
+          _TransportRow(
+            label: 'waku',
+            value: _wakuBinaryMissing
+                ? 'binary not bundled'
+                : _wakuRunning
+                    ? 'running · $_wakuPeers peer${_wakuPeers == 1 ? '' : 's'}'
+                    : 'offline',
+            tokens: t,
+          ),
           _TransportRow(
             label: 'ipfs node',
             value: _ipfsRunning ? 'running' : 'offline',

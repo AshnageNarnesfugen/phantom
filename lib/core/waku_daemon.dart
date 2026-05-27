@@ -25,11 +25,18 @@ class WakuDaemon {
   WakuDaemon._();
 
   bool _ensured = false;
+  bool _binaryMissing = false;
   Process? _directProcess;
   final _logBuf = StringBuffer();
 
   String? _dynamicApiUrl;
   String get apiUrl => _dynamicApiUrl ?? 'http://127.0.0.1:8645';
+
+  /// True after [ensure] determined that `libgowaku.so` is not bundled.
+  /// UI uses this to show "binary not bundled" instead of a generic
+  /// "offline", so the user knows Waku is missing for build reasons
+  /// rather than a runtime fault.
+  bool get binaryMissing => _binaryMissing;
 
   /// Last captured output from the Waku process.
   String get daemonLog => _logBuf.isEmpty ? '(no output)' : _logBuf.toString();
@@ -61,9 +68,11 @@ class WakuDaemon {
 
       if (!File(binary).existsSync()) {
         _logBuf.writeln('[init] WARNING: libgowaku.so not found — Waku disabled');
+        _binaryMissing = true;
         _ensured = false;
         return;
       }
+      _binaryMissing = false;
 
       final dataDir = await _dataDir();
       _logBuf.writeln('[init] data dir: $dataDir');

@@ -29,6 +29,9 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
   int     _swarmPeers   = 0;
   List<String> _topics  = [];
   Map<String, int> _contactPeers = {};
+  bool _wakuRunning = false;
+  int  _wakuPeers   = 0;
+  bool _wakuBinaryMissing = false;
 
   @override
   void initState() {
@@ -107,6 +110,52 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
     await _fetchSwarmPeers();
     await _fetchTopics();
     await _fetchContactPeers();
+    await _fetchWakuStatusQuiet();
+  }
+
+  /// Updates the Waku status chip without spamming the live log. Use this
+  /// from the auto-status loop; the verbose [_fetchWakuStatus] action dumps
+  /// the daemon's stdout/stderr buffer into the log instead.
+  Future<void> _fetchWakuStatusQuiet() async {
+    try {
+      final s = await WakuDaemon.instance.status();
+      if (!mounted) return;
+      setState(() {
+        _wakuRunning = s.running;
+        _wakuPeers   = s.peers;
+        _wakuBinaryMissing = WakuDaemon.instance.binaryMissing;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _fetchWakuStatus() async {
+    final dbg = TransportDebugger.instance;
+    dbg.log('DBG: ── Waku status ──');
+    if (WakuDaemon.instance.binaryMissing) {
+      dbg.log('DBG: ⚠ libgowaku.so NOT bundled in jniLibs — daemon never spawned');
+      dbg.log('DBG:   add the .so to android/app/src/main/jniLibs/<arch>/ and rebuild');
+    } else {
+      try {
+        final s = await WakuDaemon.instance.status();
+        dbg.log('DBG: Waku running: ${s.running}');
+        dbg.log('DBG: Waku peers:   ${s.peers}');
+        dbg.log('DBG: Waku REST:    ${WakuDaemon.instance.apiUrl}');
+      } catch (e) {
+        dbg.log('DBG: Waku status FAILED: $e');
+      }
+    }
+    // Replay the captured daemon stdout/stderr so the user can see whether
+    // libgowaku is bootstrapping, listening on a port, peering, or crashing.
+    // The Waku daemon's own logs are otherwise invisible — they're only
+    // surfaced via the WakuDaemon._logBuf StringBuffer.
+    final daemonLog = WakuDaemon.instance.daemonLog;
+    dbg.log('DBG: Waku daemon log:');
+    for (final line in daemonLog.split('\n')) {
+      if (line.trim().isEmpty) continue;
+      dbg.log('DBG:   $line');
+    }
+    dbg.log('DBG: ── end Waku status ──');
+    await _fetchWakuStatusQuiet();
   }
 
   Future<void> _fetchIpfsId() async {
@@ -355,6 +404,15 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
               tokens: t,
             ),
             const SizedBox(width: 8),
+            _StatusChip(
+              label: 'waku',
+              value: _wakuBinaryMissing
+                  ? 'no.so'
+                  : _wakuRunning ? '$_wakuPeers peers' : 'off',
+              ok: _wakuRunning,
+              tokens: t,
+            ),
+            const SizedBox(width: 8),
             if (widget.core != null) ...[
               _StatusChip(
                 label: 'ygg',
@@ -398,6 +456,7 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
             _DbgButton(label: 'contact peers', tokens: t, onTap: _fetchContactPeers),
             _DbgButton(label: 'my sub?', tokens: t, onTap: _checkMySubTopic),
             _DbgButton(label: 'ygg status', tokens: t, onTap: _fetchYggStatus),
+            _DbgButton(label: 'waku status', tokens: t, onTap: _fetchWakuStatus),
             _DbgButton(label: 'restart daemon', tokens: t, danger: true, onTap: _restartDaemon),
             _DbgButton(label: 'flush queue', tokens: t, accent: true, onTap: _flushQueue),
             if (widget.core != null)
