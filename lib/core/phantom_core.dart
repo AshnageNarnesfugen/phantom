@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'package:crypto/crypto.dart' as crypto_lib;
 import 'package:cryptography/cryptography.dart';
 import 'package:meta/meta.dart';
 
@@ -106,6 +107,29 @@ class PhantomCore {
     return true;
   }
 
+  // ── OPK consumption rate limit ────────────────────────────────────────────
+  // Caps how many one-time pre-keys a single sender (identified by their
+  // phantomId, which is derived from IK_pub so it's authenticated by X3DH)
+  // can burn through within a rolling window. An attacker who controls one
+  // IK could otherwise drain our entire OPK pool by initiating many fresh
+  // handshakes — once exhausted, all future X3DH respond falls back to the
+  // 3-DH variant which loses the forward-secrecy guarantee of DH4 against a
+  // combined IK_priv + SPK_priv compromise. With the cap, an abusive sender
+  // can degrade their OWN sessions but not ours with other peers.
+  static const _opkConsumeMax    = 20;
+  static const _opkConsumeWindow = Duration(hours: 6);
+  final Map<String, List<DateTime>> _opkConsumeTimestamps = {};
+
+  bool _shouldConsumeOpk(String senderId) {
+    final now = DateTime.now();
+    final windowStart = now.subtract(_opkConsumeWindow);
+    final list = _opkConsumeTimestamps.putIfAbsent(senderId, () => <DateTime>[]);
+    list.removeWhere((t) => t.isBefore(windowStart));
+    if (list.length >= _opkConsumeMax) return false;
+    list.add(now);
+    return true;
+  }
+
   // Tracks the wall-clock time we last sent an INIT to each contact. The
   // simultaneous re-init tiebreaker uses this to keep our established session
   // when a peer's INIT races against our own ack — the original guard only
@@ -130,6 +154,17 @@ class PhantomCore {
   // failures silently for the same contact.
   static const _recentDecryptWindow = Duration(seconds: 30);
   final Map<String, DateTime> _lastSuccessfulDecryptAt = {};
+
+  // Counts consecutive auto-revives per contact that haven't produced a good
+  // decrypt yet. Each repeated revive doubles the next cooldown, capped at
+  // [_autoReviveCooldownMax]. The previous fixed 2-minute cooldown let an
+  // attacker who could inject corrupt MSG frames keep us in an endless
+  // re-handshake loop by sending one bad frame every 2:01 — burning CPU,
+  // network, and ratchet state. With exponential backoff a sustained attack
+  // is throttled to once every 32 minutes after a handful of failures.
+  static const _autoReviveCooldownBase = Duration(minutes: 2);
+  static const _autoReviveCooldownMax  = Duration(minutes: 32);
+  final Map<String, int> _autoReviveStreak = {};
 
   // ── Per-sender INIT processing lock ────────────────────────────────────────
   // Prevents concurrent X3DH respond for the same sender when multiple INIT
@@ -409,19 +444,35 @@ class PhantomCore {
     );
     String res = ca.encode();
 
-    // 1. Append IPFS Peer ID
+    // Endpoint suffix: format is `ID#IPFS@YGG$I2P|<ed25519_sig_base64>`.
+    // Each endpoint slot is optional; the signature covers everything between
+    // the encoded CA and the `|` separator so a MITM cannot swap the IPFS
+    // peer ID / I2P dest / Yggdrasil address mid-flight (which would let
+    // them silently relay all transport traffic through their own boxes
+    // until the first encrypted connectivityInfo arrives, by which point
+    // the handshake has already been observed).
+    final suffixBuf = StringBuffer();
     final ipfsId = await getMyIpfsPeerId();
-    if (ipfsId != null) res += '#$ipfsId';
-
-    // 2. Append Yggdrasil IPv6
+    if (ipfsId != null) suffixBuf.write('#$ipfsId');
     final ygg = transport.transports.whereType<YggdrasilTransport>().firstOrNull;
-    if (ygg != null && ygg.address != null && ygg.address!.isNotEmpty) res += '@${ygg.address}';
-
-    // 3. Append I2P Destination
+    if (ygg != null && ygg.address != null && ygg.address!.isNotEmpty) {
+      suffixBuf.write('@${ygg.address}');
+    }
     final i2p = transport.transports.whereType<I2PTransport>().firstOrNull;
-    if (i2p != null && i2p.myDestination != null) res += '\$${i2p.myDestination}';
+    if (i2p != null && i2p.myDestination != null) {
+      suffixBuf.write('\$${i2p.myDestination}');
+    }
+    final suffix = suffixBuf.toString();
+    if (suffix.isEmpty) return res;
 
-    return res;
+    // Sign `<ca_encoded><suffix>` with the SK (Ed25519). Receivers verify
+    // against the SK that's already bound to the CA's IK via identityKeySignature.
+    final sig = await Ed25519().sign(
+      utf8.encode('$res$suffix'),
+      keyPair: identity.signingKeyPair,
+    );
+    final sigB64 = base64Url.encode(sig.bytes).replaceAll('=', '');
+    return '$res$suffix|$sigB64';
   }
 
   /// Manually override the Yggdrasil address if auto-detection fails.
@@ -768,7 +819,13 @@ class PhantomCore {
 
   /// Add a contact from their ContactAddress string.
   ///
-  /// Supports omnichannel addresses: `<base64_ca>[#<ipfs_id>][@<ygg_addr>][$<i2p_dest>]`
+  /// Supports omnichannel addresses: `<base64_ca>[#<ipfs_id>][@<ygg_addr>][$<i2p_dest>][|<sig>]`
+  /// The trailing `|<ed25519_sig_base64>` covers `<ca><suffix>` and is verified
+  /// against the SK embedded in the CA; addresses without a signature are
+  /// accepted for backwards-compatibility but their endpoint suffix is
+  /// dropped (so a MITM-tampered suffix can't silently relay traffic — we
+  /// fall back to learning endpoints from the authenticated connectivityInfo
+  /// channel after handshake).
   Future<ContactRecord> addContact({
     required String contactAddress,
     String? nickname,
@@ -778,7 +835,16 @@ class PhantomCore {
     String? yggAddr;
     String? i2pDest;
 
-    // Parser for omnichannel address: ID#IPFS@YGG$I2P
+    // 1. Split off the endpoint-signature first (if present).
+    String? endpointSig;
+    final sigIdx = caStr.lastIndexOf('|');
+    if (sigIdx > 0) {
+      endpointSig = caStr.substring(sigIdx + 1).trim();
+      caStr = caStr.substring(0, sigIdx);
+    }
+    final signedBase = caStr; // <ca><suffix> — exactly what was signed
+
+    // 2. Parser for omnichannel address: ID#IPFS@YGG$I2P
     final i2pIdx = caStr.lastIndexOf('\$');
     if (i2pIdx > 0) {
       i2pDest = caStr.substring(i2pIdx + 1).trim();
@@ -803,6 +869,34 @@ class PhantomCore {
       throw const PhantomCoreException(
         'Invalid contact address: identity key signature does not match.',
       );
+    }
+
+    // 3. Verify the endpoint signature (if any). If the address claims
+    // endpoints but the signature is missing or invalid, drop the endpoints
+    // — we still accept the contact since the CA itself is authenticated.
+    final hadEndpoints = finalIpfsPeerId != null || yggAddr != null || i2pDest != null;
+    if (hadEndpoints) {
+      bool sigOk = false;
+      if (endpointSig != null && endpointSig.isNotEmpty) {
+        try {
+          final sigBytes = base64Url.decode(
+              endpointSig.padRight((endpointSig.length + 3) & ~3, '='));
+          sigOk = await Ed25519().verify(
+            utf8.encode(signedBase),
+            signature: Signature(sigBytes,
+                publicKey: SimplePublicKey(ca.ed25519SigningKey,
+                    type: KeyPairType.ed25519)),
+          );
+        } catch (_) { sigOk = false; }
+      }
+      if (!sigOk) {
+        TransportDebugger.instance.log(
+            'ADD_CONTACT: ✗ endpoint signature missing/invalid — dropping endpoints, '
+            'will rely on authenticated connectivityInfo after handshake');
+        finalIpfsPeerId = null;
+        yggAddr = null;
+        i2pDest = null;
+      }
     }
     final contact = ContactRecord(
       phantomId:                ca.phantomId,
@@ -1663,25 +1757,17 @@ class PhantomCore {
   // Multiple transports (I2P + IPFS + Yggdrasil) often deliver the same frame
   // multiple times. Each redundant copy triggers a snapshot/restore cycle on
   // the Double Ratchet session, which corrupts internal state via unmodifiable
-  // list references. Dedup by payload hash with a 60s TTL.
+  // list references. Dedup by SHA-256 of the full payload with a 60s TTL.
+  // The previous fingerprint (first 16 + last 16 + length) was trivially
+  // collidable — an attacker who could observe a legitimate frame could craft
+  // a different-content frame with the same fingerprint and suppress delivery.
+  // SHA-256 over the whole frame removes that surface.
   static const _dedupeMaxSize = 100;
   static const _dedupeTtl = Duration(seconds: 60);
   final Map<String, DateTime> _recentFrameHashes = {};
 
   bool _isDuplicateFrame(Uint8List data) {
-    // Fast hash: use first 16 + last 16 bytes + length as fingerprint
-    final len = data.length;
-    final buf = StringBuffer();
-    buf.write(len);
-    buf.write(':');
-    for (int i = 0; i < 16 && i < len; i++) {
-      buf.write(data[i].toRadixString(16).padLeft(2, '0'));
-    }
-    buf.write(':');
-    for (int i = (len - 16).clamp(0, len); i < len; i++) {
-      buf.write(data[i].toRadixString(16).padLeft(2, '0'));
-    }
-    final hash = buf.toString();
+    final hash = crypto_lib.sha256.convert(data).toString();
 
     final now = DateTime.now();
 
@@ -1707,10 +1793,14 @@ class PhantomCore {
       if (frame.isInit) {
         dbg.log('MSG: ← INIT frame (${data.length} bytes, hybrid=${frame.isHybrid})');
         dbg.log('MSG:   sender = ${frame.senderPhantomId.substring(0, 8)}…');
-        if (i2pSourceDest != null) {
-          await _learnI2pDestFromIncoming(frame.senderPhantomId, i2pSourceDest);
-        }
-        await _handleInitFrame(frame);
+        // Do NOT learn the I2P dest here: the cleartext senderPhantomId in
+        // the INIT header isn't authenticated yet (anyone can craft a frame
+        // claiming Alice's IK). Saving the dest before X3DH respond verifies
+        // the sender would let an attacker poison Alice's stored I2P dest by
+        // sending a bogus INIT from their own dest, redirecting Bob's future
+        // replies to a void. Pinning happens inside _handleInitFrameInner
+        // only after the X3DH respond + decrypt succeeds.
+        await _handleInitFrame(frame, i2pSourceDest: i2pSourceDest);
       } else {
         dbg.log('MSG: ← MSG frame (${data.length} bytes)');
         // MSG frames don't carry sender identity in cleartext, so we can't
@@ -1745,7 +1835,7 @@ class PhantomCore {
   }
 
   /// Handle an INIT frame: run X3DH respond, create receiver session, decrypt.
-  Future<void> _handleInitFrame(ParsedFrame frame) async {
+  Future<void> _handleInitFrame(ParsedFrame frame, {String? i2pSourceDest}) async {
     final senderPhantomId = frame.senderPhantomId;
 
     // Serialize INIT processing per sender to prevent the concurrent-session
@@ -1757,14 +1847,14 @@ class PhantomCore {
     final completer = Completer<void>();
     _initProcessingLocks[senderPhantomId] = completer.future;
     try {
-      await _handleInitFrameInner(frame);
+      await _handleInitFrameInner(frame, i2pSourceDest: i2pSourceDest);
     } finally {
       _initProcessingLocks.remove(senderPhantomId);
       completer.complete();
     }
   }
 
-  Future<void> _handleInitFrameInner(ParsedFrame frame) async {
+  Future<void> _handleInitFrameInner(ParsedFrame frame, {String? i2pSourceDest}) async {
     final dbg = TransportDebugger.instance;
     final senderIkBytes   = frame.senderIdentityKeyBytes!;
     final senderEkBytes   = frame.senderEphemeralKeyBytes!;
@@ -1867,18 +1957,30 @@ class PhantomCore {
     // If the frame asks us to consume one of our OPKs, look up its private
     // bytes now so X3DH respond can include DH4. Missing OPK → silent fallback
     // to no-OPK respond (the sender's SK won't match → caller drops + retries).
+    //
+    // Rate-limit OPK consumption per sender: an attacker controlling one IK
+    // could otherwise drain the entire pool with rapid fresh handshakes,
+    // forcing every future session (with anyone) into the 3-DH variant that
+    // loses DH4's forward-secrecy property. When over the cap we still try
+    // to respond — just without DH4 — so the rate-limited sender degrades
+    // their own session security but ours with other peers is preserved.
     SimpleKeyPairData? opkKP;
     if (frame.opkId != null) {
-      final opkPriv = preKeyStore.oneTimePreKeyPrivates[frame.opkId!];
-      if (opkPriv != null) {
-        try {
-          final opkKpFull = await X25519().newKeyPairFromSeed(opkPriv);
-          opkKP = await opkKpFull.extract();
-        } catch (e) {
-          dbg.log('MSG: ✗ OPK ${frame.opkId} key reconstruction failed: $e');
-        }
+      if (!_shouldConsumeOpk(senderPhantomId)) {
+        dbg.log('MSG: ✗ OPK rate-limited for ${senderPhantomId.substring(0, 8)} '
+            '— responding without DH4');
       } else {
-        dbg.log('MSG: requested OPK id=${frame.opkId} not in pool — proceeding without DH4');
+        final opkPriv = preKeyStore.oneTimePreKeyPrivates[frame.opkId!];
+        if (opkPriv != null) {
+          try {
+            final opkKpFull = await X25519().newKeyPairFromSeed(opkPriv);
+            opkKP = await opkKpFull.extract();
+          } catch (e) {
+            dbg.log('MSG: ✗ OPK ${frame.opkId} key reconstruction failed: $e');
+          }
+        } else {
+          dbg.log('MSG: requested OPK id=${frame.opkId} not in pool — proceeding without DH4');
+        }
       }
     }
 
@@ -1968,6 +2070,15 @@ class PhantomCore {
     await storage.setLastInitEkHex(senderPhantomId, incomingEkHex);
     _sessions[senderPhantomId] = session;
     await _saveSession(senderPhantomId, session);
+
+    // X3DH respond + decrypt succeeded, so the sender genuinely controls the
+    // IK_priv that derives senderPhantomId. Only now is it safe to attribute
+    // the I2P source dest to this contact — saving it earlier (in
+    // _handleIncomingBytes) would let any unauthenticated attacker poison
+    // Alice's saved dest by sending a bogus INIT claiming her phantomId.
+    if (i2pSourceDest != null) {
+      await _learnI2pDestFromIncoming(senderPhantomId, i2pSourceDest);
+    }
 
     await _dispatchIncoming(message, senderPhantomId);
     dbg.log('MSG: ✓ dispatched to UI');
@@ -2105,6 +2216,7 @@ class PhantomCore {
         await _dispatchIncoming(message, entry.key);
         dbg.log('MSG: ✓ MSG decrypted via session ${entry.key.substring(0, 8)}');
         _lastSuccessfulDecryptAt[entry.key] = DateTime.now();
+        _autoReviveStreak.remove(entry.key);
         _cancelHandshakeRetry(entry.key);
         if (i2pSourceDest != null) {
           await _learnI2pDestFromIncoming(entry.key, i2pSourceDest);
@@ -2150,17 +2262,25 @@ class PhantomCore {
         }
 
         final lastRevive = _autoReviveCooldowns[contactId];
-
-        // Rate limit: at most 1 auto-revive per contact per 2 minutes
-        if (lastRevive != null &&
-            now.difference(lastRevive) < const Duration(minutes: 2)) {
+        final streak = _autoReviveStreak[contactId] ?? 0;
+        // Exponential backoff: 2m, 4m, 8m, 16m, 32m (capped).
+        final shift = streak.clamp(0, 4);
+        final cooldown = Duration(
+          seconds: (_autoReviveCooldownBase.inSeconds * (1 << shift))
+              .clamp(_autoReviveCooldownBase.inSeconds,
+                     _autoReviveCooldownMax.inSeconds),
+        );
+        if (lastRevive != null && now.difference(lastRevive) < cooldown) {
+          final remaining =
+              cooldown.inSeconds - now.difference(lastRevive).inSeconds;
           dbg.log('MSG: auto-revive skipped for ${contactId.substring(0, 8)} '
-              '(cooldown ${120 - now.difference(lastRevive).inSeconds}s)');
+              '(cooldown ${remaining}s, streak=$streak)');
           continue;
         }
 
         _autoReviveCooldowns[contactId] = now;
-        dbg.log('MSG: ⚡ auto-revive triggered for ${contactId.substring(0, 8)} '
+        _autoReviveStreak[contactId] = streak + 1;
+        dbg.log('MSG: ⚡ auto-revive #${streak + 1} for ${contactId.substring(0, 8)} '
             '— resetting session and re-handshaking');
 
         // Fire-and-forget: reset + re-handshake in background

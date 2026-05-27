@@ -19,6 +19,8 @@ dependencies:
 
   # ── Cryptography ───────────────────────────────────────────────────────────
   cryptography: ^2.9.0
+  # Synchronous SHA-256 for frame dedup (cryptography's Sha256 is async).
+  crypto: ^3.0.0
 
   # ── Encrypted local storage ────────────────────────────────────────────────
   # Hive with manual JSON serialization — hive_generator and build_runner

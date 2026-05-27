@@ -18,7 +18,6 @@ import 'ui/screens/screens.dart';
 const _seedKey = 'phantom_seed_v1';
 
 const _messagingChannel = MethodChannel('phantom/messaging');
-const _diagnosticsChannel = MethodChannel('phantom/diagnostics');
 
 void _startMessagingService() {
   if (!Platform.isAndroid) return;
@@ -34,30 +33,23 @@ void _stopMessagingService() {
 /// the next time the app launches (via [_dumpPreviousCrashIfAny]). This is
 /// the only viable diagnostic channel in release mode when the user can't
 /// run `adb logcat` — Dart's normal stderr is invisible there.
+///
+/// We deliberately do NOT mirror to public Downloads anymore: a stack trace
+/// can capture buffer contents, plaintext message bytes, ratchet state, or
+/// other sensitive material in error messages, and the public Downloads
+/// folder is readable by any installed app with READ_EXTERNAL_STORAGE.
+/// App-private internal storage is sandboxed per app uid; that's the only
+/// place a crash log belongs.
 Future<void> _writeCrashLog(Object error, StackTrace? stack) async {
   final ts = DateTime.now().toIso8601String();
   final body = '─── CRASH @ $ts ───\n$error\n$stack\n\n';
 
-  // 1. Internal storage — read by [_dumpPreviousCrashIfAny] on next launch.
   try {
     final dir = await getApplicationDocumentsDirectory();
     final f = File('${dir.path}/last_crash.txt');
     await f.writeAsString(body, mode: FileMode.append);
   } catch (e) {
     debugPrint('Failed to write crash log: $e');
-  }
-
-  // 2. Public Downloads via MediaStore — survives uninstall and is readable
-  // from any file manager without root or adb. This is the diagnostic
-  // channel the user can actually reach when a release-mode crash kills
-  // the app before any UI loads.
-  if (Platform.isAndroid) {
-    try {
-      await _diagnosticsChannel
-          .invokeMethod<String>('writeCrashToDownloads', {'body': body});
-    } catch (e) {
-      debugPrint('Failed to write crash to downloads: $e');
-    }
   }
 }
 
