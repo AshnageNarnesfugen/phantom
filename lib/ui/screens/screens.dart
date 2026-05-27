@@ -26,6 +26,7 @@ part 'chat_screen.dart';
 part 'add_contact_screen.dart';
 part 'settings_screen.dart';
 part 'transport_debug_screen.dart';
+part 'verify_contact_screen.dart';
 part '_extras.dart';
 
 const _seedKey = 'phantom_seed_v1';

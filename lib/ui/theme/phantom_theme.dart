@@ -244,7 +244,14 @@ class PhantomTheme extends InheritedWidget {
 // ── ThemeController — gestiona el estado global del tema ─────────────────────
 
 class ThemeController extends ChangeNotifier {
-  static const _store         = FlutterSecureStorage();
+  // Theme prefs aren't sensitive but we keep them on the same hardened
+  // storage instance as the seed phrase so plugin-level options stay
+  // uniform — mixing default and biometric AndroidOptions on the same
+  // process can trigger spurious migrations.
+  static const _store         = FlutterSecureStorage(
+    aOptions: AndroidOptions.biometric(enforceBiometrics: false),
+    iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock_this_device),
+  );
   static const _keyAccent     = 'theme_accent';
   static const _keyDark       = 'theme_dark';
   static const _keyIntensity  = 'theme_intensity';

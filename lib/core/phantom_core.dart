@@ -10,6 +10,7 @@ import 'package:meta/meta.dart';
 import 'identity/identity.dart';
 import 'crypto/double_ratchet.dart';
 import 'crypto/hybrid_kem.dart';
+import 'crypto/safety_number.dart';
 import 'crypto/x3dh.dart';
 import 'protocol/message.dart';
 import 'protocol/frame.dart';
@@ -597,19 +598,27 @@ class PhantomCore {
     final Uint8List wire;
     if (x3dhEk != null) {
       if (kyberCipher != null && opkId != null) {
-        // Embed our current transport endpoints in cleartext so the receiver
-        // can refresh their saved contact record BEFORE they send the
-        // handshakeAck — fixes the dead-letter case where the receiver
-        // imported our ContactAddress with previous-install endpoints.
-        wire = WireFrame.wrapHybridInitFull(
+        // Embed our current transport endpoints — but seal them with an
+        // AES-GCM key derived from the X3DH shared secret so a passive
+        // observer of the IPFS pubsub topic can't link the sender's
+        // phantomId to their IPFS peer id / I2P dest / Yggdrasil addr.
+        // The receiver re-derives the same key in initAsReceiver and
+        // decrypts in _handleInitFrameInner before refreshing endpoints.
+        final endpoints = <String, String>{
+          if ((_myI2pDest() ?? '').isNotEmpty)        'i2p':  _myI2pDest()!,
+          if ((await getMyIpfsPeerId() ?? '').isNotEmpty) 'ipfs': (await getMyIpfsPeerId())!,
+          if ((_myYggAddr() ?? '').isNotEmpty)        'ygg':  _myYggAddr()!,
+        };
+        final sealed = session.endpointKey != null
+            ? await _sealEndpoints(session.endpointKey!, endpoints)
+            : Uint8List(0);
+        wire = WireFrame.wrapHybridInitFullSealed(
           senderIdentityKeyBytes:    identity.encryptionPublicKeyBytes,
           senderEphemeralKeyBytes:   x3dhEk,
           kyberCipherBytes:          kyberCipher,
           senderContactAddressBytes: await _getMyContactAddressBytes(),
           opkId:                     opkId,
-          senderI2pDest:             _myI2pDest() ?? '',
-          senderIpfsPeerId:          await getMyIpfsPeerId() ?? '',
-          senderYggAddr:             _myYggAddr() ?? '',
+          sealedEndpoints:           sealed,
           envelopeBytes:             envelopeBytes,
         );
       } else if (kyberCipher != null) {
@@ -1219,11 +1228,14 @@ class PhantomCore {
   // ── Safety number ──────────────────────────────────────────────────────────
 
   Future<String> safetyNumber(String theirPhantomId) async {
-    final ids   = [myId, theirPhantomId]..sort();
-    final input = utf8.encode('${ids[0]}\x00${ids[1]}');
-    final hash  = await Sha256().hash(input);
-    final hex   = hash.bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-    return List.generate(8, (i) => hex.substring(i * 8, i * 8 + 8)).join(' ');
+    final contact = await storage.getContact(theirPhantomId);
+    if (contact == null) {
+      throw PhantomCoreException('Contact not found: $theirPhantomId');
+    }
+    return SafetyNumber.compute(
+      ourIk:   identity.encryptionPublicKeyBytes,
+      theirIk: contact.encryptionPublicKeyBytes,
+    );
   }
 
   // ── Kyber-768 initialisation ───────────────────────────────────────────────
@@ -1605,6 +1617,15 @@ class PhantomCore {
     await storage.saveContact(c.copyWith(isArchived: archived));
   }
 
+  /// Marks (or unmarks) a contact as verified. Should be called after the
+  /// user confirms the safety number matches via an out-of-band channel.
+  Future<void> setContactVerified(String contactId, {required bool verified}) async {
+    final c = await storage.getContact(contactId);
+    if (c == null) return;
+    await storage.saveContact(c.copyWith(isVerified: verified));
+    _notifyContactUpdated(contactId);
+  }
+
   Future<void> _handleIncomingAlias(String contactId, String alias) async {
     final contact = await storage.getContact(contactId);
     if (contact == null) return;
@@ -1653,17 +1674,36 @@ class PhantomCore {
     notifyContactChanged(contactId);
   }
 
-  /// Pulls the sender's cleartext endpoint metadata out of a HYBRID_INIT_FULL
-  /// frame and updates the contact record so the immediately-following
-  /// handshakeAck (and any subsequent control frames) hit fresh addresses
-  /// instead of the stale ones we may have imported originally. No-ops
-  /// silently when [frame] is an older format that doesn't carry endpoints.
+  /// Pulls the sender's endpoint metadata out of an INIT frame and updates
+  /// the contact record so the immediately-following handshakeAck hits
+  /// fresh addresses. Handles both:
+  ///   - HYBRID_INIT_FULL (0x46): cleartext trailer (legacy)
+  ///   - HYBRID_INIT_FULL_SEALED (0x45): AEAD trailer decrypted with the
+  ///     X3DH-derived endpoint key on the receiver's freshly-built session.
+  /// No-ops silently when the frame format doesn't carry endpoints.
   Future<void> _refreshContactEndpointsFromInit(
       String contactId, ParsedFrame frame) async {
-    final i2p  = frame.senderI2pDest;
-    final ipfs = frame.senderIpfsPeerId;
-    final ygg  = frame.senderYggAddr;
-    // None set → older frame format or sender had no endpoints to share.
+    String? i2p  = frame.senderI2pDest;
+    String? ipfs = frame.senderIpfsPeerId;
+    String? ygg  = frame.senderYggAddr;
+
+    // SEALED variant: decrypt with the session's endpointKey, which both
+    // sides derived identically from the X3DH shared secret. A failed open
+    // (forged frame, wrong key) is silently ignored — we still have a valid
+    // session at this point, just no endpoint refresh.
+    if (frame.sealedEndpoints != null) {
+      final session = _sessions[contactId];
+      if (session?.endpointKey != null) {
+        final opened = await _openSealedEndpoints(
+            session!.endpointKey!, frame.sealedEndpoints!);
+        if (opened != null) {
+          i2p  ??= opened['i2p'];
+          ipfs ??= opened['ipfs'];
+          ygg  ??= opened['ygg'];
+        }
+      }
+    }
+
     if ((i2p == null || i2p.isEmpty) &&
         (ipfs == null || ipfs.isEmpty) &&
         (ygg == null || ygg.isEmpty)) {
@@ -1811,6 +1851,48 @@ class PhantomCore {
       }
     } catch (e) {
       dbg.log('MSG: ✗ frame parse/handle error: $e');
+    }
+  }
+
+  /// AES-GCM-256 encrypts the JSON of [endpoints] under [key]. Output is
+  /// `nonce(12) || ciphertext+tag`. Used to seal the endpoint trailer in
+  /// HYBRID_INIT_FULL_SEALED so the IPFS pubsub topic observer can't link
+  /// our phantomId to our transport endpoints.
+  Future<Uint8List> _sealEndpoints(Uint8List key, Map<String, String> endpoints) async {
+    final aead = AesGcm.with256bits();
+    final nonce = aead.newNonce();
+    final pt    = utf8.encode(jsonEncode(endpoints));
+    final box   = await aead.encrypt(
+      pt,
+      secretKey: SecretKey(key),
+      nonce: nonce,
+    );
+    final out = Uint8List(nonce.length + box.cipherText.length + box.mac.bytes.length);
+    out.setRange(0, nonce.length, nonce);
+    out.setRange(nonce.length, nonce.length + box.cipherText.length, box.cipherText);
+    out.setRange(nonce.length + box.cipherText.length, out.length, box.mac.bytes);
+    return out;
+  }
+
+  /// Inverse of [_sealEndpoints]. Returns the parsed endpoint map or null
+  /// when decryption fails (forged / wrong key / corrupted blob).
+  Future<Map<String, String>?> _openSealedEndpoints(
+      Uint8List key, Uint8List sealed) async {
+    if (sealed.length < 12 + 16) return null; // nonce + MAC minimum
+    try {
+      final aead   = AesGcm.with256bits();
+      final nonce  = sealed.sublist(0, 12);
+      final macBytes = sealed.sublist(sealed.length - 16);
+      final ct       = sealed.sublist(12, sealed.length - 16);
+      final pt = await aead.decrypt(
+        SecretBox(ct, nonce: nonce, mac: Mac(macBytes)),
+        secretKey: SecretKey(key),
+      );
+      final decoded = jsonDecode(utf8.decode(pt));
+      if (decoded is! Map) return null;
+      return decoded.map((k, v) => MapEntry(k.toString(), v.toString()));
+    } catch (_) {
+      return null;
     }
   }
 

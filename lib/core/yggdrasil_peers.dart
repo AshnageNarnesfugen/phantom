@@ -36,6 +36,13 @@ class YggdrasilPeerCatalog {
 
   /// Scrapes the publicpeers page. Returns deduped peer URIs. Throws if
   /// the network fetch fails — caller falls back to cache or [fallback].
+  ///
+  /// The upstream is HTTPS but we don't pin its certificate (the cert
+  /// rotates and a wrong pin would brick everyone). Instead we validate
+  /// every URI returned and drop anything that doesn't look like a
+  /// public-internet peer — defending against a MITM that swaps the
+  /// upstream with something like `tls://10.0.0.1:9999` aiming to route
+  /// our VPN tunnel through their box.
   Future<List<String>> fetchUpstream() async {
     final resp = await _client
         .get(Uri.parse('https://publicpeers.neilalexander.dev/'))
@@ -44,7 +51,61 @@ class YggdrasilPeerCatalog {
       throw HttpException('publicpeers HTTP ${resp.statusCode}');
     }
     final matches = _peerRe.allMatches(resp.body).map((m) => m.group(0)!).toSet();
-    return matches.toList();
+    return matches.where(_isPublicPeer).toList();
+  }
+
+  /// Returns true iff [peerUri] looks like a public-internet Yggdrasil peer.
+  /// Filters: localhost, RFC1918 private ranges, link-local, loopback IPv6,
+  /// CGNAT, multicast, and reserved ranges. We can't fully validate without
+  /// DNS lookup of hostnames, but blocking obvious bogons cuts the MITM
+  /// surface significantly.
+  static bool _isPublicPeer(String peerUri) {
+    final m = RegExp(r'^([a-z]+)://([^:/]+|\[[^\]]+\]):(\d+)$').firstMatch(peerUri);
+    if (m == null) return false;
+    final scheme = m.group(1)!;
+    if (!const {'tls', 'tcp', 'ws', 'wss', 'quic'}.contains(scheme)) return false;
+
+    final port = int.tryParse(m.group(3)!);
+    if (port == null || port <= 0 || port > 65535) return false;
+
+    var host = m.group(2)!;
+    // Strip brackets from IPv6 literal
+    if (host.startsWith('[') && host.endsWith(']')) {
+      host = host.substring(1, host.length - 1);
+    }
+
+    final lower = host.toLowerCase();
+    if (lower == 'localhost' || lower.endsWith('.localhost')) return false;
+    if (lower.endsWith('.local') || lower.endsWith('.internal')) return false;
+
+    // IPv4 dotted-quad checks
+    final v4 = RegExp(r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$').firstMatch(host);
+    if (v4 != null) {
+      final octets = List<int>.generate(4, (i) => int.parse(v4.group(i + 1)!));
+      if (octets.any((o) => o > 255)) return false;
+      if (octets[0] == 0) return false;                       // 0.0.0.0/8
+      if (octets[0] == 10) return false;                      // RFC1918
+      if (octets[0] == 127) return false;                     // loopback
+      if (octets[0] == 169 && octets[1] == 254) return false; // link-local
+      if (octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31)) return false; // RFC1918
+      if (octets[0] == 192 && octets[1] == 168) return false; // RFC1918
+      if (octets[0] == 100 && (octets[1] >= 64 && octets[1] <= 127)) return false; // CGNAT
+      if (octets[0] >= 224) return false;                     // multicast + reserved
+      return true;
+    }
+
+    // IPv6 — block loopback, link-local, ULA
+    if (host.contains(':')) {
+      if (host == '::1' || host == '::') return false;
+      if (lower.startsWith('fe80:') || lower.startsWith('fec0:')) return false;
+      if (lower.startsWith('fc') || lower.startsWith('fd')) return false; // ULA fc00::/7
+      if (lower.startsWith('ff')) return false; // multicast
+      return true;
+    }
+
+    // Hostname — must have at least one dot (no bare names like "router")
+    if (!host.contains('.')) return false;
+    return true;
   }
 
   /// Picks [n] random peers from [list]. Used to rotate which peers we

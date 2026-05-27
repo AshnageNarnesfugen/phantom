@@ -26,6 +26,7 @@ const _kdfRkInfo  = 'phantom-ratchet-root-key';
 const _kdfCkInfo  = 'phantom-ratchet-chain-key';
 const _kdfMkInfo  = 'phantom-ratchet-message-key';
 const _kdfHkAtoB  = 'phantom-ratchet-hk-atob';
+const _kdfEndpoint = 'phantom-endpoint-v1';
 const _kdfHkBtoA  = 'phantom-ratchet-hk-btoa';
 
 // ── Auxiliary types ───────────────────────────────────────────────────────────
@@ -129,6 +130,15 @@ class RatchetSession {
   /// Used by the transport layer to prioritize handshake-optimized transports.
   bool isNewSession = false;
 
+  /// 32-byte AES key derived once from the X3DH shared secret via HKDF,
+  /// shared between sender and receiver. Used to encrypt the cleartext
+  /// endpoint trailer carried in HYBRID_INIT_FULL_SEALED frames so a
+  /// passive observer of the IPFS pubsub topic can't link a sender's
+  /// phantomId to their I2P destination / IPFS peer id / Yggdrasil addr.
+  /// Derived from the *initial* shared secret (not the ratcheted root key)
+  /// so both sides produce the same key without needing per-message state.
+  Uint8List? endpointKey;
+
   RatchetSession._({
     required Uint8List rootKey,
     required SimpleKeyPairData dhSendingKP,
@@ -160,6 +170,7 @@ class RatchetSession {
     // so the receiver can decrypt without knowing our ratchet DH key.
     final hkAtoB = await _kdfInitialHeaderKey(sharedSecret, _kdfHkAtoB);
     final hkBtoA = await _kdfInitialHeaderKey(sharedSecret, _kdfHkBtoA);
+    final endpointK = await _kdfInitialHeaderKey(sharedSecret, _kdfEndpoint);
 
     // First ratchet KDF
     final (newRootKey, sendingCK, nextSendHK) =
@@ -177,6 +188,7 @@ class RatchetSession {
       ..pendingX3dhEphemeralKey  = x3dhEphemeralKeyBytes
       ..pendingKyberCipherBytes  = kyberCipherBytes
       ..pendingOpkId             = opkId
+      ..endpointKey              = endpointK
       ..isNewSession = true;
 
     return session;
@@ -189,6 +201,7 @@ class RatchetSession {
   }) async {
     final hkAtoB = await _kdfInitialHeaderKey(sharedSecret, _kdfHkAtoB);
     final hkBtoA = await _kdfInitialHeaderKey(sharedSecret, _kdfHkBtoA);
+    final endpointK = await _kdfInitialHeaderKey(sharedSecret, _kdfEndpoint);
 
     return RatchetSession._(
       rootKey: sharedSecret,
@@ -198,7 +211,8 @@ class RatchetSession {
       receivingChainKey: null,
     )
       .._nextReceivingHeaderKey = hkAtoB   // decrypt Alice's first messages
-      .._nextSendingHeaderKey   = hkBtoA;  // used as Bob's first sending HK after DH ratchet
+      .._nextSendingHeaderKey   = hkBtoA   // used as Bob's first sending HK after DH ratchet
+      ..endpointKey             = endpointK;
   }
 
   // ── Encrypt ────────────────────────────────────────────────────────────────
@@ -542,6 +556,7 @@ class RatchetSession {
       'x3dh_ek':    pendingX3dhEphemeralKey != null ? _hexOf(Uint8List.fromList(pendingX3dhEphemeralKey!)) : null,
       'kyber_cipher': pendingKyberCipherBytes != null ? _hexOf(Uint8List.fromList(pendingKyberCipherBytes!)) : null,
       'opk_id': pendingOpkId,
+      'epk':   endpointKey != null ? _hexOf(Uint8List.fromList(endpointKey!)) : null,
       'sk': Map<String, dynamic>.fromEntries(_skippedKeys.entries.map((e) => MapEntry(e.key, <String, String>{
         'ek': _hexOf(Uint8List.fromList(e.value.encKey)),
         'hk': _hexOf(Uint8List.fromList(e.value.headerKey)),
@@ -570,6 +585,7 @@ class RatchetSession {
       'x3dh_ek':      pendingX3dhEphemeralKey  != null ? _hexOf(pendingX3dhEphemeralKey!)  : null,
       'kyber_cipher': pendingKyberCipherBytes   != null ? _hexOf(pendingKyberCipherBytes!)   : null,
       'opk_id': pendingOpkId,
+      'epk':    endpointKey != null ? _hexOf(endpointKey!) : null,
       'sk': _skippedKeys.map((k, v) => MapEntry(k, {
         'ek': _hexOf(v.encKey),
         'hk': _hexOf(v.headerKey),
@@ -602,6 +618,7 @@ class RatchetSession {
     session.pendingX3dhEphemeralKey = j['x3dh_ek']      != null ? Uint8List.fromList(_unhexOf(j['x3dh_ek']      as String)) : null;
     session.pendingKyberCipherBytes = j['kyber_cipher'] != null ? Uint8List.fromList(_unhexOf(j['kyber_cipher'] as String)) : null;
     session.pendingOpkId            = j['opk_id'] as int?;
+    session.endpointKey             = j['epk'] != null ? Uint8List.fromList(_unhexOf(j['epk'] as String)) : null;
 
     final skMap = (j['sk'] as Map?) ?? <String, dynamic>{};
     for (final entry in skMap.entries) {

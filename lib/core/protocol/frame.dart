@@ -30,6 +30,21 @@ const int _kHybridInitOpk   = 0x47; // 'G' — hybrid INIT carrying a one-time p
 /// they send the handshakeAck back — fixes the case where the peer
 /// imported our ContactAddress when we had different addresses.
 const int _kHybridInitFull  = 0x46; // 'F'
+/// Same as HYBRID_INIT_FULL but the endpoint trailer is sealed (encrypted
+/// with an AES-GCM key derived from the X3DH shared secret). Hides the
+/// sender's transport endpoints from passive observers of the IPFS pubsub
+/// topic (the receiver's msg topic is public, anyone watching it would
+/// otherwise link phantomId ↔ IPFS peer id + I2P dest + Yggdrasil addr
+/// just by parsing every INIT they see).
+///
+/// Format:
+///   [1=0x45][32 IK][32 EK]
+///   [2 kyber_len][kyber]
+///   [2 CA_len][CA]
+///   [4 opk_id]
+///   [2 sealed_len][sealed_endpoints]   // 12-byte nonce || AES-GCM-128 ct+tag of UTF-8 JSON
+///   [payload]
+const int _kHybridInitFullSealed = 0x45; // 'E'
 const int _kMsg             = 0x4D; // 'M'
 
 class WireFrame {
@@ -190,6 +205,47 @@ class WireFrame {
     return buf.toBytes();
   }
 
+  /// Same on-wire shape as [wrapHybridInitFull] but the endpoint trailer is
+  /// a single opaque sealed blob (nonce || AES-GCM ct+tag of UTF-8 JSON
+  /// `{"i2p":...,"ipfs":...,"ygg":...}`). The receiver derives the same key
+  /// from the X3DH shared secret and decrypts after running respond.
+  static Uint8List wrapHybridInitFullSealed({
+    required Uint8List senderIdentityKeyBytes,
+    required Uint8List senderEphemeralKeyBytes,
+    required Uint8List kyberCipherBytes,
+    required Uint8List senderContactAddressBytes,
+    required int opkId,
+    required Uint8List sealedEndpoints,
+    required Uint8List envelopeBytes,
+  }) {
+    assert(senderIdentityKeyBytes.length  == 32);
+    assert(senderEphemeralKeyBytes.length == 32);
+    assert(opkId >= 0 && opkId <= 0xFFFFFFFF);
+    assert(sealedEndpoints.length <= 0xFFFF);
+
+    final kyberLen = kyberCipherBytes.length;
+    final caLen    = senderContactAddressBytes.length;
+
+    final buf = BytesBuilder();
+    buf.addByte(_kHybridInitFullSealed);
+    buf.add(senderIdentityKeyBytes);
+    buf.add(senderEphemeralKeyBytes);
+
+    buf.add((ByteData(2)..setUint16(0, kyberLen, Endian.big)).buffer.asUint8List());
+    buf.add(kyberCipherBytes);
+
+    buf.add((ByteData(2)..setUint16(0, caLen, Endian.big)).buffer.asUint8List());
+    buf.add(senderContactAddressBytes);
+
+    buf.add((ByteData(4)..setUint32(0, opkId, Endian.big)).buffer.asUint8List());
+
+    buf.add((ByteData(2)..setUint16(0, sealedEndpoints.length, Endian.big)).buffer.asUint8List());
+    buf.add(sealedEndpoints);
+
+    buf.add(envelopeBytes);
+    return buf.toBytes();
+  }
+
   static Uint8List wrapMsg({required Uint8List envelopeBytes}) {
     final out = Uint8List(1 + envelopeBytes.length);
     out[0] = _kMsg;
@@ -220,7 +276,8 @@ class WireFrame {
 
     } else if (type == _kHybridInit ||
                type == _kHybridInitOpk ||
-               type == _kHybridInitFull) {
+               type == _kHybridInitFull ||
+               type == _kHybridInitFullSealed) {
       // 'H': [1][32 IK][32 EK][2 kyber_len][kyber][2 CA_len][CA][payload]
       // 'G': 'H' format + [4 opk_id] before payload
       // 'F': 'G' format + [2 i2p_len][i2p][2 ipfs_len][ipfs][2 ygg_len][ygg]
@@ -249,7 +306,9 @@ class WireFrame {
       offset  += caLen;
 
       int? opkId;
-      if (type == _kHybridInitOpk || type == _kHybridInitFull) {
+      if (type == _kHybridInitOpk ||
+          type == _kHybridInitFull ||
+          type == _kHybridInitFullSealed) {
         if (bytes.length < offset + 4) {
           throw const FrameException('HYBRID_INIT_OPK opk_id truncated');
         }
@@ -260,6 +319,7 @@ class WireFrame {
       String? senderI2pDest;
       String? senderIpfsPeerId;
       String? senderYggAddr;
+      Uint8List? sealedEndpoints;
       if (type == _kHybridInitFull) {
         for (final assign in <void Function(String)>[
           (v) => senderI2pDest = v,
@@ -277,6 +337,17 @@ class WireFrame {
           assign(String.fromCharCodes(bytes.sublist(offset, offset + len)));
           offset += len;
         }
+      } else if (type == _kHybridInitFullSealed) {
+        if (bytes.length < offset + 2) {
+          throw const FrameException('HYBRID_INIT_FULL_SEALED length truncated');
+        }
+        final len = bd.getUint16(offset, Endian.big);
+        offset += 2;
+        if (bytes.length < offset + len) {
+          throw const FrameException('HYBRID_INIT_FULL_SEALED sealed body truncated');
+        }
+        sealedEndpoints = Uint8List.fromList(bytes.sublist(offset, offset + len));
+        offset += len;
       }
 
       final payload = Uint8List.fromList(bytes.sublist(offset));
@@ -292,6 +363,7 @@ class WireFrame {
         senderI2pDest:             senderI2pDest,
         senderIpfsPeerId:          senderIpfsPeerId,
         senderYggAddr:             senderYggAddr,
+        sealedEndpoints:           sealedEndpoints,
         payload:                   payload,
       );
 
@@ -329,6 +401,11 @@ class ParsedFrame {
   final String? senderIpfsPeerId;
   /// Sender's current Yggdrasil IPv6 address. Same purpose as [senderI2pDest].
   final String? senderYggAddr;
+  /// AEAD-sealed endpoint blob (12-byte nonce || AES-GCM ct+tag of UTF-8
+  /// JSON `{"i2p":...,"ipfs":...,"ygg":...}`). Present on
+  /// HYBRID_INIT_FULL_SEALED only. The receiver decrypts using a key derived
+  /// from the X3DH shared secret after running respond.
+  final Uint8List? sealedEndpoints;
   final Uint8List payload;
 
   ParsedFrame._({
@@ -342,6 +419,7 @@ class ParsedFrame {
     this.senderI2pDest,
     this.senderIpfsPeerId,
     this.senderYggAddr,
+    this.sealedEndpoints,
     required this.payload,
   });
 

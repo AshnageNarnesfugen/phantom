@@ -25,6 +25,7 @@ class _ChatScreenState extends State<ChatScreen> {
   // edits via the contactChanges stream so the AppBar refreshes the moment
   // the user saves a new nickname instead of waiting for the next entry.
   String? _displayName;
+  bool _isVerified = false;
   StoredMessage? _replyTo;
   String?   _wallpaperPath;
   BoxFit    _bgFit       = BoxFit.cover;
@@ -75,7 +76,13 @@ class _ChatScreenState extends State<ChatScreen> {
     final c = await core.storage.getContact(widget.contactId);
     if (!mounted) return;
     final newName = c?.displayName ?? widget.contactName;
-    if (newName != _displayName) setState(() => _displayName = newName);
+    final newVerified = c?.isVerified ?? false;
+    if (newName != _displayName || newVerified != _isVerified) {
+      setState(() {
+        _displayName = newName;
+        _isVerified  = newVerified;
+      });
+    }
   }
 
   Future<void> _loadWallpaper(PhantomCore core) async {
@@ -404,11 +411,22 @@ class _ChatScreenState extends State<ChatScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(_displayName ?? widget.contactName,
-                    style: TextStyle(
-                        color: t.textPrimary,
-                        fontFamily: 'monospace',
-                        fontSize: 15)),
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(_displayName ?? widget.contactName,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                              color: t.textPrimary,
+                              fontFamily: 'monospace',
+                              fontSize: 15)),
+                    ),
+                    if (_isVerified) ...[
+                      const SizedBox(width: 6),
+                      Icon(Icons.verified, color: t.accentLight, size: 14),
+                    ],
+                  ],
+                ),
                 PhantomIdDisplay(phantomId: widget.contactId, compact: true),
               ],
             ),
@@ -601,7 +619,12 @@ class _ChatScreenState extends State<ChatScreen> {
               _MenuItem(icon: Icons.fingerprint, label: 'verify safety number', tokens: t,
                 onTap: () {
                   Navigator.pop(context);
-                  if (core != null) _showSafetyNumber(t, core);
+                  Navigator.push(context, _AppRoute(
+                    builder: (_) => VerifyContactScreen(
+                      contactId:   widget.contactId,
+                      contactName: _displayName ?? widget.contactName,
+                    ),
+                  ));
                 }),
               _MenuItem(icon: Icons.wallpaper_outlined, label: 'set chat wallpaper', tokens: t,
                 onTap: () async {
@@ -863,42 +886,6 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       ),
     );
-  }
-
-  void _showSafetyNumber(PhantomTokens t, PhantomCore core) {
-    core.safetyNumber(widget.contactId).then((number) {
-      if (!mounted) return;
-      showDialog(
-        context: context,
-        builder: (_) => AlertDialog(
-          backgroundColor: t.bgSurface,
-          title: Text('safety number',
-              style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 16)),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                'compare this with your contact in person to verify no one is intercepting your messages.',
-                style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12, height: 1.6),
-              ),
-              const SizedBox(height: 20),
-              Text(
-                number,
-                textAlign: TextAlign.center,
-                style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 18,
-                    letterSpacing: 2, height: 1.8),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: Text('close', style: TextStyle(color: t.textSecondary, fontFamily: 'monospace')),
-            ),
-          ],
-        ),
-      );
-    });
   }
 
   void _showEditContact(PhantomTokens t, PhantomCore? core) async {

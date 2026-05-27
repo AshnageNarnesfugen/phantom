@@ -110,9 +110,27 @@ class PhantomApp extends StatefulWidget {
   State<PhantomApp> createState() => _PhantomAppState();
 }
 
+/// Hardened storage options used for everything that derives the user's
+/// identity (the seed phrase, theme prefs that live in secure storage, etc).
+///
+/// Android: AES/GCM/NoPadding key kept resident in the Android Keystore via
+/// the biometric constructor (`enforceBiometrics: false` so we don't prompt
+/// on every launch). When StrongBox is available (API 28+) the key never
+/// leaves the secure chip; on older devices it's still TEE-bound. This is a
+/// strict upgrade over the default RSA-wrapped variant.
+///
+/// iOS: `first_unlock_this_device` — Keychain entries are unreadable until
+/// the device has been unlocked at least once since boot, and they are
+/// excluded from iCloud Keychain backup. Without this the seed could end up
+/// in an iCloud backup, defeating the device-binding property.
+const _kSecure = FlutterSecureStorage(
+  aOptions: AndroidOptions.biometric(enforceBiometrics: false),
+  iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock_this_device),
+);
+
 class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
   ThemeController _themeCtrl = ThemeController();
-  static const _secure = FlutterSecureStorage();
+  static const _secure = _kSecure;
 
   PhantomCore? _core;
   bool _loading = true;

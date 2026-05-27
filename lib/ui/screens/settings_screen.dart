@@ -15,7 +15,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _contactAddress;
   String? _ownAvatarPath;
   final _myAliasCtrl = TextEditingController();
-  static const _secure = FlutterSecureStorage(aOptions: AndroidOptions());
+  // Match main.dart's hardened secure storage so the seed-export flow reads
+  // from the same Keystore/Keychain entry. The biometric AES/GCM scheme is
+  // strictly stronger than the default RSA-wrapped variant: the AES key
+  // stays inside the TEE/StrongBox on Android, and Keychain entries are
+  // bound to this device only (no iCloud-backup leakage).
+  static const _secure = FlutterSecureStorage(
+    aOptions: AndroidOptions.biometric(enforceBiometrics: false),
+    iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock_this_device),
+  );
 
   // App-level glass state (independent from chat glass)
   bool    _glassEnabled       = false;
