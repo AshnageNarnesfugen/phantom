@@ -113,18 +113,20 @@ class PhantomApp extends StatefulWidget {
 /// Hardened storage options used for everything that derives the user's
 /// identity (the seed phrase, theme prefs that live in secure storage, etc).
 ///
-/// Android: AES/GCM/NoPadding key kept resident in the Android Keystore via
-/// the biometric constructor (`enforceBiometrics: false` so we don't prompt
-/// on every launch). When StrongBox is available (API 28+) the key never
-/// leaves the secure chip; on older devices it's still TEE-bound. This is a
-/// strict upgrade over the default RSA-wrapped variant.
+/// Android: the default flutter_secure_storage v10 scheme is already
+/// hardware-backed — AES/GCM/NoPadding for the data, wrapped by an
+/// Android-Keystore-resident RSA/ECB/OAEPwithSHA-256 key. We tried the
+/// `biometric()` (Keystore-resident AES) variant for a marginally stronger
+/// key custody, but switching cipher schemes triggers an on-read migration
+/// of pre-existing entries that hangs / throws on some devices, which froze
+/// the app on the loading screen. The default scheme's security is
+/// effectively equivalent for our threat model, so we stay on it.
 ///
 /// iOS: `first_unlock_this_device` — Keychain entries are unreadable until
 /// the device has been unlocked at least once since boot, and they are
 /// excluded from iCloud Keychain backup. Without this the seed could end up
 /// in an iCloud backup, defeating the device-binding property.
 const _kSecure = FlutterSecureStorage(
-  aOptions: AndroidOptions.biometric(enforceBiometrics: false),
   iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock_this_device),
 );
 
@@ -160,9 +162,16 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
 
   Future<void> _init() async {
     NotificationService.initialize().catchError((_) {});
-    final persisted = await ThemeController.load();
-    persisted.addListener(() { if (mounted) setState(() {}); });
-    if (mounted) setState(() => _themeCtrl = persisted);
+    // Theme load reads secure storage; a storage hiccup here must never block
+    // the account-restore path below (it would otherwise leave the app stuck
+    // on the loading spinner forever, since _init runs fire-and-forget).
+    try {
+      final persisted = await ThemeController.load();
+      persisted.addListener(() { if (mounted) setState(() {}); });
+      if (mounted) setState(() => _themeCtrl = persisted);
+    } catch (e) {
+      debugPrint('Theme load error (continuing with defaults): $e');
+    }
     if (Platform.isAndroid) {
       // Try Waku first — it's the primary messaging transport when available.
       bool wakuReady = false;

@@ -82,12 +82,15 @@ jobs:
         continue-on-error: true
         run: bash scripts/download_i2pd.sh arm64-v8a x86_64
 
-      - name: Build go-waku mobile library (gomobile)
+      - name: Build go-waku daemon (arm64 PIE → libgowaku.so)
         # Waku handles all real-time messaging + store-and-forward for offline
-        # delivery. IPFS is relegated to file transfer only.
-        # Non-blocking: if the upstream repo or gomobile breaks, the build
-        # still ships — Waku features simply stay dormant and the app falls
-        # back to IPFS pubsub for messaging until Waku is available.
+        # delivery. IPFS is relegated to file transfer only. The script builds
+        # go-waku's cmd/waku CLI as a PIE executable named libgowaku.so and
+        # drops it directly into jniLibs/arm64-v8a so the APK ships a runnable
+        # daemon (same pattern as i2pd / kubo).
+        # Non-blocking: if the upstream repo or the cross-build breaks, the
+        # APK still ships — Waku stays dormant and the app falls back to IPFS
+        # pubsub for messaging until libgowaku.so is present.
         continue-on-error: true
         run: |
           export ANDROID_NDK_HOME=$(ls -d "$ANDROID_HOME/ndk/"*/ 2>/dev/null | sort -V | tail -1 || true)
@@ -97,8 +100,20 @@ jobs:
             export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/26.3.11579264"
           fi
           echo "Using NDK: $ANDROID_NDK_HOME"
-          mkdir -p android/app/libs
-          bash scripts/build_waku_mobile.sh android/app/libs/gowaku.aar
+          bash scripts/build_waku_mobile.sh android/app/src/main/jniLibs
+
+      - name: Verify libgowaku.so bundled
+        # Surface whether Waku actually made it into the build. Doesn't fail
+        # the job (Waku is optional) but the log line tells us at a glance
+        # whether messaging will run on Waku or fall back to IPFS.
+        run: |
+          SO=android/app/src/main/jniLibs/arm64-v8a/libgowaku.so
+          if [ -f "$SO" ]; then
+            echo "✓ libgowaku.so present ($(du -h "$SO" | cut -f1))"
+            file "$SO" || true
+          else
+            echo "⚠ libgowaku.so NOT built — Waku will be disabled, IPFS fallback active"
+          fi
 
       - name: Build static x86_64 Kubo binary
         run: |
