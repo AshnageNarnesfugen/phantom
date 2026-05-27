@@ -25,6 +25,13 @@
 set -euo pipefail
 
 JNILIBS_DIR="${1:-$(pwd)/android/app/src/main/jniLibs}"
+# Resolve to an ABSOLUTE path now. We `cd` into the go-waku workdir before
+# writing the .so; a relative JNILIBS_DIR would otherwise resolve against
+# /tmp/gowaku-build and the binary would land there instead of the workspace
+# jniLibs (the build succeeds but the APK ships without it — exactly the
+# "compiled OK yet NOT bundled" symptom we hit).
+mkdir -p "$JNILIBS_DIR"
+JNILIBS_DIR="$(cd "$JNILIBS_DIR" && pwd)"
 WAKU_VERSION="${WAKU_VERSION:-v0.9.0}"
 WORKDIR="${WORKDIR:-/tmp/gowaku-build}"
 ANDROID_TARGET="${ANDROID_TARGET:-23}"
