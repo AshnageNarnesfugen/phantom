@@ -53,14 +53,31 @@ if [ -z "$CC_ARM64" ]; then
 fi
 echo "▶ CC: $CC_ARM64"
 
-# 2. Clone go-waku (shallow).
+# 2. Pin a Go 1.20 toolchain just for this build.
+#    go-waku v0.9.0 fixes quic-go v0.36.4, which has a hard build guard
+#    refusing Go >= 1.21 (internal/qtls/go121.go). The workflow's Go 1.22
+#    (needed by kubo/yggdrasil) therefore can't compile go-waku. Fetch a
+#    private Go 1.20 here and leave the rest of CI untouched.
+GO_PIN="${GO_PIN:-1.20.14}"
+GO_ROOT="/tmp/go-${GO_PIN}"
+GO_BIN="$GO_ROOT/bin/go"
+if [ ! -x "$GO_BIN" ]; then
+  echo "▶ fetching Go $GO_PIN toolchain for the go-waku build…"
+  curl -fsSL "https://go.dev/dl/go${GO_PIN}.linux-amd64.tar.gz" -o /tmp/go-pin.tgz
+  rm -rf "$GO_ROOT" && mkdir -p "$GO_ROOT"
+  tar -C "$GO_ROOT" --strip-components=1 -xzf /tmp/go-pin.tgz
+fi
+export GOROOT="$GO_ROOT"
+echo "▶ go-waku toolchain: $("$GO_BIN" version)"
+
+# 3. Clone go-waku (shallow).
 rm -rf "$WORKDIR"
 git clone --depth=1 --branch "$WAKU_VERSION" \
   https://github.com/waku-org/go-waku.git "$WORKDIR"
 cd "$WORKDIR"
-go mod download
+"$GO_BIN" mod download
 
-# 3. Cross-compile cmd/waku as a PIE executable.
+# 4. Cross-compile cmd/waku as a PIE executable.
 #  - gowaku_no_rln: skip RLN (on-chain rate-limit nullifiers) — a private
 #    messenger doesn't need zkSNARK spam protection, and RLN drags in zerokit
 #    (Rust) which complicates the cross-build enormously.
@@ -71,7 +88,7 @@ OUT_SO="$JNILIBS_DIR/arm64-v8a/libgowaku.so"
 
 echo "▶ building cmd/waku → libgowaku.so (arm64, PIE) — this takes a few minutes…"
 CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_ARM64" \
-  go build \
+  "$GO_BIN" build \
     -buildmode=pie \
     -tags="gowaku_no_rln" \
     -ldflags="-s -w" \
