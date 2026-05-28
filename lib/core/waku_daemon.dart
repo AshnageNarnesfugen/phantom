@@ -422,6 +422,13 @@ class WakuDaemon {
         // Without this flag the endpoint returns 404 and jsonDecode throws,
         // making status() falsely report running=false.
         '--rest-admin=true',
+        // Default 1 rejects publishes with HTTP 400 "not enough peers" during
+        // the 5-30s DNS-discovery bootstrap window after launch. Drop to 0 so
+        // the daemon accepts the publish and gossips it once peers connect.
+        // Worst case (peers never connect): the message goes nowhere on Waku
+        // — but the parallel I2P / IPFS / Yggdrasil transports already deliver
+        // it, so the user-visible behaviour is unchanged.
+        '--min-relay-peers-to-publish=0',
       ],
       environment: env,
     );

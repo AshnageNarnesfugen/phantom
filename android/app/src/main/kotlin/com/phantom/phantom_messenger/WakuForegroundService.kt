@@ -191,6 +191,10 @@ class WakuForegroundService : Service() {
                     "--dns-discovery-name-server=1.1.1.1",
                     // /admin/v1/peers (used by Dart status()) requires this.
                     "--rest-admin=true",
+                    // Default 1 rejects publishes with "not enough peers"
+                    // during the bootstrap window; drop to 0 so we don't
+                    // 400 while DNS discovery is still connecting peers.
+                    "--min-relay-peers-to-publish=0",
                 )
                 pb.environment()["HOME"] = dataDir
                 pb.redirectErrorStream(true)
