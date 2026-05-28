@@ -168,7 +168,10 @@ class WakuForegroundService : Service() {
             try {
                 Log.i(TAG, "Spawning Waku: $binary (data: $dataDir)")
 
-                // go-waku CLI: start with relay + store + REST API on random port
+                // go-waku CLI: start with relay + store + REST API on random port.
+                // Flag names verified from the daemon's own --help output —
+                // earlier `--nodekey-file` / `--db-path` were guesses that
+                // panicked the process with "flag provided but not defined".
                 val pb = ProcessBuilder(
                     binary,
                     "--relay=true",
@@ -176,8 +179,13 @@ class WakuForegroundService : Service() {
                     "--rest=true",
                     "--rest-address=127.0.0.1",
                     "--rest-port=0",           // OS picks a free port
-                    "--nodekey-file=$dataDir/nodekey",
-                    "--db-path=$dataDir/store",
+                    "--key-file=$dataDir/nodekey",
+                    "--store-message-db-url=sqlite3://$dataDir/store.db",
+                    // Without discovery the daemon never peers; use Status'
+                    // public wakuv2 enrtree (E2E traffic is ratcheted so
+                    // the public relays only see opaque blobs).
+                    "--dns-discovery=true",
+                    "--dns-discovery-url=enrtree://AOGECG2SPND25EEFMAJ5WF3KSGJNSGV356DSTL2YVLLZWIV6SAYBM@prod.wakuv2.nodes.status.im",
                 )
                 pb.environment()["HOME"] = dataDir
                 pb.redirectErrorStream(true)

@@ -340,8 +340,19 @@ class WakuDaemon {
         '--rest=true',
         '--rest-address=127.0.0.1',
         '--rest-port=0',
-        '--nodekey-file=$dataDir/nodekey',
-        '--db-path=$dataDir/store',
+        // Real go-waku CLI flag names (verified from the daemon's own --help
+        // dump in the transport debugger on first run). The previous
+        // `--nodekey-file` / `--db-path` were guesses that panicked the
+        // process with "flag provided but not defined".
+        '--key-file=$dataDir/nodekey',
+        '--store-message-db-url=sqlite3://$dataDir/store.db',
+        // Without a discovery mechanism the daemon comes up but never peers,
+        // so "running · 0 peers" forever and nothing routes. Use the Status
+        // team's public wakuv2 enrtree — the relayed traffic is end-to-end
+        // encrypted by our ratchet anyway, so the public relay nodes only
+        // see opaque blobs.
+        '--dns-discovery=true',
+        '--dns-discovery-url=enrtree://AOGECG2SPND25EEFMAJ5WF3KSGJNSGV356DSTL2YVLLZWIV6SAYBM@prod.wakuv2.nodes.status.im',
       ],
       environment: env,
     );
