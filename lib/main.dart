@@ -173,23 +173,30 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
       debugPrint('Theme load error (continuing with defaults): $e');
     }
     if (Platform.isAndroid) {
-      // Try Waku first — it's the primary messaging transport when available.
-      bool wakuReady = false;
+      // Start both Waku and IPFS regardless. Transport-level priority in
+      // TransportManager.publish already prefers Waku for messaging and
+      // demotes IPFS to a fallback / broadcast channel — but we still need
+      // the IPFS daemon up because:
+      //  - PresenceService publishes / subscribes heartbeats over IPFS
+      //    pubsub (the green online dot, contact discovery on cold start).
+      //  - It's the only sender-anonymous broadcast channel we have when
+      //    Waku is unreachable (DNS blocked, peer count drops to 0, etc).
+      //  - File transfers will rehydrate it on-demand anyway; keeping it
+      //    warm just avoids a multi-second spin-up on the first send.
+      //
+      // Spawn them in parallel so Waku's enrtree DNS resolve doesn't gate
+      // IPFS startup time.
       try {
-        await WakuDaemon.instance.ensure();
-        final status = await WakuDaemon.instance.status();
-        wakuReady = status.running;
-      } catch (e) { debugPrint('Waku error: $e'); }
-
-      if (!wakuReady) {
-        // Waku not available (libgowaku.so missing or daemon failed) —
-        // fall back to IPFS as the messaging transport. Once Waku is
-        // compiled and deployed, this branch will stop executing and
-        // IPFS will only start on-demand for file transfers.
-        debugPrint('[init] Waku unavailable — starting IPFS as messaging fallback');
-        try { await IpfsDaemon.instance.ensure(); } catch (e) { debugPrint('Ipfs error: $e'); }
-      } else {
-        debugPrint('[init] Waku active — IPFS will start on-demand for files only');
+        await Future.wait([
+          WakuDaemon.instance.ensure().catchError((e) {
+            debugPrint('Waku error: $e');
+          }),
+          IpfsDaemon.instance.ensure().catchError((e) {
+            debugPrint('Ipfs error: $e');
+          }),
+        ]);
+      } catch (e) {
+        debugPrint('Daemon ensure error: $e');
       }
 
       try { await I2pdDaemon.instance.ensure(); } catch (e) { debugPrint('I2pd error: $e'); }
