@@ -41,7 +41,12 @@ echo "▶ go-waku version:    $WAKU_VERSION"
 echo "▶ android target API: $ANDROID_TARGET"
 echo "▶ workdir:            $WORKDIR"
 
-# 1. Resolve the NDK arm64 C compiler (go-waku needs CGO for its crypto deps).
+# 1. Resolve the NDK (go-waku needs CGO for its crypto deps). We compile
+#    for arm64-v8a (real phones) AND x86_64 (Waydroid + Android emulator),
+#    same pattern as the bundled kubo binary. Without the x86_64 build,
+#    Waydroid installs the APK but extracts no Waku binary and the daemon
+#    silently stays off — exactly what surfaced as "bundled on Pocket Flip,
+#    not bundled on Waydroid".
 if [ -z "${ANDROID_NDK_HOME:-}" ]; then
   ANDROID_NDK_HOME=$(ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}/ndk/"*/ 2>/dev/null | sort -V | tail -1 || true)
   ANDROID_NDK_HOME=${ANDROID_NDK_HOME%/}
@@ -51,14 +56,6 @@ if [ -z "$ANDROID_NDK_HOME" ]; then
   exit 1
 fi
 echo "▶ NDK: $ANDROID_NDK_HOME"
-
-CC_ARM64=$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" \
-  -name "aarch64-linux-android${ANDROID_TARGET}-clang" 2>/dev/null | head -1 || true)
-if [ -z "$CC_ARM64" ]; then
-  echo "✗ NDK clang aarch64-linux-android${ANDROID_TARGET}-clang not found"
-  exit 1
-fi
-echo "▶ CC: $CC_ARM64"
 
 # 2. Pin a Go 1.20 toolchain just for this build.
 #    go-waku v0.9.0 fixes quic-go v0.36.4, which has a hard build guard
@@ -84,23 +81,37 @@ git clone --depth=1 --branch "$WAKU_VERSION" \
 cd "$WORKDIR"
 "$GO_BIN" mod download
 
-# 4. Cross-compile cmd/waku as a PIE executable.
+# 4. Cross-compile cmd/waku as a PIE executable for each target ABI.
 #  - gowaku_no_rln: skip RLN (on-chain rate-limit nullifiers) — a private
 #    messenger doesn't need zkSNARK spam protection, and RLN drags in zerokit
 #    (Rust) which complicates the cross-build enormously.
 #  - -buildmode=pie: Android requires position-independent executables.
 #  - -ldflags "-s -w": strip symbol + DWARF tables to shrink the binary.
-mkdir -p "$JNILIBS_DIR/arm64-v8a"
-OUT_SO="$JNILIBS_DIR/arm64-v8a/libgowaku.so"
+build_for_abi() {
+  local abi="$1"        # jniLibs subdir name
+  local goarch="$2"     # GOARCH value
+  local cc_prefix="$3"  # NDK clang wrapper prefix
+  local cc
+  cc=$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" \
+    -name "${cc_prefix}${ANDROID_TARGET}-clang" 2>/dev/null | head -1 || true)
+  if [ -z "$cc" ]; then
+    echo "⚠ NDK clang ${cc_prefix}${ANDROID_TARGET}-clang not found — skipping $abi"
+    return 0
+  fi
+  local out_dir="$JNILIBS_DIR/$abi"
+  local out_so="$out_dir/libgowaku.so"
+  mkdir -p "$out_dir"
+  echo "▶ building cmd/waku → $abi/libgowaku.so (CC=$cc)…"
+  CGO_ENABLED=1 GOOS=android GOARCH="$goarch" CC="$cc" \
+    "$GO_BIN" build \
+      -buildmode=pie \
+      -tags="gowaku_no_rln" \
+      -ldflags="-s -w" \
+      -o "$out_so" \
+      ./cmd/waku
+  echo "✓ wrote $out_so ($(du -h "$out_so" | cut -f1))"
+  file "$out_so" || true
+}
 
-echo "▶ building cmd/waku → libgowaku.so (arm64, PIE) — this takes a few minutes…"
-CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_ARM64" \
-  "$GO_BIN" build \
-    -buildmode=pie \
-    -tags="gowaku_no_rln" \
-    -ldflags="-s -w" \
-    -o "$OUT_SO" \
-    ./cmd/waku
-
-echo "✓ wrote $OUT_SO ($(du -h "$OUT_SO" | cut -f1))"
-file "$OUT_SO" || true
+build_for_abi arm64-v8a arm64 aarch64-linux-android
+build_for_abi x86_64    amd64 x86_64-linux-android

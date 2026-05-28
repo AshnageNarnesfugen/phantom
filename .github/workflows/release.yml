@@ -103,17 +103,21 @@ jobs:
           bash scripts/build_waku_mobile.sh android/app/src/main/jniLibs
 
       - name: Verify libgowaku.so bundled
-        # Surface whether Waku actually made it into the build. Doesn't fail
-        # the job (Waku is optional) but the log line tells us at a glance
-        # whether messaging will run on Waku or fall back to IPFS.
+        # Surface whether Waku actually made it into the build for each ABI.
+        # Doesn't fail the job (Waku is optional) but the log line tells us
+        # at a glance whether messaging will run on Waku or fall back to IPFS
+        # — and on which device classes (arm64 phones vs x86_64 Waydroid /
+        # emulator).
         run: |
-          SO=android/app/src/main/jniLibs/arm64-v8a/libgowaku.so
-          if [ -f "$SO" ]; then
-            echo "✓ libgowaku.so present ($(du -h "$SO" | cut -f1))"
-            file "$SO" || true
-          else
-            echo "⚠ libgowaku.so NOT built — Waku will be disabled, IPFS fallback active"
-          fi
+          for ABI in arm64-v8a x86_64; do
+            SO="android/app/src/main/jniLibs/$ABI/libgowaku.so"
+            if [ -f "$SO" ]; then
+              echo "✓ libgowaku.so [$ABI] present ($(du -h "$SO" | cut -f1))"
+              file "$SO" || true
+            else
+              echo "⚠ libgowaku.so [$ABI] NOT built — Waku disabled on $ABI devices"
+            fi
+          done
 
       - name: Build static x86_64 Kubo binary
         run: |
