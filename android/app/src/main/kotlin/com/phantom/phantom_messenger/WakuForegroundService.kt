@@ -187,7 +187,11 @@ class WakuForegroundService : Service() {
                     "--store=true",
                     "--store-message-retention-time=72h",
                     "--dns-discovery=true",
+                    // Two enrtree URLs — second key (ANEDLO25) is what
+                    // status-im/infra-nim-waku publishes for the fleet's
+                    // store/lightpush nodes; first one returned relay-only.
                     "--dns-discovery-url=enrtree://AOGECG2SPND25EEFMAJ5WF3KSGJNSGV356DSTL2YVLLZWIV6SAYBM@prod.wakuv2.nodes.status.im",
+                    "--dns-discovery-url=enrtree://ANEDLO25QVUGJOUTQFRYKWX6P4Z4GKVESBMHML7DZ6YK4LGS5FC5O@prod.wakuv2.nodes.status.im",
                     "--dns-discovery-name-server=1.1.1.1",
                     "--rest-admin=true",
                     "--min-relay-peers-to-publish=0",

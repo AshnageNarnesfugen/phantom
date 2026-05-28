@@ -461,7 +461,14 @@ class WakuDaemon {
         // encrypted by our ratchet anyway, so the public relay nodes only
         // see opaque blobs.
         '--dns-discovery=true',
+        // Two enrtree URLs for the same Status fleet — they advertise
+        // overlapping but distinct peer subsets. The first (AOGECG2S key)
+        // gave us relay peers but no store-capable ones, so our storeQuery
+        // returned HTTP 500 "no suitable peers found". The second key
+        // (ANEDLO25) is what status-im/infra-nim-waku actually publishes
+        // for the wakuv2-prod fleet — including its store/lightpush nodes.
         '--dns-discovery-url=enrtree://AOGECG2SPND25EEFMAJ5WF3KSGJNSGV356DSTL2YVLLZWIV6SAYBM@prod.wakuv2.nodes.status.im',
+        '--dns-discovery-url=enrtree://ANEDLO25QVUGJOUTQFRYKWX6P4Z4GKVESBMHML7DZ6YK4LGS5FC5O@prod.wakuv2.nodes.status.im',
         // Pin the resolver. Android sandboxes don't expose a local DNS at
         // [::1]:53 (Waydroid logged "connection refused"), so without this
         // the enrtree lookup fails and no peers are ever discovered.
