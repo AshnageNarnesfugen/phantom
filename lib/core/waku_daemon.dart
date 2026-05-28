@@ -273,27 +273,43 @@ class WakuDaemon {
 
   Future<({bool running, int peers})> status() async {
     if (!Platform.isAndroid) return (running: false, peers: 0);
+
+    // /debug/v1/info is the ground truth for "is the daemon up". If it
+    // answers 200, the daemon is running — period. The peer count comes
+    // from /admin/v1/peers separately; a failure there must NOT flip
+    // running back to false (the old code did exactly that whenever the
+    // admin endpoint was disabled, since jsonDecode of the 404 body threw
+    // inside the same try block).
+    bool running = false;
     try {
-      final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
-      final req = await client.getUrl(Uri.parse('$apiUrl/debug/v1/info'));
-      final resp = await req.close();
+      final c = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+      final r = await c.getUrl(Uri.parse('$apiUrl/debug/v1/info'));
+      final resp = await r.close();
       await resp.drain<void>();
-      client.close(force: true);
-
-      if (resp.statusCode != 200) return (running: false, peers: 0);
-
-      // We only need the peers list — info response is checked for HTTP 200
-      // above to confirm the node is responsive.
-      final peersReq = await HttpClient().getUrl(Uri.parse('$apiUrl/admin/v1/peers'));
-      final peersResp = await peersReq.close();
-      final peersBody = await peersResp.transform(utf8.decoder).join();
-      final peerList = jsonDecode(peersBody) as List<dynamic>? ?? [];
-
-      return (running: true, peers: peerList.length);
+      c.close(force: true);
+      running = resp.statusCode == 200;
     } catch (e) {
-      debugPrint('[WakuDaemon] status error: $e');
+      debugPrint('[WakuDaemon] /debug/v1/info error: $e');
       return (running: false, peers: 0);
     }
+    if (!running) return (running: false, peers: 0);
+
+    int peers = 0;
+    try {
+      final c = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+      final r = await c.getUrl(Uri.parse('$apiUrl/admin/v1/peers'));
+      final resp = await r.close();
+      final body = await resp.transform(utf8.decoder).join();
+      c.close(force: true);
+      if (resp.statusCode == 200) {
+        final decoded = jsonDecode(body);
+        if (decoded is List) peers = decoded.length;
+      }
+    } catch (e) {
+      debugPrint('[WakuDaemon] /admin/v1/peers error: $e');
+      // Leave peers at 0 but keep running=true — the daemon is alive.
+    }
+    return (running: true, peers: peers);
   }
 
   // ── Internals ──────────────────────────────────────────────────────────────
@@ -362,6 +378,10 @@ class WakuDaemon {
         // the enrtree lookup fails and no peers are ever discovered.
         // 1.1.1.1 is privacy-friendly (Cloudflare's stated no-logs policy).
         '--dns-discovery-name-server=1.1.1.1',
+        // Expose /admin/v1/peers — our status() polls it for the peer count.
+        // Without this flag the endpoint returns 404 and jsonDecode throws,
+        // making status() falsely report running=false.
+        '--rest-admin=true',
       ],
       environment: env,
     );

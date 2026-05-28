@@ -189,6 +189,8 @@ class WakuForegroundService : Service() {
                     // Android sandboxes don't expose a local DNS at [::1]:53,
                     // so enrtree resolution fails without an explicit server.
                     "--dns-discovery-name-server=1.1.1.1",
+                    // /admin/v1/peers (used by Dart status()) requires this.
+                    "--rest-admin=true",
                 )
                 pb.environment()["HOME"] = dataDir
                 pb.redirectErrorStream(true)

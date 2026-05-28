@@ -1450,26 +1450,27 @@ class SeedPhraseGrid extends StatelessWidget {
     final t = PhantomTheme.tokensOf(context);
     final words = seedPhrase.split(' ');
 
-    return GridView.builder(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 4,
-        mainAxisSpacing: 8,
-        crossAxisSpacing: 8,
-        childAspectRatio: 2.2,
-      ),
-      itemCount: words.length,
-      itemBuilder: (context, i) {
+    // Wrap with intrinsically-sized chips so long BIP-39 words (e.g.
+    // "prosperity", "quantum", "category") get the width they need and
+    // short ones don't waste space. The previous fixed 4-col GridView
+    // with childAspectRatio 2.2 clipped any word over ~6 characters to
+    // "bronze", "empowe", "quantu", "prosper", … which was unreadable
+    // — especially destructive for a seed phrase the user has to copy
+    // by hand to a piece of paper.
+    return Wrap(
+      spacing: 6,
+      runSpacing: 6,
+      children: List.generate(words.length, (i) {
         final word = words[i];
         return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
           decoration: BoxDecoration(
             color: t.bgSubtle,
             borderRadius: BorderRadius.circular(8),
             border: Border.all(color: t.inputBorder, width: 0.5),
           ),
           child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
+            mainAxisSize: MainAxisSize.min,
             children: [
               Text(
                 '${i + 1}.',
@@ -1479,19 +1480,20 @@ class SeedPhraseGrid extends StatelessWidget {
                   fontFamily: 'monospace',
                 ),
               ),
-              const SizedBox(width: 3),
+              const SizedBox(width: 6),
               Text(
                 obscured ? '••••' : word,
                 style: TextStyle(
                   color: obscured ? t.textDisabled : t.textPrimary,
-                  fontSize: 12,
+                  fontSize: 13,
                   fontFamily: 'monospace',
+                  letterSpacing: 0.2,
                 ),
               ),
             ],
           ),
         );
-      },
+      }),
     );
   }
 }

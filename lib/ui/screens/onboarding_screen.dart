@@ -236,12 +236,43 @@ class _NewAccountStepState extends State<_NewAccountStep> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text('seed phrase', style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
-                GestureDetector(
-                  onTap: () => setState(() => _obscured = !_obscured),
-                  child: Text(
-                    _obscured ? 'show' : 'hide',
-                    style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 12),
-                  ),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    GestureDetector(
+                      onTap: () {
+                        Clipboard.setData(ClipboardData(text: _seedPhrase!));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text(
+                              'seed phrase copied — paste it into your password manager NOW and clear the clipboard',
+                              style: TextStyle(fontFamily: 'monospace', fontSize: 12),
+                            ),
+                            duration: Duration(seconds: 4),
+                          ),
+                        );
+                      },
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.copy_outlined, size: 12, color: t.accentLight),
+                          const SizedBox(width: 4),
+                          Text(
+                            'copy',
+                            style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    GestureDetector(
+                      onTap: () => setState(() => _obscured = !_obscured),
+                      child: Text(
+                        _obscured ? 'show' : 'hide',
+                        style: TextStyle(color: t.accentLight, fontFamily: 'monospace', fontSize: 12),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
