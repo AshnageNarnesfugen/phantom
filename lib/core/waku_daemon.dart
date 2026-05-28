@@ -339,7 +339,11 @@ class WakuDaemon {
         '--store=true',
         '--rest=true',
         '--rest-address=127.0.0.1',
-        '--rest-port=0',
+        // Pin the REST port so the Dart client can reach it without parsing
+        // a dynamic port from stdout. With --rest-port=0 the daemon logs
+        // `addr: 127.0.0.1:0` (echoing the config, not the actual bound
+        // port) and there's no other place the OS-assigned port surfaces.
+        '--rest-port=8645',
         // Real go-waku CLI flag names (verified from the daemon's own --help
         // dump in the transport debugger on first run). The previous
         // `--nodekey-file` / `--db-path` were guesses that panicked the
@@ -353,6 +357,11 @@ class WakuDaemon {
         // see opaque blobs.
         '--dns-discovery=true',
         '--dns-discovery-url=enrtree://AOGECG2SPND25EEFMAJ5WF3KSGJNSGV356DSTL2YVLLZWIV6SAYBM@prod.wakuv2.nodes.status.im',
+        // Pin the resolver. Android sandboxes don't expose a local DNS at
+        // [::1]:53 (Waydroid logged "connection refused"), so without this
+        // the enrtree lookup fails and no peers are ever discovered.
+        // 1.1.1.1 is privacy-friendly (Cloudflare's stated no-logs policy).
+        '--dns-discovery-name-server=1.1.1.1',
       ],
       environment: env,
     );

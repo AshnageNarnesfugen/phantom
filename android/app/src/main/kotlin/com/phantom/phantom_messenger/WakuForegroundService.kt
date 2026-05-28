@@ -178,7 +178,7 @@ class WakuForegroundService : Service() {
                     "--store=true",
                     "--rest=true",
                     "--rest-address=127.0.0.1",
-                    "--rest-port=0",           // OS picks a free port
+                    "--rest-port=8645",         // pin so Dart can reach it
                     "--key-file=$dataDir/nodekey",
                     "--store-message-db-url=sqlite3://$dataDir/store.db",
                     // Without discovery the daemon never peers; use Status'
@@ -186,6 +186,9 @@ class WakuForegroundService : Service() {
                     // the public relays only see opaque blobs).
                     "--dns-discovery=true",
                     "--dns-discovery-url=enrtree://AOGECG2SPND25EEFMAJ5WF3KSGJNSGV356DSTL2YVLLZWIV6SAYBM@prod.wakuv2.nodes.status.im",
+                    // Android sandboxes don't expose a local DNS at [::1]:53,
+                    // so enrtree resolution fails without an explicit server.
+                    "--dns-discovery-name-server=1.1.1.1",
                 )
                 pb.environment()["HOME"] = dataDir
                 pb.redirectErrorStream(true)
