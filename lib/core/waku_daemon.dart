@@ -139,37 +139,32 @@ class WakuDaemon {
 
   // ── Waku REST API methods ──────────────────────────────────────────────────
 
-  /// Waku has two layers of topics that we kept conflating:
-  ///   - pubsub topic: gossipsub routing layer. The daemon subscribes to ONE
-  ///     by default (`/waku/2/default-waku/proto`); that's where peers form
-  ///     a mesh and gossip messages.
+  /// Waku has two layers of topics:
+  ///   - pubsub topic: gossipsub routing layer. ALL nodes that want to
+  ///     intercommunicate must subscribe to the same pubsub topic.
   ///   - content topic: application-level filter inside each WakuMessage.
-  ///     We use `/phantom/1/<phantomId>/proto` so a receiver can pick out
-  ///     messages addressed to them from the shared pubsub firehose.
   ///
-  /// The go-waku REST API needs the *pubsub* topic in the URL path
-  /// (URL-encoded), and the content topic in the message body. Earlier
-  /// versions of this file passed the content topic to the URL path and
-  /// to /relay/v1/subscriptions, which returned 404 ("relayPublish failed"
-  /// with no body) and silently subscribed to nothing.
+  /// We use the legacy named pubsub topic `/waku/2/default-waku/proto`
+  /// because that's what the Status `wakuv2.nodes.status.im` fleet subscribes
+  /// to (cluster 0, pre-TWN). The newer autosharded endpoints derive shards
+  /// like `/waku/2/rs/0/N` instead — but Status' legacy fleet doesn't
+  /// gossip on those, so messages published via auto endpoints succeed
+  /// locally but never leave our mesh (Status store nodes never see them).
+  ///
+  /// Per-user content topic: `/phantom/1/<phantomId>/proto`. The receiver
+  /// filters its inbox to messages with its own content topic.
   static const String defaultPubsubTopic = '/waku/2/default-waku/proto';
 
-  /// Publishes [payload] tagged with [contentTopic] to the Waku relay.
-  ///
-  /// Uses go-waku's auto-sharded endpoint — `/relay/v1/auto/messages` —
-  /// which figures out the pubsub topic from the content topic on the
-  /// server side. The non-auto variant requires the pubsub topic in the
-  /// URL path, but the `%2F` encoding of the topic's leading slashes hits
-  /// router-level routing inconsistencies (chi-mux et al. don't reliably
-  /// decode `%2F` inside path params), which manifested as a generic 404
-  /// and an opaque "Waku relay publish failed".
+  /// Publishes [payload] tagged with [contentTopic] onto [pubsubTopic].
+  /// Uses the non-autosharded endpoint so we publish onto the exact pubsub
+  /// topic the Status fleet's relay+store nodes are subscribed to.
   Future<bool> relayPublish({
     required String contentTopic,
     required Uint8List payload,
     String pubsubTopic = defaultPubsubTopic,
   }) async {
     final dbg = TransportDebugger.instance;
-    final url = '$apiUrl/relay/v1/auto/messages';
+    final url = '$apiUrl/relay/v1/messages/${Uri.encodeComponent(pubsubTopic)}';
     try {
       final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
       final req = await client.postUrl(Uri.parse(url));
@@ -187,9 +182,6 @@ class WakuDaemon {
       client.close(force: true);
 
       if (resp.statusCode == 200) return true;
-      // Surface the actual server response so we can diagnose without
-      // shipping another build. Truncate so a verbose HTML error page
-      // doesn't blow up the log buffer.
       final preview = respBody.length > 200 ? '${respBody.substring(0, 200)}…' : respBody;
       dbg.log('Waku: publish HTTP ${resp.statusCode} body="$preview" url=$url');
       return false;
@@ -199,13 +191,13 @@ class WakuDaemon {
     }
   }
 
-  /// Subscribes to [contentTopic] via the auto-sharded endpoint and yields
-  /// payloads as they arrive. REST API uses polling — we GET from
-  /// `/relay/v1/auto/messages/{contentTopic}` every [intervalMs]. The server
-  /// resolves the underlying pubsub topic from the content topic.
+  /// Subscribes to [pubsubTopic] and yields payloads whose `contentTopic`
+  /// matches [contentTopic] (our per-user inbox filter on the shared mesh).
+  /// REST relay v1 needs the pubsub topic both in the subscriptions body
+  /// AND in the poll URL.
   Stream<Uint8List> relaySubscribe({
     required String contentTopic,
-    String pubsubTopic = defaultPubsubTopic, // kept for backward compat, unused
+    String pubsubTopic = defaultPubsubTopic,
     int intervalMs = 500,
   }) {
     final dbg = TransportDebugger.instance;
@@ -213,13 +205,13 @@ class WakuDaemon {
     bool running = true;
 
     () async {
-      // Register the content topic with the auto-subscriptions endpoint.
+      // Register subscription to the pubsub topic.
       try {
         final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
-        final url = '$apiUrl/relay/v1/auto/subscriptions';
+        final url = '$apiUrl/relay/v1/subscriptions';
         final req = await client.postUrl(Uri.parse(url));
         req.headers.contentType = ContentType.json;
-        req.write(jsonEncode([contentTopic]));
+        req.write(jsonEncode([pubsubTopic]));
         final resp = await req.close();
         final body = await resp.transform(utf8.decoder).join();
         client.close(force: true);
@@ -231,9 +223,9 @@ class WakuDaemon {
         dbg.log('Waku: subscribe exception $e');
       }
 
-      // Poll messages addressed to this content topic.
-      final encodedTopic = Uri.encodeComponent(contentTopic);
-      final pollUrl = '$apiUrl/relay/v1/auto/messages/$encodedTopic';
+      // Poll messages on the pubsub topic, filter by content topic locally.
+      final encodedPubsub = Uri.encodeComponent(pubsubTopic);
+      final pollUrl = '$apiUrl/relay/v1/messages/$encodedPubsub';
       while (running && !controller.isClosed) {
         try {
           final client = HttpClient()..connectionTimeout = const Duration(seconds: 3);
@@ -246,6 +238,8 @@ class WakuDaemon {
             final List<dynamic> messages = jsonDecode(body);
             for (final msg in messages) {
               if (msg is! Map) continue;
+              final ct = msg['contentTopic'] as String?;
+              if (ct != contentTopic) continue; // not for us
               final payload = msg['payload'] as String?;
               if (payload != null && payload.isNotEmpty) {
                 controller.add(base64Decode(payload));
@@ -253,7 +247,6 @@ class WakuDaemon {
             }
           }
         } catch (e) {
-          // poll errors are spammy at intervalMs cadence; log to debug only.
           debugPrint('[WakuDaemon] poll error: $e');
         }
         await Future.delayed(Duration(milliseconds: intervalMs));
@@ -265,14 +258,59 @@ class WakuDaemon {
     return controller.stream;
   }
 
-  /// Queries the Waku Store protocol for historical messages on a content topic.
-  /// This is the key feature that solves the "synchronous presence" problem:
-  /// messages sent while we were offline are retrieved from store nodes.
+  /// Cold-start fallback: when we have 0 local Waku peers, regular relay
+  /// publish dies in our own empty mesh. Lightpush forwards the message
+  /// to a remote relay node that handles the actual gossip. Returns true
+  /// when the lightpush server ACKs `relayPeerCount >= 1`.
+  ///
+  /// REST endpoint: `POST /lightpush/v1/message` (singular, NOT plural).
+  /// Body has `pubsubTopic` + `message{payload,contentTopic,timestamp}`.
+  Future<bool> lightpush({
+    required String contentTopic,
+    required Uint8List payload,
+    String pubsubTopic = defaultPubsubTopic,
+  }) async {
+    final dbg = TransportDebugger.instance;
+    final url = '$apiUrl/lightpush/v1/message';
+    try {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+      final req = await client.postUrl(Uri.parse(url));
+      req.headers.contentType = ContentType.json;
+      req.write(jsonEncode({
+        'pubsubTopic': pubsubTopic,
+        'message': {
+          'payload': base64Encode(payload),
+          'contentTopic': contentTopic,
+          'timestamp': DateTime.now().microsecondsSinceEpoch * 1000,
+        },
+      }));
+      final resp = await req.close();
+      final respBody = await resp.transform(utf8.decoder).join();
+      client.close(force: true);
+      if (resp.statusCode == 200) return true;
+      final preview = respBody.length > 200 ? '${respBody.substring(0, 200)}…' : respBody;
+      dbg.log('Waku: lightpush HTTP ${resp.statusCode} body="$preview"');
+      return false;
+    } catch (e) {
+      dbg.log('Waku: lightpush exception $e');
+      return false;
+    }
+  }
+
+  /// Queries the Waku Store protocol for historical messages on a content
+  /// topic. This is what enables async delivery — Bob publishes while Alice
+  /// is offline, the Status fleet's store nodes persist the message (≤25GB
+  /// total, ~days in practice), and Alice's app on next launch fetches it.
+  ///
+  /// Uses legacy /store/v1/messages — go-waku auto-selects a connected store
+  /// peer (no need to pass peerAddr like v3 requires), as long as DNS
+  /// discovery has populated our peer store with store-capable nodes.
   Future<List<Uint8List>> storeQuery({
     required String contentTopic,
     DateTime? startTime,
     int pageSize = 100,
   }) async {
+    final dbg = TransportDebugger.instance;
     try {
       final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
 
@@ -292,7 +330,8 @@ class WakuDaemon {
       client.close(force: true);
 
       if (resp.statusCode != 200) {
-        debugPrint('[WakuDaemon] storeQuery failed: HTTP ${resp.statusCode}');
+        final preview = body.length > 200 ? '${body.substring(0, 200)}…' : body;
+        dbg.log('Waku: storeQuery HTTP ${resp.statusCode} body="$preview"');
         return [];
       }
 
@@ -304,7 +343,7 @@ class WakuDaemon {
           .map((p) => base64Decode(p!))
           .toList();
     } catch (e) {
-      debugPrint('[WakuDaemon] storeQuery error: $e');
+      dbg.log('Waku: storeQuery exception $e');
       return [];
     }
   }
@@ -406,6 +445,16 @@ class WakuDaemon {
         // process with "flag provided but not defined".
         '--key-file=$dataDir/nodekey',
         '--store-message-db-url=sqlite3://$dataDir/store.db',
+        // Explicitly subscribe to the same pubsub topic the Status fleet
+        // publishes on. Without this go-waku defaults to the same topic
+        // anyway, but being explicit makes the intent obvious and matches
+        // the topic our REST publish/subscribe paths put in the URL.
+        '--pubsub-topic=/waku/2/default-waku/proto',
+        // Keep messages we ingest for 3 days so a contact's store query
+        // (run on their cold start) can reach back that far. Default in
+        // go-waku v0.9.0 is only 48h.
+        '--store=true',
+        '--store-message-retention-time=72h',
         // Without a discovery mechanism the daemon comes up but never peers,
         // so "running · 0 peers" forever and nothing routes. Use the Status
         // team's public wakuv2 enrtree — the relayed traffic is end-to-end
@@ -425,9 +474,6 @@ class WakuDaemon {
         // Default 1 rejects publishes with HTTP 400 "not enough peers" during
         // the 5-30s DNS-discovery bootstrap window after launch. Drop to 0 so
         // the daemon accepts the publish and gossips it once peers connect.
-        // Worst case (peers never connect): the message goes nowhere on Waku
-        // — but the parallel I2P / IPFS / Yggdrasil transports already deliver
-        // it, so the user-visible behaviour is unchanged.
         '--min-relay-peers-to-publish=0',
       ],
       environment: env,

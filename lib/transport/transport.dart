@@ -1723,12 +1723,25 @@ class WakuTransport implements PhantomTransport {
     if (_disposed) throw const TransportException('WakuTransport disposed');
 
     final topic = _contentTopic(recipientId);
-    final ok = await _daemon.relayPublish(
+    // Relay first: cheapest, gossips on our local mesh if we have peers.
+    final relayed = await _daemon.relayPublish(
       contentTopic: topic,
       payload: encryptedEnvelope,
     );
-    if (!ok) {
-      throw const TransportException('Waku relay publish failed');
+    if (relayed) return;
+
+    // Cold-start fallback: relay died (0 peers, or local mesh just doesn't
+    // include any node subscribed to this pubsub topic). Lightpush forwards
+    // the message to a remote relay node that handles the actual gossip —
+    // the message lands on Waku Store even if we ourselves never peered.
+    // This is what enables async delivery: Bob publishes from a fresh boot
+    // before any peer is connected, Alice's store query later fetches it.
+    final pushed = await _daemon.lightpush(
+      contentTopic: topic,
+      payload: encryptedEnvelope,
+    );
+    if (!pushed) {
+      throw const TransportException('Waku relay + lightpush both failed');
     }
   }
 

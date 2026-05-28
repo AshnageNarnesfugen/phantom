@@ -181,19 +181,15 @@ class WakuForegroundService : Service() {
                     "--rest-port=8645",         // pin so Dart can reach it
                     "--key-file=$dataDir/nodekey",
                     "--store-message-db-url=sqlite3://$dataDir/store.db",
-                    // Without discovery the daemon never peers; use Status'
-                    // public wakuv2 enrtree (E2E traffic is ratcheted so
-                    // the public relays only see opaque blobs).
+                    // Match Status' wakuv2 fleet pubsub topic so messages
+                    // we publish actually get gossipped+stored by them.
+                    "--pubsub-topic=/waku/2/default-waku/proto",
+                    "--store=true",
+                    "--store-message-retention-time=72h",
                     "--dns-discovery=true",
                     "--dns-discovery-url=enrtree://AOGECG2SPND25EEFMAJ5WF3KSGJNSGV356DSTL2YVLLZWIV6SAYBM@prod.wakuv2.nodes.status.im",
-                    // Android sandboxes don't expose a local DNS at [::1]:53,
-                    // so enrtree resolution fails without an explicit server.
                     "--dns-discovery-name-server=1.1.1.1",
-                    // /admin/v1/peers (used by Dart status()) requires this.
                     "--rest-admin=true",
-                    // Default 1 rejects publishes with "not enough peers"
-                    // during the bootstrap window; drop to 0 so we don't
-                    // 400 while DNS discovery is still connecting peers.
                     "--min-relay-peers-to-publish=0",
                 )
                 pb.environment()["HOME"] = dataDir
