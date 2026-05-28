@@ -138,15 +138,32 @@ class WakuDaemon {
 
   // ── Waku REST API methods ──────────────────────────────────────────────────
 
-  /// Publishes a message to a Waku content topic via the REST API.
-  /// Content topic format: /phantom/1/{phantomId}/proto
+  /// Waku has two layers of topics that we kept conflating:
+  ///   - pubsub topic: gossipsub routing layer. The daemon subscribes to ONE
+  ///     by default (`/waku/2/default-waku/proto`); that's where peers form
+  ///     a mesh and gossip messages.
+  ///   - content topic: application-level filter inside each WakuMessage.
+  ///     We use `/phantom/1/<phantomId>/proto` so a receiver can pick out
+  ///     messages addressed to them from the shared pubsub firehose.
+  ///
+  /// The go-waku REST API needs the *pubsub* topic in the URL path
+  /// (URL-encoded), and the content topic in the message body. Earlier
+  /// versions of this file passed the content topic to the URL path and
+  /// to /relay/v1/subscriptions, which returned 404 ("relayPublish failed"
+  /// with no body) and silently subscribed to nothing.
+  static const String defaultPubsubTopic = '/waku/2/default-waku/proto';
+
+  /// Publishes [payload] to the shared pubsub topic, tagged with the
+  /// recipient's [contentTopic] so only their client picks it up.
   Future<bool> relayPublish({
     required String contentTopic,
     required Uint8List payload,
+    String pubsubTopic = defaultPubsubTopic,
   }) async {
     try {
       final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
-      final req = await client.postUrl(Uri.parse('$apiUrl/relay/v1/messages'));
+      final url = '$apiUrl/relay/v1/messages/${Uri.encodeComponent(pubsubTopic)}';
+      final req = await client.postUrl(Uri.parse(url));
       req.headers.contentType = ContentType.json;
 
       final body = jsonEncode({
@@ -169,22 +186,26 @@ class WakuDaemon {
     }
   }
 
-  /// Subscribes to a Waku content topic. The REST API uses polling
-  /// (GET /relay/v1/messages/{topic}) — we poll at [intervalMs] intervals.
+  /// Subscribes to the shared pubsub topic and yields only payloads whose
+  /// content topic matches [contentTopic] (our own per-user channel).
+  /// REST API uses polling — we GET messages from the pubsub topic every
+  /// [intervalMs].
   Stream<Uint8List> relaySubscribe({
     required String contentTopic,
+    String pubsubTopic = defaultPubsubTopic,
     int intervalMs = 500,
   }) {
     final controller = StreamController<Uint8List>();
     bool running = true;
 
     () async {
-      // First, register subscription
+      // Register subscription to the pubsub topic (not the content topic —
+      // that's what subscriptions take in the relay v1 API).
       try {
         final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
         final req = await client.postUrl(Uri.parse('$apiUrl/relay/v1/subscriptions'));
         req.headers.contentType = ContentType.json;
-        req.write(jsonEncode([contentTopic]));
+        req.write(jsonEncode([pubsubTopic]));
         final resp = await req.close();
         await resp.drain<void>();
         client.close(force: true);
@@ -192,11 +213,11 @@ class WakuDaemon {
         debugPrint('[WakuDaemon] subscription registration error: $e');
       }
 
-      // Then poll for messages
+      // Poll messages on that pubsub topic, filter by content topic locally.
       while (running && !controller.isClosed) {
         try {
           final client = HttpClient()..connectionTimeout = const Duration(seconds: 3);
-          final encodedTopic = Uri.encodeComponent(contentTopic);
+          final encodedTopic = Uri.encodeComponent(pubsubTopic);
           final req = await client.getUrl(
             Uri.parse('$apiUrl/relay/v1/messages/$encodedTopic'),
           );
@@ -207,6 +228,9 @@ class WakuDaemon {
           if (resp.statusCode == 200 && body.isNotEmpty) {
             final List<dynamic> messages = jsonDecode(body);
             for (final msg in messages) {
+              if (msg is! Map) continue;
+              final ct = msg['contentTopic'] as String?;
+              if (ct != contentTopic) continue; // not for us
               final payload = msg['payload'] as String?;
               if (payload != null && payload.isNotEmpty) {
                 controller.add(base64Decode(payload));
