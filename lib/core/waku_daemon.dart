@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
+import 'transport_debugger.dart';
 
 /// Manages the bundled go-waku daemon on Android for message relay/store.
 ///
@@ -153,16 +154,24 @@ class WakuDaemon {
   /// with no body) and silently subscribed to nothing.
   static const String defaultPubsubTopic = '/waku/2/default-waku/proto';
 
-  /// Publishes [payload] to the shared pubsub topic, tagged with the
-  /// recipient's [contentTopic] so only their client picks it up.
+  /// Publishes [payload] tagged with [contentTopic] to the Waku relay.
+  ///
+  /// Uses go-waku's auto-sharded endpoint — `/relay/v1/auto/messages` —
+  /// which figures out the pubsub topic from the content topic on the
+  /// server side. The non-auto variant requires the pubsub topic in the
+  /// URL path, but the `%2F` encoding of the topic's leading slashes hits
+  /// router-level routing inconsistencies (chi-mux et al. don't reliably
+  /// decode `%2F` inside path params), which manifested as a generic 404
+  /// and an opaque "Waku relay publish failed".
   Future<bool> relayPublish({
     required String contentTopic,
     required Uint8List payload,
     String pubsubTopic = defaultPubsubTopic,
   }) async {
+    final dbg = TransportDebugger.instance;
+    final url = '$apiUrl/relay/v1/auto/messages';
     try {
       final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
-      final url = '$apiUrl/relay/v1/messages/${Uri.encodeComponent(pubsubTopic)}';
       final req = await client.postUrl(Uri.parse(url));
       req.headers.contentType = ContentType.json;
 
@@ -178,49 +187,57 @@ class WakuDaemon {
       client.close(force: true);
 
       if (resp.statusCode == 200) return true;
-      debugPrint('[WakuDaemon] relayPublish failed: HTTP ${resp.statusCode} $respBody');
+      // Surface the actual server response so we can diagnose without
+      // shipping another build. Truncate so a verbose HTML error page
+      // doesn't blow up the log buffer.
+      final preview = respBody.length > 200 ? '${respBody.substring(0, 200)}…' : respBody;
+      dbg.log('Waku: publish HTTP ${resp.statusCode} body="$preview" url=$url');
       return false;
     } catch (e) {
-      debugPrint('[WakuDaemon] relayPublish error: $e');
+      dbg.log('Waku: publish exception $e url=$url');
       return false;
     }
   }
 
-  /// Subscribes to the shared pubsub topic and yields only payloads whose
-  /// content topic matches [contentTopic] (our own per-user channel).
-  /// REST API uses polling — we GET messages from the pubsub topic every
-  /// [intervalMs].
+  /// Subscribes to [contentTopic] via the auto-sharded endpoint and yields
+  /// payloads as they arrive. REST API uses polling — we GET from
+  /// `/relay/v1/auto/messages/{contentTopic}` every [intervalMs]. The server
+  /// resolves the underlying pubsub topic from the content topic.
   Stream<Uint8List> relaySubscribe({
     required String contentTopic,
-    String pubsubTopic = defaultPubsubTopic,
+    String pubsubTopic = defaultPubsubTopic, // kept for backward compat, unused
     int intervalMs = 500,
   }) {
+    final dbg = TransportDebugger.instance;
     final controller = StreamController<Uint8List>();
     bool running = true;
 
     () async {
-      // Register subscription to the pubsub topic (not the content topic —
-      // that's what subscriptions take in the relay v1 API).
+      // Register the content topic with the auto-subscriptions endpoint.
       try {
         final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
-        final req = await client.postUrl(Uri.parse('$apiUrl/relay/v1/subscriptions'));
+        final url = '$apiUrl/relay/v1/auto/subscriptions';
+        final req = await client.postUrl(Uri.parse(url));
         req.headers.contentType = ContentType.json;
-        req.write(jsonEncode([pubsubTopic]));
+        req.write(jsonEncode([contentTopic]));
         final resp = await req.close();
-        await resp.drain<void>();
+        final body = await resp.transform(utf8.decoder).join();
         client.close(force: true);
+        if (resp.statusCode != 200) {
+          final preview = body.length > 200 ? '${body.substring(0, 200)}…' : body;
+          dbg.log('Waku: subscribe HTTP ${resp.statusCode} body="$preview"');
+        }
       } catch (e) {
-        debugPrint('[WakuDaemon] subscription registration error: $e');
+        dbg.log('Waku: subscribe exception $e');
       }
 
-      // Poll messages on that pubsub topic, filter by content topic locally.
+      // Poll messages addressed to this content topic.
+      final encodedTopic = Uri.encodeComponent(contentTopic);
+      final pollUrl = '$apiUrl/relay/v1/auto/messages/$encodedTopic';
       while (running && !controller.isClosed) {
         try {
           final client = HttpClient()..connectionTimeout = const Duration(seconds: 3);
-          final encodedTopic = Uri.encodeComponent(pubsubTopic);
-          final req = await client.getUrl(
-            Uri.parse('$apiUrl/relay/v1/messages/$encodedTopic'),
-          );
+          final req = await client.getUrl(Uri.parse(pollUrl));
           final resp = await req.close();
           final body = await resp.transform(utf8.decoder).join();
           client.close(force: true);
@@ -229,8 +246,6 @@ class WakuDaemon {
             final List<dynamic> messages = jsonDecode(body);
             for (final msg in messages) {
               if (msg is! Map) continue;
-              final ct = msg['contentTopic'] as String?;
-              if (ct != contentTopic) continue; // not for us
               final payload = msg['payload'] as String?;
               if (payload != null && payload.isNotEmpty) {
                 controller.add(base64Decode(payload));
@@ -238,6 +253,7 @@ class WakuDaemon {
             }
           }
         } catch (e) {
+          // poll errors are spammy at intervalMs cadence; log to debug only.
           debugPrint('[WakuDaemon] poll error: $e');
         }
         await Future.delayed(Duration(milliseconds: intervalMs));
