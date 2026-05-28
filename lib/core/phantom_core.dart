@@ -1140,7 +1140,26 @@ class PhantomCore {
         return;
       }
 
-      // Step 5: Mesh is alive! Reset session and send handshake
+      // Step 5: Mesh is alive. Decide whether to also reset the ratchet
+      // session. If we decrypted a real message from this contact within
+      // the last [_recentDecryptWindow], the session is healthy — resetting
+      // it would destroy a working ratchet, force both sides into a fresh
+      // X3DH, and burn ~50s of tiebreaker / auto-revive churn before they
+      // reconverge. During that window the user can't actually send (any
+      // typed message rides the half-built session and tiebreaker-drops on
+      // the peer). Skip the reset and just announce the new transport is
+      // ready.
+      final lastOk = _lastSuccessfulDecryptAt[contactId];
+      final sessionHealthy = lastOk != null &&
+          DateTime.now().difference(lastOk) < _recentDecryptWindow;
+      if (sessionHealthy) {
+        dbg.log('REVIVE: ✓ network refreshed; session healthy '
+            '(last decrypt ${DateTime.now().difference(lastOk).inSeconds}s ago)'
+            ' — skipping handshake reset');
+        yield 'success';
+        return;
+      }
+
       yield 'Sending handshake…';
       await resetSession(contactId);
       try {
