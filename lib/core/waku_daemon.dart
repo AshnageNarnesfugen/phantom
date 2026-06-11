@@ -326,7 +326,10 @@ class WakuDaemon {
   /// Uses legacy /store/v1/messages — go-waku auto-selects a connected store
   /// peer (no need to pass peerAddr like v3 requires), as long as DNS
   /// discovery has populated our peer store with store-capable nodes.
-  Future<List<({Uint8List payload, int timestampNs})>> storeQuery({
+  /// Returns null on failure (daemon unreachable, no store peers yet, HTTP
+  /// error) so the caller can retry later WITHOUT advancing its cursor — a
+  /// failed query is not the same as "no offline messages".
+  Future<List<({Uint8List payload, int timestampNs})>?> storeQuery({
     required String contentTopic,
     DateTime? startTime,
     int pageSize = 100,
@@ -353,7 +356,7 @@ class WakuDaemon {
       if (resp.statusCode != 200) {
         final preview = body.length > 200 ? '${body.substring(0, 200)}…' : body;
         dbg.log('Waku: storeQuery HTTP ${resp.statusCode} body="$preview"');
-        return [];
+        return null;
       }
 
       final json = jsonDecode(body) as Map<String, dynamic>;
@@ -371,7 +374,7 @@ class WakuDaemon {
       return out;
     } catch (e) {
       dbg.log('Waku: storeQuery exception $e');
-      return [];
+      return null;
     }
   }
 

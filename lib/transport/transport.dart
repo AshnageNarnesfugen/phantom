@@ -255,33 +255,27 @@ class TransportManager {
 
     final dbg = TransportDebugger.instance;
 
-    if (priority == TransportPriority.control) {
-      final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
-      final dest = _i2pDests[recipientId];
-      if (i2p != null && dest != null && i2p.isAvailable) {
-        try {
-          dbg.log('TRANSPORT: control via I2P → ${dest.substring(0, 12)}…');
-          await i2p
-              .publishToDest(dest: dest, data: encryptedEnvelope)
-              .timeout(const Duration(seconds: 12));
-          dbg.log('TRANSPORT: control delivered via I2P');
-          return;
-        } catch (e) {
-          dbg.log('TRANSPORT: I2P control failed ($e) — falling back to IPFS');
-        }
-      } else {
-        dbg.log('TRANSPORT: I2P unavailable for control '
-            '(i2p=${i2p != null} dest=${dest != null} ready=${i2p?.isAvailable ?? false}) — using IPFS');
-      }
-    }
+    // NOTE: control frames used to short-circuit after a single I2P datagram
+    // send. That "success" only means the local SAM bridge accepted the UDP
+    // packet — I2P datagrams are fire-and-forget with zero delivery feedback,
+    // so a handshake INIT could ride one unreliable path and silently vanish
+    // (observed in the field: 12 control frames "delivered via I2P", peer
+    // never saw any of them). Control now fans out to every backend like
+    // broadcast; the receiver dedupes, so redundancy is free reliability.
 
     final futures = <Future<void>>[];
 
     // ── Waku: preferred for text messages and handshakes ──────────────────
     final waku = _activeTransports.whereType<WakuTransport>().firstOrNull;
+    bool wakuHasPeers = false;
     if (waku != null && waku.isAvailable) {
+      // Live peer check: the daemon being up says nothing about gossip
+      // reach. With --min-relay-peers-to-publish=0 a relay publish into an
+      // empty mesh returns HTTP 200 and goes nowhere.
+      wakuHasPeers = await waku.hasRelayPeers();
       futures.add(() async {
-        dbg.log('TRANSPORT: firing Waku for ${recipientId.substring(0, 8)}…');
+        dbg.log('TRANSPORT: firing Waku for ${recipientId.substring(0, 8)}… '
+            '(peers=$wakuHasPeers)');
         try {
           await waku.publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope);
           dbg.log('TRANSPORT: Waku delivery OK');
@@ -329,9 +323,16 @@ class TransportManager {
       }());
     }
 
-    // IPFS: only used as fallback when Waku is unavailable, or for broadcast
+    // IPFS: fallback when Waku can't actually gossip (down OR zero peers),
+    // and always for handshake / control / broadcast frames — session
+    // establishment is too important to trust a single backend.
     final ipfsList = _activeTransports.whereType<IpfsTransport>();
-    if (waku == null || !waku.isAvailable || priority == TransportPriority.broadcast) {
+    if (waku == null ||
+        !waku.isAvailable ||
+        !wakuHasPeers ||
+        isHandshake ||
+        priority == TransportPriority.control ||
+        priority == TransportPriority.broadcast) {
       for (final ipfs in ipfsList) {
         if (isHandshake ||
             priority == TransportPriority.control ||
@@ -1752,6 +1753,19 @@ class WakuTransport implements PhantomTransport {
     }
   }
 
+  /// Live peer-count probe against the local daemon. The daemon answering
+  /// /debug/v1/info (what [checkAvailability] verifies) doesn't mean our
+  /// gossip reaches anyone — during the DNS-discovery bootstrap window the
+  /// node is "running · 0 peers" and relay publishes die in the empty mesh.
+  Future<bool> hasRelayPeers() async {
+    try {
+      final st = await _daemon.status();
+      return st.running && st.peers > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
   @override
   Future<void> publish({
     required String recipientId,
@@ -1760,24 +1774,32 @@ class WakuTransport implements PhantomTransport {
     if (_disposed) throw const TransportException('WakuTransport disposed');
 
     final topic = _contentTopic(recipientId);
-    // Relay first: cheapest, gossips on our local mesh if we have peers.
-    final relayed = await _daemon.relayPublish(
-      contentTopic: topic,
-      payload: encryptedEnvelope,
-    );
-    if (relayed) return;
 
-    // Cold-start fallback: relay died (0 peers, or local mesh just doesn't
-    // include any node subscribed to this pubsub topic). Lightpush forwards
-    // the message to a remote relay node that handles the actual gossip —
-    // the message lands on Waku Store even if we ourselves never peered.
-    // This is what enables async delivery: Bob publishes from a fresh boot
-    // before any peer is connected, Alice's store query later fetches it.
+    // Relay gossips on our local mesh — but with
+    // --min-relay-peers-to-publish=0 it returns HTTP 200 even into an empty
+    // mesh, so a 200 with zero peers is NOT delivery. Only count relay as a
+    // success when we actually have peers to gossip to.
+    final hasPeers = await hasRelayPeers();
+    bool relayed = false;
+    if (hasPeers) {
+      relayed = await _daemon.relayPublish(
+        contentTopic: topic,
+        payload: encryptedEnvelope,
+      );
+    }
+
+    // Lightpush hands the message to a remote relay node that gossips on our
+    // behalf and lands it on Waku Store — this is what makes async delivery
+    // work from a fresh boot before any peer is connected. Fire it even when
+    // relay "succeeded": relay peers ≠ peers subscribed to this pubsub
+    // topic, and the lightpush ACK (relayPeerCount ≥ 1 on the remote node)
+    // is the only end-to-end-ish confirmation we get.
     final pushed = await _daemon.lightpush(
       contentTopic: topic,
       payload: encryptedEnvelope,
     );
-    if (!pushed) {
+
+    if (!relayed && !pushed) {
       throw const TransportException('Waku relay + lightpush both failed');
     }
   }
@@ -1790,53 +1812,34 @@ class WakuTransport implements PhantomTransport {
 
     final controller = StreamController<IncomingEnvelope>();
 
-    // 1. First, query the Store for any messages we missed while offline.
-    //    Resume from the last persisted query time (minus a small overlap for
-    //    clock skew) so old, already-consumed frames are not replayed on
-    //    every app start. Paginate so a backlog larger than one page is not
-    //    silently truncated (ascending order would otherwise return only the
-    //    OLDEST page and drop the newest messages).
-    () async {
-      try {
-        final lastUs = await _loadLastStoreQueryUs?.call();
-        DateTime? startTime = lastUs != null
-            ? DateTime.fromMicrosecondsSinceEpoch(lastUs)
-                .subtract(const Duration(minutes: 5))
-            : null;
-        dbg.log('Waku: querying store for offline messages '
-            '(since ${startTime?.toIso8601String() ?? 'beginning'})…');
-        const pageSize = 100;
-        int total = 0;
-        for (int page = 0; page < 10; page++) {
-          final batch = await _daemon.storeQuery(
-            contentTopic: topic,
-            startTime: startTime,
-            pageSize: pageSize,
-          );
-          for (final entry in batch) {
-            if (controller.isClosed) break;
-            controller.add(IncomingEnvelope(
-              data: entry.payload,
-              transportName: 'Waku-Store',
-              receivedAt: DateTime.now(),
-            ));
-          }
-          total += batch.length;
-          if (batch.length < pageSize) break;
-          final maxNs = batch
-              .map((e) => e.timestampNs)
-              .fold<int>(0, (m, t) => t > m ? t : m);
-          if (maxNs <= 0) break;
-          startTime = DateTime.fromMicrosecondsSinceEpoch(maxNs ~/ 1000 + 1);
-        }
-        dbg.log('Waku: store returned $total message(s)');
-        await _saveLastStoreQueryUs
-            ?.call(DateTime.now().microsecondsSinceEpoch);
-      } catch (e) {
-        dbg.log('Waku: store query error: $e');
-      }
+    // Set once the offline backlog has been fetched successfully this
+    // session. Live messages may only advance the persisted store cursor
+    // AFTER that — otherwise a live frame arriving while the store is still
+    // unreachable (DNS discovery bootstrapping) would move the cursor past
+    // offline messages we never fetched, losing them permanently.
+    bool storeCursorReady = false;
 
-      // 2. Then subscribe to live relay messages
+    // 1. Offline backlog via Waku Store — with retry. Store-capable peers
+    //    come from DNS discovery and routinely take 15-60s to appear after a
+    //    cold start; the first query failing is the NORM, not the exception
+    //    (observed: HTTP 500 "no suitable peers found" at t+0s). A
+    //    single-shot query meant offline messages were never fetched for the
+    //    entire session.
+    unawaited(() async {
+      for (int attempt = 1; attempt <= 40; attempt++) {
+        if (_disposed || controller.isClosed) return;
+        final ok = await _fetchStoreBacklog(topic, controller, dbg);
+        if (ok) {
+          storeCursorReady = true;
+          return;
+        }
+        await Future.delayed(const Duration(seconds: 15));
+      }
+      dbg.log('Waku: ✗ store backlog never fetched (no store peers in 10m)');
+    }());
+
+    // 2. Live relay messages, immediately and in parallel with the backlog.
+    () async {
       try {
         final stream = _daemon.relaySubscribe(contentTopic: topic);
         await for (final payload in stream) {
@@ -1848,8 +1851,10 @@ class WakuTransport implements PhantomTransport {
           ));
           // Live delivery advances the store cursor too — anything received
           // here is already consumed, so the next cold-start query can skip it.
-          unawaited(_saveLastStoreQueryUs
-              ?.call(DateTime.now().microsecondsSinceEpoch));
+          if (storeCursorReady) {
+            unawaited(_saveLastStoreQueryUs
+                ?.call(DateTime.now().microsecondsSinceEpoch));
+          }
         }
       } catch (e) {
         dbg.log('Waku: relay subscription error: $e');
@@ -1858,6 +1863,55 @@ class WakuTransport implements PhantomTransport {
     }();
 
     return controller.stream;
+  }
+
+  /// One full (paginated) store fetch starting at the persisted cursor minus
+  /// a clock-skew overlap. Returns true and persists the new cursor only when
+  /// every page query succeeded; a failed query returns false WITHOUT
+  /// touching the cursor so the retry loop can try again.
+  Future<bool> _fetchStoreBacklog(String topic,
+      StreamController<IncomingEnvelope> controller, TransportDebugger dbg) async {
+    try {
+      final lastUs = await _loadLastStoreQueryUs?.call();
+      DateTime? startTime = lastUs != null
+          ? DateTime.fromMicrosecondsSinceEpoch(lastUs)
+              .subtract(const Duration(minutes: 5))
+          : null;
+      const pageSize = 100;
+      int total = 0;
+      for (int page = 0; page < 10; page++) {
+        final batch = await _daemon.storeQuery(
+          contentTopic: topic,
+          startTime: startTime,
+          pageSize: pageSize,
+        );
+        if (batch == null) {
+          dbg.log('Waku: store query failed (page $page) — will retry');
+          return false;
+        }
+        for (final entry in batch) {
+          if (controller.isClosed) break;
+          controller.add(IncomingEnvelope(
+            data: entry.payload,
+            transportName: 'Waku-Store',
+            receivedAt: DateTime.now(),
+          ));
+        }
+        total += batch.length;
+        if (batch.length < pageSize) break;
+        final maxNs = batch
+            .map((e) => e.timestampNs)
+            .fold<int>(0, (m, t) => t > m ? t : m);
+        if (maxNs <= 0) break;
+        startTime = DateTime.fromMicrosecondsSinceEpoch(maxNs ~/ 1000 + 1);
+      }
+      dbg.log('Waku: ✓ store backlog fetched ($total message(s))');
+      await _saveLastStoreQueryUs?.call(DateTime.now().microsecondsSinceEpoch);
+      return true;
+    } catch (e) {
+      dbg.log('Waku: store backlog error: $e');
+      return false;
+    }
   }
 
   @override
