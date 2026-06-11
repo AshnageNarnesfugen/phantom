@@ -144,16 +144,19 @@ class WakuDaemon {
   ///     intercommunicate must subscribe to the same pubsub topic.
   ///   - content topic: application-level filter inside each WakuMessage.
   ///
-  /// We use the legacy named pubsub topic `/waku/2/default-waku/proto`
-  /// because that's what the Status `wakuv2.nodes.status.im` fleet subscribes
-  /// to (cluster 0, pre-TWN). The newer autosharded endpoints derive shards
-  /// like `/waku/2/rs/0/N` instead — but Status' legacy fleet doesn't
-  /// gossip on those, so messages published via auto endpoints succeed
-  /// locally but never leave our mesh (Status store nodes never see them).
+  /// We ride the Status `status.prod` fleet's static shard: cluster 16,
+  /// shard 32 — the shard status-go uses for 1:1 chats, so its relay nodes
+  /// gossip it and its six dedicated store nodes persist it.
+  ///
+  /// The previous topic `/waku/2/default-waku/proto` belonged to the legacy
+  /// `wakuv2.prod` fleet (cluster 0), which Status retired: it no longer
+  /// appears on fleets.status.im, and its last nodes refuse dials ("dial
+  /// backoff"), which is why storeQuery failed forever with "no suitable
+  /// peers found" and lightpush got HTTP 503.
   ///
   /// Per-user content topic: `/phantom/1/<phantomId>/proto`. The receiver
   /// filters its inbox to messages with its own content topic.
-  static const String defaultPubsubTopic = '/waku/2/default-waku/proto';
+  static const String defaultPubsubTopic = '/waku/2/rs/16/32';
 
   /// Publishes [payload] tagged with [contentTopic] onto [pubsubTopic].
   /// Uses the non-autosharded endpoint so we publish onto the exact pubsub
@@ -475,30 +478,38 @@ class WakuDaemon {
         // process with "flag provided but not defined".
         '--key-file=$dataDir/nodekey',
         '--store-message-db-url=sqlite3://$dataDir/store.db',
-        // Explicitly subscribe to the same pubsub topic the Status fleet
-        // publishes on. Without this go-waku defaults to the same topic
-        // anyway, but being explicit makes the intent obvious and matches
-        // the topic our REST publish/subscribe paths put in the URL.
-        '--pubsub-topic=/waku/2/default-waku/proto',
+        // status.prod is a static-sharding fleet: cluster 16, and shard 32
+        // is where status-go puts 1:1 traffic. Both flags must agree with
+        // defaultPubsubTopic or relay/store REST calls 404 on the topic.
+        '--cluster-id=16',
+        '--pubsub-topic=/waku/2/rs/16/32',
         // Keep messages we ingest for 3 days so a contact's store query
         // (run on their cold start) can reach back that far. Default in
         // go-waku v0.9.0 is only 48h.
         '--store=true',
         '--store-message-retention-time=72h',
         // Without a discovery mechanism the daemon comes up but never peers,
-        // so "running · 0 peers" forever and nothing routes. Use the Status
-        // team's public wakuv2 enrtree — the relayed traffic is end-to-end
-        // encrypted by our ratchet anyway, so the public relay nodes only
-        // see opaque blobs.
+        // so "running · 0 peers" forever and nothing routes. The relayed
+        // traffic is end-to-end encrypted by our ratchet anyway, so the
+        // public fleet nodes only see opaque blobs.
+        //
+        // The old wakuv2.prod enrtrees (AOGECG2S/ANEDLO25 keys) are gone —
+        // that fleet was retired and its nodes sit in permanent dial
+        // backoff, which is why storeQuery returned "no suitable peers
+        // found" for entire sessions. This is status.prod's boot enrtree
+        // (from status-go params/cluster.go).
         '--dns-discovery=true',
-        // Two enrtree URLs for the same Status fleet — they advertise
-        // overlapping but distinct peer subsets. The first (AOGECG2S key)
-        // gave us relay peers but no store-capable ones, so our storeQuery
-        // returned HTTP 500 "no suitable peers found". The second key
-        // (ANEDLO25) is what status-im/infra-nim-waku actually publishes
-        // for the wakuv2-prod fleet — including its store/lightpush nodes.
-        '--dns-discovery-url=enrtree://AOGECG2SPND25EEFMAJ5WF3KSGJNSGV356DSTL2YVLLZWIV6SAYBM@prod.wakuv2.nodes.status.im',
-        '--dns-discovery-url=enrtree://ANEDLO25QVUGJOUTQFRYKWX6P4Z4GKVESBMHML7DZ6YK4LGS5FC5O@prod.wakuv2.nodes.status.im',
+        '--dns-discovery-url=enrtree://AMOJVZX4V6EXP7NTJPMAYJYST2QP6AJXYW76IU6VGJS7UVSNDYZG4@boot.prod.status.nodes.status.im',
+        // Pin store nodes (one per region, from fleets.status.im) as static
+        // peers so the peer manager always has store/lightpush-capable
+        // peers even when DNS discovery is slow, and our relay gossip has a
+        // direct path to a node that persists it.
+        '--staticnode=/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT',
+        '--staticnode=/dns4/store-01.gc-us-central1-a.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmMELCo218hncCtTvC2Dwbej3rbyHQcR8erXNnKGei7WPZ',
+        '--staticnode=/dns4/store-01.ac-cn-hongkong-c.status.prod.status.im/tcp/30303/p2p/16Uiu2HAm2M7xs7cLPc3jamawkEqbr7cUJX11uvY7LxQ6WFUdUKUT',
+        // Default peer for store client queries (with do-ams3 as primary;
+        // the staticnodes above are fallbacks the peer manager can select).
+        '--storenode=/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT',
         // Pin the resolver. Android sandboxes don't expose a local DNS at
         // [::1]:53 (Waydroid logged "connection refused"), so without this
         // the enrtree lookup fails and no peers are ever discovered.

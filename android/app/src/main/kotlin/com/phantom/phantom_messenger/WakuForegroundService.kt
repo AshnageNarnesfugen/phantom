@@ -181,18 +181,26 @@ class WakuForegroundService : Service() {
                     "--rest-port=8645",         // pin so Dart can reach it
                     "--key-file=$dataDir/nodekey",
                     "--store-message-db-url=sqlite3://$dataDir/store.db",
-                    // Match Status' wakuv2 fleet pubsub topic so messages
-                    // we publish actually get gossipped+stored by them.
-                    "--pubsub-topic=/waku/2/default-waku/proto",
+                    // status.prod fleet: cluster 16, shard 32 (status-go's
+                    // 1:1 shard). The old wakuv2.prod fleet (cluster 0,
+                    // /waku/2/default-waku/proto) was retired — its nodes
+                    // sit in permanent dial backoff, so store queries
+                    // failed with "no suitable peers found" forever.
+                    // Must match WakuDaemon.defaultPubsubTopic.
+                    "--cluster-id=16",
+                    "--pubsub-topic=/waku/2/rs/16/32",
                     "--store=true",
                     "--store-message-retention-time=72h",
                     "--dns-discovery=true",
-                    // Two enrtree URLs — second key (ANEDLO25) is what
-                    // status-im/infra-nim-waku publishes for the fleet's
-                    // store/lightpush nodes; first one returned relay-only.
-                    "--dns-discovery-url=enrtree://AOGECG2SPND25EEFMAJ5WF3KSGJNSGV356DSTL2YVLLZWIV6SAYBM@prod.wakuv2.nodes.status.im",
-                    "--dns-discovery-url=enrtree://ANEDLO25QVUGJOUTQFRYKWX6P4Z4GKVESBMHML7DZ6YK4LGS5FC5O@prod.wakuv2.nodes.status.im",
+                    "--dns-discovery-url=enrtree://AMOJVZX4V6EXP7NTJPMAYJYST2QP6AJXYW76IU6VGJS7UVSNDYZG4@boot.prod.status.nodes.status.im",
                     "--dns-discovery-name-server=1.1.1.1",
+                    // Pinned status.prod store nodes (one per region, from
+                    // fleets.status.im) — guarantees store/lightpush-capable
+                    // peers even when DNS discovery is slow.
+                    "--staticnode=/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT",
+                    "--staticnode=/dns4/store-01.gc-us-central1-a.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmMELCo218hncCtTvC2Dwbej3rbyHQcR8erXNnKGei7WPZ",
+                    "--staticnode=/dns4/store-01.ac-cn-hongkong-c.status.prod.status.im/tcp/30303/p2p/16Uiu2HAm2M7xs7cLPc3jamawkEqbr7cUJX11uvY7LxQ6WFUdUKUT",
+                    "--storenode=/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT",
                     "--rest-admin=true",
                     "--min-relay-peers-to-publish=0",
                 )
