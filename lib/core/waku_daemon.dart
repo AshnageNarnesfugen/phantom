@@ -204,8 +204,11 @@ class WakuDaemon {
     final controller = StreamController<Uint8List>();
     bool running = true;
 
-    () async {
-      // Register subscription to the pubsub topic.
+    // Registers the pubsub-topic subscription with the local daemon. Returns
+    // true on HTTP 200. Must succeed before polls return anything; the daemon
+    // may not be up yet when the stream is first created (cold start), so the
+    // poll loop below re-attempts registration until it sticks.
+    Future<bool> register() async {
       try {
         final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
         final url = '$apiUrl/relay/v1/subscriptions';
@@ -219,15 +222,29 @@ class WakuDaemon {
           final preview = body.length > 200 ? '${body.substring(0, 200)}…' : body;
           dbg.log('Waku: subscribe HTTP ${resp.statusCode} body="$preview"');
         }
+        return resp.statusCode == 200;
       } catch (e) {
         dbg.log('Waku: subscribe exception $e');
+        return false;
       }
+    }
+
+    () async {
+      bool subscribed = await register();
 
       // Poll messages on the pubsub topic, filter by content topic locally.
       final encodedPubsub = Uri.encodeComponent(pubsubTopic);
-      final pollUrl = '$apiUrl/relay/v1/messages/$encodedPubsub';
       while (running && !controller.isClosed) {
+        if (!subscribed) {
+          await Future.delayed(const Duration(seconds: 3));
+          if (!running || controller.isClosed) break;
+          subscribed = await register();
+          continue;
+        }
         try {
+          // Recompute per iteration: apiUrl can change when the dynamic
+          // REST port is discovered after this stream was created.
+          final pollUrl = '$apiUrl/relay/v1/messages/$encodedPubsub';
           final client = HttpClient()..connectionTimeout = const Duration(seconds: 3);
           final req = await client.getUrl(Uri.parse(pollUrl));
           final resp = await req.close();
@@ -245,9 +262,13 @@ class WakuDaemon {
                 controller.add(base64Decode(payload));
               }
             }
+          } else if (resp.statusCode != 200) {
+            // Daemon restarted or dropped the subscription — re-register.
+            subscribed = false;
           }
         } catch (e) {
           debugPrint('[WakuDaemon] poll error: $e');
+          subscribed = false;
         }
         await Future.delayed(Duration(milliseconds: intervalMs));
       }
@@ -305,7 +326,7 @@ class WakuDaemon {
   /// Uses legacy /store/v1/messages — go-waku auto-selects a connected store
   /// peer (no need to pass peerAddr like v3 requires), as long as DNS
   /// discovery has populated our peer store with store-capable nodes.
-  Future<List<Uint8List>> storeQuery({
+  Future<List<({Uint8List payload, int timestampNs})>> storeQuery({
     required String contentTopic,
     DateTime? startTime,
     int pageSize = 100,
@@ -337,11 +358,17 @@ class WakuDaemon {
 
       final json = jsonDecode(body) as Map<String, dynamic>;
       final messages = json['messages'] as List<dynamic>? ?? [];
-      return messages
-          .map((m) => m['payload'] as String?)
-          .where((p) => p != null && p.isNotEmpty)
-          .map((p) => base64Decode(p!))
-          .toList();
+      final out = <({Uint8List payload, int timestampNs})>[];
+      for (final m in messages) {
+        if (m is! Map) continue;
+        final p = m['payload'] as String?;
+        if (p == null || p.isEmpty) continue;
+        out.add((
+          payload: base64Decode(p),
+          timestampNs: (m['timestamp'] as num?)?.toInt() ?? 0,
+        ));
+      }
+      return out;
     } catch (e) {
       dbg.log('Waku: storeQuery exception $e');
       return [];

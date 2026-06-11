@@ -61,9 +61,15 @@ class _ChatScreenState extends State<ChatScreen> {
         if (id == widget.contactId && mounted) setState(() {});
       });
       // Reload contact-derived display name when nickname/alias change so
-      // the AppBar updates without a screen pop/push.
+      // the AppBar updates without a screen pop/push. The same stream fires
+      // when a media message finishes downloading from IPFS, so reload the
+      // message list too — that's how a "[image]" placeholder becomes the
+      // actual picture without leaving the chat.
       _contactSub = core.contactChanges.listen((id) {
-        if (id == widget.contactId) _refreshDisplayName(core);
+        if (id == widget.contactId) {
+          _refreshDisplayName(core);
+          _loadMessages(core);
+        }
       });
       _refreshDisplayName(core);
       _loadMessages(core);
@@ -195,6 +201,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final msgs = await core.getMessages(widget.contactId, limit: 100);
     if (!mounted) return;
     setState(() => _messages = msgs);
+    // Retry any media whose IPFS download failed earlier (daemon still
+    // bootstrapping, sender briefly offline). No-op when all are resolved.
+    unawaited(core.resolvePendingMedia(widget.contactId));
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
 
     // Mark all unread incoming messages as read and notify the sender.

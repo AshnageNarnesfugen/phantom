@@ -111,9 +111,14 @@ class TransportManager {
     String? yggdrasilAddress,
     Future<String?> Function()? i2pLoadKey,
     Future<void> Function(String)? i2pPersistKey,
+    Future<int?> Function()? wakuLoadLastStoreUs,
+    Future<void> Function(int)? wakuSaveLastStoreUs,
   }) : _transports = [
           // Waku: primary messaging transport (text, handshakes, metadata)
-          WakuTransport(),
+          WakuTransport(
+            loadLastStoreQueryUs: wakuLoadLastStoreUs,
+            saveLastStoreQueryUs: wakuSaveLastStoreUs,
+          ),
           YggdrasilTransport(address: yggdrasilAddress),
           I2PTransport(
             host:        i2pSamHost ?? '127.0.0.1',
@@ -163,26 +168,35 @@ class TransportManager {
   /// Throttled to once per 3 s so a burst of publish() calls right after
   /// app start doesn't all skip the retry — but also doesn't hammer the
   /// daemon either.
+  bool _lateRetryInProgress = false;
+
   Future<void> _activateLateTransports() async {
-    if (_ourId.isEmpty) return;
+    if (_ourId.isEmpty || _lateRetryInProgress) return;
     final now = DateTime.now();
     if (_lastRetryAt != null &&
         now.difference(_lastRetryAt!) < const Duration(seconds: 3)) {
       return;
     }
     _lastRetryAt = now;
+    _lateRetryInProgress = true;
 
-    for (final t in _transports) {
-      if (_activeTransports.contains(t)) { continue; }
-      try {
-        if (await t.checkAvailability()) {
-          _activeTransports.add(t);
-          t.subscribe(ourId: _ourId).listen(
-            _incomingController.add,
-            onError: (_) {},
-          );
-        }
-      } catch (_) {}
+    try {
+      for (final t in _transports) {
+        if (_activeTransports.contains(t)) { continue; }
+        try {
+          if (await t.checkAvailability()) {
+            _activeTransports.add(t);
+            t.subscribe(ourId: _ourId).listen(
+              _incomingController.add,
+              onError: (_) {},
+            );
+            TransportDebugger.instance
+                .log('TRANSPORT: ${t.name} activated late');
+          }
+        } catch (_) {}
+      }
+    } finally {
+      _lateRetryInProgress = false;
     }
   }
 
@@ -225,7 +239,16 @@ class TransportManager {
     bool isHandshake = false,
     TransportPriority priority = TransportPriority.data,
   }) async {
-    if (_activeTransports.isEmpty) await _activateLateTransports();
+    // Re-probe inactive transports on every publish (throttled to 1/3s).
+    // Yggdrasil's availability check passes on virtually every device, so the
+    // old `only when nothing is active` gate meant a daemon that finished
+    // booting AFTER initialize() (Waku/I2P/IPFS routinely take longer than
+    // app startup) was never activated for the rest of the session.
+    if (_activeTransports.isEmpty) {
+      await _activateLateTransports();
+    } else {
+      unawaited(_activateLateTransports());
+    }
     if (_activeTransports.isEmpty) {
       throw const TransportException('No transport available.');
     }
@@ -1691,6 +1714,20 @@ class WakuTransport implements PhantomTransport {
   bool _disposed = false;
   final _daemon = WakuDaemon.instance;
 
+  /// Persistence hooks for the last successful store-query wall clock (µs).
+  /// Without them every app start re-fetches the full 72h+ store history and
+  /// replays frames the ratchet already consumed — each replayed MSG frame
+  /// fails to decrypt and used to trigger a spurious auto-revive session
+  /// reset on every cold start.
+  final Future<int?> Function()? _loadLastStoreQueryUs;
+  final Future<void> Function(int)? _saveLastStoreQueryUs;
+
+  WakuTransport({
+    Future<int?> Function()? loadLastStoreQueryUs,
+    Future<void> Function(int)? saveLastStoreQueryUs,
+  })  : _loadLastStoreQueryUs = loadLastStoreQueryUs,
+        _saveLastStoreQueryUs = saveLastStoreQueryUs;
+
   /// Content topic format following Waku naming convention.
   /// /phantom/1/{phantomId}/proto
   String _contentTopic(String phantomId) => '/phantom/1/$phantomId/proto';
@@ -1753,21 +1790,48 @@ class WakuTransport implements PhantomTransport {
 
     final controller = StreamController<IncomingEnvelope>();
 
-    // 1. First, query the Store for any messages we missed while offline
+    // 1. First, query the Store for any messages we missed while offline.
+    //    Resume from the last persisted query time (minus a small overlap for
+    //    clock skew) so old, already-consumed frames are not replayed on
+    //    every app start. Paginate so a backlog larger than one page is not
+    //    silently truncated (ascending order would otherwise return only the
+    //    OLDEST page and drop the newest messages).
     () async {
       try {
-        dbg.log('Waku: querying store for offline messages…');
-        final stored = await _daemon.storeQuery(contentTopic: topic);
-        dbg.log('Waku: store returned ${stored.length} messages');
-        for (final payload in stored) {
-          if (!controller.isClosed) {
+        final lastUs = await _loadLastStoreQueryUs?.call();
+        DateTime? startTime = lastUs != null
+            ? DateTime.fromMicrosecondsSinceEpoch(lastUs)
+                .subtract(const Duration(minutes: 5))
+            : null;
+        dbg.log('Waku: querying store for offline messages '
+            '(since ${startTime?.toIso8601String() ?? 'beginning'})…');
+        const pageSize = 100;
+        int total = 0;
+        for (int page = 0; page < 10; page++) {
+          final batch = await _daemon.storeQuery(
+            contentTopic: topic,
+            startTime: startTime,
+            pageSize: pageSize,
+          );
+          for (final entry in batch) {
+            if (controller.isClosed) break;
             controller.add(IncomingEnvelope(
-              data: payload,
+              data: entry.payload,
               transportName: 'Waku-Store',
               receivedAt: DateTime.now(),
             ));
           }
+          total += batch.length;
+          if (batch.length < pageSize) break;
+          final maxNs = batch
+              .map((e) => e.timestampNs)
+              .fold<int>(0, (m, t) => t > m ? t : m);
+          if (maxNs <= 0) break;
+          startTime = DateTime.fromMicrosecondsSinceEpoch(maxNs ~/ 1000 + 1);
         }
+        dbg.log('Waku: store returned $total message(s)');
+        await _saveLastStoreQueryUs
+            ?.call(DateTime.now().microsecondsSinceEpoch);
       } catch (e) {
         dbg.log('Waku: store query error: $e');
       }
@@ -1782,6 +1846,10 @@ class WakuTransport implements PhantomTransport {
             transportName: name,
             receivedAt: DateTime.now(),
           ));
+          // Live delivery advances the store cursor too — anything received
+          // here is already consumed, so the next cold-start query can skip it.
+          unawaited(_saveLastStoreQueryUs
+              ?.call(DateTime.now().microsecondsSinceEpoch));
         }
       } catch (e) {
         dbg.log('Waku: relay subscription error: $e');

@@ -369,12 +369,12 @@ class StoredMessage {
   DateTime get timestamp =>
       DateTime.fromMicrosecondsSinceEpoch(timestampUs);
 
-  StoredMessage copyWith({MessageStatus? status}) {
+  StoredMessage copyWith({MessageStatus? status, Uint8List? content}) {
     return StoredMessage(
       id: id,
       conversationId: conversationId,
       type: type,
-      content: content,
+      content: content ?? this.content,
       timestampUs: timestampUs,
       direction: direction,
       status: status ?? this.status,

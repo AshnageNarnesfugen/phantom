@@ -393,6 +393,10 @@ class PhantomCore {
       i2pLoadKey:       () => PhantomStorage.instance.getI2PPrivateDestination(),
       i2pPersistKey:    (b64) =>
           PhantomStorage.instance.setI2PPrivateDestination(b64),
+      wakuLoadLastStoreUs: () =>
+          PhantomStorage.instance.getSetting<int>('waku_last_store_query_us'),
+      wakuSaveLastStoreUs: (us) =>
+          PhantomStorage.instance.setSetting('waku_last_store_query_us', us),
     );
   }
 
@@ -545,19 +549,27 @@ class PhantomCore {
     // 1. IPFS On-Demand: Ensure the daemon is running only when needed
     await IpfsDaemon.instance.ensure();
 
+    // The wire format reserves a single byte for the name length, so the
+    // name must fit in 255 UTF-8 bytes. Trim from the front to preserve the
+    // extension (the receiver uses it to pick image/audio rendering).
+    var safeName = fileName;
+    while (utf8.encode(safeName).length > 255 && safeName.isNotEmpty) {
+      safeName = safeName.substring(1);
+    }
+
     // 2. Upload file to IPFS and pin it locally
-    final cid = await IpfsDaemon.instance.uploadFile(bytes, fileName);
+    final cid = await IpfsDaemon.instance.uploadFile(bytes, safeName);
 
     // 3. Prepare the Waku message containing only the CID + filename
-    final lower = fileName.toLowerCase();
+    final lower = safeName.toLowerCase();
     final isImage = lower.endsWith('.jpg') || lower.endsWith('.jpeg') ||
         lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp');
 
     final type = isImage ? MessageType.image : MessageType.file;
-    
+
     // Wire format for files: [name_len(1)][fileName][CID]
     // (CID is small enough that Waku easily handles it)
-    final nameBytes = utf8.encode(fileName);
+    final nameBytes = utf8.encode(safeName);
     final cidBytes = utf8.encode(cid);
     final content = Uint8List(1 + nameBytes.length + cidBytes.length)
       ..[0] = nameBytes.length
@@ -570,10 +582,96 @@ class PhantomCore {
       message: PhantomMessage(type: type, content: content),
     );
 
-    // 5. Schedule IPFS shutdown (5 minutes idle)
-    IpfsDaemon.instance.scheduleIdleShutdown();
+    // 5. The wire payload (name+CID) is what got persisted by
+    //    _sendPhantomMessage, but the UI renders messages straight from
+    //    storage — images expect raw bytes and files expect `name\0bytes`.
+    //    We already hold the original bytes, so persist the displayable
+    //    form locally instead of forcing our own chat to download the CID.
+    final display = stored.copyWith(
+      content: isImage ? bytes : encodeFileDisplayContent(safeName, bytes),
+    );
+    await storage.saveMessage(display);
 
-    return stored;
+    // NOTE: no idle shutdown here. The IPFS daemon also carries presence
+    // heartbeats and the pubsub fallback channel; killing it 5 minutes after
+    // a file send silently disabled both for the rest of the session (and a
+    // later restart binds a NEW dynamic API port that the already-constructed
+    // transports would never learn about).
+
+    return display;
+  }
+
+  /// Local display format for file/audio messages: `name\0bytes`.
+  /// This is the layout `ChatBubble._buildContent` parses.
+  static Uint8List encodeFileDisplayContent(String name, Uint8List bytes) {
+    final nameBytes = utf8.encode(name);
+    final out = Uint8List(nameBytes.length + 1 + bytes.length);
+    out.setAll(0, nameBytes);
+    out[nameBytes.length] = 0;
+    out.setAll(nameBytes.length + 1, bytes);
+    return out;
+  }
+
+  /// Attempts to parse [content] as the on-wire file payload
+  /// `[name_len(1)][fileName][CID]`. Returns null when the bytes don't match
+  /// (already-resolved media is raw image bytes or `name\0bytes`, neither of
+  /// which passes the strict CID check).
+  static ({String name, String cid})? tryParseFileWireContent(Uint8List content) {
+    if (content.length < 2) return null;
+    final nameLen = content[0];
+    if (nameLen == 0 || content.length <= 1 + nameLen) return null;
+    String name;
+    String cid;
+    try {
+      name = utf8.decode(content.sublist(1, 1 + nameLen));
+      cid  = ascii.decode(content.sublist(1 + nameLen));
+    } catch (_) {
+      return null;
+    }
+    final cidOk = RegExp(r'^(Qm[1-9A-HJ-NP-Za-km-z]{44}|baf[a-zA-Z0-9]{20,})$')
+        .hasMatch(cid);
+    return cidOk ? (name: name, cid: cid) : null;
+  }
+
+  // Media messages travel as a tiny CID pointer; the actual bytes live on
+  // IPFS. Resolution downloads the CID and rewrites the stored message into
+  // the displayable form. Keyed set prevents duplicate concurrent downloads.
+  final Set<String> _mediaResolutionInFlight = {};
+
+  /// Re-attempts resolution of any unresolved media in [conversationId].
+  /// Called by the chat screen on load so a download that failed earlier
+  /// (IPFS still bootstrapping, sender offline) gets retried on each visit.
+  Future<void> resolvePendingMedia(String conversationId) async {
+    final msgs = await storage.getMessages(conversationId, limit: 100);
+    for (final m in msgs) {
+      if (m.type != MessageType.image && m.type != MessageType.file) continue;
+      final parsed = tryParseFileWireContent(m.content);
+      if (parsed == null) continue;
+      unawaited(_resolveMediaMessage(m, parsed));
+    }
+  }
+
+  Future<void> _resolveMediaMessage(
+      StoredMessage m, ({String name, String cid}) file) async {
+    final key = '${m.conversationId}:${m.id}';
+    if (!_mediaResolutionInFlight.add(key)) return;
+    final dbg = TransportDebugger.instance;
+    try {
+      await IpfsDaemon.instance.ensure();
+      final bytes = await IpfsDaemon.instance.downloadFile(file.cid);
+      final display = m.type == MessageType.image
+          ? bytes
+          : encodeFileDisplayContent(file.name, bytes);
+      await storage.saveMessage(m.copyWith(content: display));
+      dbg.log('MEDIA: ✓ resolved ${file.name} (${bytes.length} B) from IPFS');
+      // contactChanges (not incomingMessages) so a pending resendHandshake
+      // ack-wait isn't falsely completed by a media refresh.
+      notifyContactChanged(m.conversationId);
+    } catch (e) {
+      dbg.log('MEDIA: ✗ download failed for ${file.name} (${file.cid}): $e');
+    } finally {
+      _mediaResolutionInFlight.remove(key);
+    }
   }
 
   Future<StoredMessage> _sendPhantomMessage({
@@ -1821,8 +1919,11 @@ class PhantomCore {
   // collidable — an attacker who could observe a legitimate frame could craft
   // a different-content frame with the same fingerprint and suppress delivery.
   // SHA-256 over the whole frame removes that surface.
-  static const _dedupeMaxSize = 100;
-  static const _dedupeTtl = Duration(seconds: 60);
+  // TTL covers the Waku store-query overlap window (5 min) plus margin, so a
+  // frame that arrives both live and via the cold-start store fetch is still
+  // recognised as a duplicate instead of hitting the ratchet twice.
+  static const _dedupeMaxSize = 500;
+  static const _dedupeTtl = Duration(minutes: 10);
   final Map<String, DateTime> _recentFrameHashes = {};
 
   bool _isDuplicateFrame(Uint8List data) {
@@ -2342,9 +2443,17 @@ class PhantomCore {
     // has drifted (e.g. one side sent messages the other never received).
     // Instead of silently discarding the message, we reset the session and
     // send a fresh X3DH INIT so both sides can re-sync automatically.
-    if (_sessions.isNotEmpty) {
-      // Pick the session that most likely sent this frame — the one we
-      // have an active ratchet for. In 1:1 chat there's typically one.
+    // An undecryptable MSG frame carries no sender identity, so with more
+    // than one live session we cannot attribute it — resetting a session
+    // picked by map-iteration order used to nuke a HEALTHY ratchet with an
+    // unrelated contact whenever any frame failed to decrypt. Only when a
+    // single session exists is the attribution unambiguous enough to revive.
+    if (_sessions.length > 1) {
+      dbg.log('MSG: undecryptable frame with ${_sessions.length} sessions — '
+          'cannot attribute sender, skipping auto-revive (use manual '
+          'reconnect if a chat is stuck)');
+    }
+    if (_sessions.length == 1) {
       for (final contactId in _sessions.keys) {
         final now = DateTime.now();
 
@@ -2470,6 +2579,13 @@ class PhantomCore {
     );
     await storage.saveMessage(stored);
     _incomingController.add(stored);
+
+    // Media arrives as a CID pointer — fetch the real bytes from IPFS in the
+    // background and rewrite the stored message into displayable form.
+    if (stored.type == MessageType.image || stored.type == MessageType.file) {
+      final parsed = tryParseFileWireContent(stored.content);
+      if (parsed != null) unawaited(_resolveMediaMessage(stored, parsed));
+    }
 
     if (_activeChatId != senderId) {
       final contact = await storage.getContact(senderId);
