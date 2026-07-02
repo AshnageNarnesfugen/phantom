@@ -292,32 +292,44 @@ class PhantomCore {
 
   // ── Factory constructors ───────────────────────────────────────────────────
 
+  /// [storage], [transports], [enablePresence] and [enableBleMesh] exist for
+  /// the local lab / e2e tests: an isolated storage plus a loopback transport
+  /// let several identities run in one process with no daemons, no platform
+  /// channels and no network. The app itself never passes them.
   static Future<({PhantomCore core, String seedPhrase})> createAccount({
     required String storagePath,
     TransportConfig? transportConfig,
+    PhantomStorage? storage,
+    List<PhantomTransport>? transports,
+    bool enablePresence = true,
+    bool enableBleMesh = true,
   }) async {
     final result = await PhantomIdentity.generateNew();
+    final store  = storage ?? PhantomStorage.instance;
 
-    await PhantomStorage.instance.initialize(
+    await store.initialize(
       seedPhrase: result.seedPhrase,
       storagePath: storagePath,
+      boxNamespace: storage == null ? '' : 'lab${identityHashCode(storage)}',
     );
 
-    final transport = _buildTransport(transportConfig);
+    final transport = _buildTransport(transportConfig, store, transports);
     final core = PhantomCore._(
       identity: result.identity,
-      storage:  PhantomStorage.instance,
+      storage:  store,
       transport: transport,
     );
     core._ipfsApiUrl  = IpfsDaemon.apiUrl;
-    core._transportV2 = _buildTransportV2(transport, core.myId);
+    if (enableBleMesh) {
+      core._transportV2 = _buildTransportV2(transport, core.myId);
+    }
 
     // Derive Kyber-768 keypair deterministically from the seed phrase.
     await core._initKyberKeys(result.seedPhrase);
     await core._initializePreKeys();
     await core._maybeRotateSignedPreKey();
     await core._startTransport();
-    await core._startPresence();
+    if (enablePresence) await core._startPresence();
 
     return (core: core, seedPhrase: result.seedPhrase);
   }
@@ -326,33 +338,41 @@ class PhantomCore {
     required String seedPhrase,
     required String storagePath,
     TransportConfig? transportConfig,
+    PhantomStorage? storage,
+    List<PhantomTransport>? transports,
+    bool enablePresence = true,
+    bool enableBleMesh = true,
   }) async {
     final identity = await PhantomIdentity.fromSeedPhrase(seedPhrase);
+    final store    = storage ?? PhantomStorage.instance;
 
-    await PhantomStorage.instance.initialize(
+    await store.initialize(
       seedPhrase: seedPhrase,
       storagePath: storagePath,
+      boxNamespace: storage == null ? '' : 'lab${identityHashCode(storage)}',
     );
 
-    final transport = _buildTransport(transportConfig);
+    final transport = _buildTransport(transportConfig, store, transports);
     final core = PhantomCore._(
       identity: identity,
-      storage:  PhantomStorage.instance,
+      storage:  store,
       transport: transport,
     );
     core._ipfsApiUrl  = IpfsDaemon.apiUrl;
-    core._transportV2 = _buildTransportV2(transport, core.myId);
+    if (enableBleMesh) {
+      core._transportV2 = _buildTransportV2(transport, core.myId);
+    }
 
     await core._initKyberKeys(seedPhrase);
     await core._syncTransportMetadata();
 
-    final savedYgg = await PhantomStorage.instance.getSetting<String>('yggdrasil_address');
+    final savedYgg = await store.getSetting<String>('yggdrasil_address');
     if (savedYgg != null) {
       core.setMyYggdrasilAddress(savedYgg);
     }
 
     // Re-initialize prekeys if they don't exist yet (e.g. first restore on new device)
-    final existing = await PhantomStorage.instance.getPreKeyStore();
+    final existing = await store.getPreKeyStore();
     if (existing == null) {
       await core._initializePreKeys();
     }
@@ -363,7 +383,7 @@ class PhantomCore {
     await core._preloadSessions();
 
     await core._startTransport();
-    await core._startPresence();
+    if (enablePresence) await core._startPresence();
     return core;
   }
 
@@ -376,7 +396,8 @@ class PhantomCore {
     }
   }
 
-  static TransportManager _buildTransport(TransportConfig? config) {
+  static TransportManager _buildTransport(TransportConfig? config,
+      PhantomStorage store, List<PhantomTransport>? transportsOverride) {
     // Use the dynamic IPFS API URL discovered by IpfsDaemon.ensure() (which
     // reads the actual port from the repo/api file after the daemon binds to
     // tcp/0). Fall back to the config value or 5001 only if the daemon hasn't
@@ -390,13 +411,13 @@ class PhantomCore {
       i2pSamHost:       config?.i2pSamHost,
       i2pSamPort:       config?.i2pSamPort,
       yggdrasilAddress: config?.yggdrasilAddress,
-      i2pLoadKey:       () => PhantomStorage.instance.getI2PPrivateDestination(),
-      i2pPersistKey:    (b64) =>
-          PhantomStorage.instance.setI2PPrivateDestination(b64),
+      i2pLoadKey:       () => store.getI2PPrivateDestination(),
+      i2pPersistKey:    (b64) => store.setI2PPrivateDestination(b64),
       wakuLoadLastStoreUs: () =>
-          PhantomStorage.instance.getSetting<int>('waku_last_store_query_us'),
+          store.getSetting<int>('waku_last_store_query_us'),
       wakuSaveLastStoreUs: (us) =>
-          PhantomStorage.instance.setSetting('waku_last_store_query_us', us),
+          store.setSetting('waku_last_store_query_us', us),
+      transportsOverride: transportsOverride,
     );
   }
 
@@ -674,7 +695,23 @@ class PhantomCore {
     }
   }
 
+  /// Per-recipient send locks. Encrypting mutates the ratchet session and
+  /// persists it — two concurrent sends to the same contact (e.g. a text
+  /// racing the automatic connectivityInfo/preKeyShare after a handshake)
+  /// would both advance the chain from the same snapshot and emit frames
+  /// the receiver can only partially decrypt.
+  final Map<String, _SerialLock> _sendLocks = {};
+
   Future<StoredMessage> _sendPhantomMessage({
+    required String recipientId,
+    required PhantomMessage message,
+  }) {
+    final lock = _sendLocks.putIfAbsent(recipientId, () => _SerialLock());
+    return lock.guard(() => _sendPhantomMessageInner(
+        recipientId: recipientId, message: message));
+  }
+
+  Future<StoredMessage> _sendPhantomMessageInner({
     required String recipientId,
     required PhantomMessage message,
   }) async {
@@ -1941,12 +1978,26 @@ class PhantomCore {
     return false;
   }
 
-  Future<void> _handleIncomingBytes(Uint8List data, {String? i2pSourceDest}) async {
+  /// Serializes ALL inbound frame processing. Decrypting mutates ratchet
+  /// session state; when several frames land at once (Waku store backlog on
+  /// cold start, multi-transport fan-in, the loopback lab) concurrent
+  /// handling advances the same session from the same snapshot — the first
+  /// save wins and every other frame fails with "no session could decrypt".
+  /// Found by the loopback e2e lab, where zero latency makes the race fire
+  /// on every run.
+  final _inboundLock = _SerialLock();
+
+  Future<void> _handleIncomingBytes(Uint8List data, {String? i2pSourceDest}) {
+    // Dedupe outside the lock: duplicates are the common case under
+    // multi-transport fan-out and shouldn't queue behind decrypts.
+    if (_disposed || _isDuplicateFrame(data)) return Future.value();
+    return _inboundLock.guard(
+        () => _handleIncomingBytesInner(data, i2pSourceDest: i2pSourceDest));
+  }
+
+  Future<void> _handleIncomingBytesInner(Uint8List data, {String? i2pSourceDest}) async {
     if (_disposed) return;
     final dbg = TransportDebugger.instance;
-
-    // Deduplicate: same frame arriving via multiple transports
-    if (_isDuplicateFrame(data)) return;
 
     try {
       final frame = WireFrame.parse(data);
@@ -2709,4 +2760,24 @@ class PhantomCoreException implements Exception {
   const PhantomCoreException(this.message);
   @override
   String toString() => 'PhantomCoreException: $message';
+}
+
+/// FIFO async mutex: `guard` runs [fn] after every previously guarded call
+/// has finished, propagating its result/error to the caller. Ratchet
+/// sessions are read-modify-write state, so both send and receive paths
+/// must be serialized (see [_inboundLock] / [_sendLocks]).
+class _SerialLock {
+  Future<void> _tail = Future.value();
+  Future<T> guard<T>(Future<T> Function() fn) {
+    final completer = Completer<void>();
+    final prev = _tail;
+    _tail = completer.future;
+    return prev.then((_) async {
+      try {
+        return await fn();
+      } finally {
+        completer.complete();
+      }
+    });
+  }
 }

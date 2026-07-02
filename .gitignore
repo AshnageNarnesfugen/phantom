@@ -81,3 +81,4 @@ android/app/src/main/jniLibs/arm64-v8a/libi2pd.so
 android/app/src/main/jniLibs/armeabi-v7a/libi2pd.so
 android/app/src/main/jniLibs/x86_64/libi2pd.so
 android/app/src/main/jniLibs/x86/libi2pd.so
+tool/bin/

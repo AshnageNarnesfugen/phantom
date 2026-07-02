@@ -25,6 +25,13 @@ class WakuDaemon {
   static final instance = WakuDaemon._();
   WakuDaemon._();
 
+  /// REST client bound to an arbitrary endpoint. Used by the desktop lab
+  /// (test/lab/) to drive go-waku daemons it spawned itself — possibly
+  /// several at once on distinct ports — with the exact same REST methods
+  /// the app uses. Never used on-device.
+  factory WakuDaemon.forApiUrl(String apiUrl) =>
+      WakuDaemon._().._dynamicApiUrl = apiUrl;
+
   bool _ensured = false;
   bool _binaryMissing = false;
   Process? _directProcess;
@@ -332,16 +339,25 @@ class WakuDaemon {
   /// Returns null on failure (daemon unreachable, no store peers yet, HTTP
   /// error) so the caller can retry later WITHOUT advancing its cursor — a
   /// failed query is not the same as "no offline messages".
+  ///
+  /// pubsubTopic is REQUIRED in practice: without it go-waku's store client
+  /// can't resolve a peer for the query and answers HTTP 500 "no suitable
+  /// peers found" — even while a store node is connected and serving. This
+  /// single missing parameter produced that error on every device for every
+  /// session (verified in the desktop lab: same query, with the parameter,
+  /// returns the messages).
   Future<List<({Uint8List payload, int timestampNs})>?> storeQuery({
     required String contentTopic,
     DateTime? startTime,
     int pageSize = 100,
+    String pubsubTopic = defaultPubsubTopic,
   }) async {
     final dbg = TransportDebugger.instance;
     try {
       final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
 
       final params = <String, String>{
+        'pubsubTopic': pubsubTopic,
         'contentTopics': contentTopic,
         'pageSize': '$pageSize',
         'ascending': 'true',
@@ -384,7 +400,9 @@ class WakuDaemon {
   // ── Status ─────────────────────────────────────────────────────────────────
 
   Future<({bool running, int peers})> status() async {
-    if (!Platform.isAndroid) return (running: false, peers: 0);
+    // No platform gate here: on desktop (the lab) the daemon is spawned
+    // manually and this must report it truthfully; on platforms with no
+    // daemon the probe fails instantly (connection refused) anyway.
 
     // /debug/v1/info is the ground truth for "is the daemon up". If it
     // answers 200, the daemon is running — period. The peer count comes
@@ -451,6 +469,65 @@ class WakuDaemon {
     return false;
   }
 
+  /// The full go-waku CLI invocation, shared by the on-device direct spawn
+  /// and the desktop lab (test/lab/), so what the lab exercises is exactly
+  /// what phones run. Mirror any change here into
+  /// WakuForegroundService.kt's ProcessBuilder args.
+  ///
+  /// Flag notes:
+  /// - Real go-waku CLI flag names (verified from the daemon's own --help);
+  ///   `--nodekey-file` / `--db-path` were guesses that panicked the process
+  ///   with "flag provided but not defined".
+  /// - status.prod is a static-sharding fleet: cluster 16, shard 32 is where
+  ///   status-go puts 1:1 traffic. Must agree with [defaultPubsubTopic] or
+  ///   relay/store REST calls 404 on the topic.
+  /// - 72h retention: keep ingested messages 3 days so a contact's cold-start
+  ///   store query can reach back that far (go-waku default is 48h).
+  /// - DNS discovery uses status.prod's boot enrtree (from status-go
+  ///   params/cluster.go). The old wakuv2.prod enrtrees are dead — that
+  ///   fleet was retired, its nodes sit in permanent dial backoff, which is
+  ///   why storeQuery said "no suitable peers found" for entire sessions.
+  /// - Store nodes (one per region, from fleets.status.im) are pinned as
+  ///   staticnode so store/lightpush-capable peers exist even while DNS
+  ///   discovery is still warming up; storenode sets the store client's
+  ///   default query target.
+  /// - Resolver pinned to 1.1.1.1: Android sandboxes don't expose local DNS
+  ///   at [::1]:53 (Waydroid logged "connection refused"), which silently
+  ///   killed enrtree lookups.
+  /// - rest-admin exposes /admin/v1/peers for our status() peer count.
+  /// - min-relay-peers-to-publish=0: default 1 rejects publishes with HTTP
+  ///   400 during the discovery bootstrap window. The flip side (a 200 into
+  ///   an empty mesh means nothing) is handled by WakuTransport.publish's
+  ///   live peer check + lightpush.
+  static List<String> launchArgs({
+    required String dataDir,
+    int restPort = 8645,
+  }) =>
+      [
+        '--relay=true',
+        '--store=true',
+        '--rest=true',
+        '--rest-address=127.0.0.1',
+        // Pinned so the Dart client can reach it without parsing a dynamic
+        // port from stdout (--rest-port=0 logs the config value, not the
+        // actual bound port).
+        '--rest-port=$restPort',
+        '--key-file=$dataDir/nodekey',
+        '--store-message-db-url=sqlite3://$dataDir/store.db',
+        '--cluster-id=16',
+        '--pubsub-topic=/waku/2/rs/16/32',
+        '--store-message-retention-time=72h',
+        '--dns-discovery=true',
+        '--dns-discovery-url=enrtree://AMOJVZX4V6EXP7NTJPMAYJYST2QP6AJXYW76IU6VGJS7UVSNDYZG4@boot.prod.status.nodes.status.im',
+        '--staticnode=/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT',
+        '--staticnode=/dns4/store-01.gc-us-central1-a.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmMELCo218hncCtTvC2Dwbej3rbyHQcR8erXNnKGei7WPZ',
+        '--staticnode=/dns4/store-01.ac-cn-hongkong-c.status.prod.status.im/tcp/30303/p2p/16Uiu2HAm2M7xs7cLPc3jamawkEqbr7cUJX11uvY7LxQ6WFUdUKUT',
+        '--storenode=/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT',
+        '--dns-discovery-name-server=1.1.1.1',
+        '--rest-admin=true',
+        '--min-relay-peers-to-publish=0',
+      ];
+
   Future<void> _spawnDirectly(String binary, String dataDir) async {
     final env = Map<String, String>.from(Platform.environment)
       ..['HOME'] = dataDir;
@@ -462,68 +539,7 @@ class WakuDaemon {
 
     _directProcess = await Process.start(
       binary,
-      [
-        '--relay=true',
-        '--store=true',
-        '--rest=true',
-        '--rest-address=127.0.0.1',
-        // Pin the REST port so the Dart client can reach it without parsing
-        // a dynamic port from stdout. With --rest-port=0 the daemon logs
-        // `addr: 127.0.0.1:0` (echoing the config, not the actual bound
-        // port) and there's no other place the OS-assigned port surfaces.
-        '--rest-port=8645',
-        // Real go-waku CLI flag names (verified from the daemon's own --help
-        // dump in the transport debugger on first run). The previous
-        // `--nodekey-file` / `--db-path` were guesses that panicked the
-        // process with "flag provided but not defined".
-        '--key-file=$dataDir/nodekey',
-        '--store-message-db-url=sqlite3://$dataDir/store.db',
-        // status.prod is a static-sharding fleet: cluster 16, and shard 32
-        // is where status-go puts 1:1 traffic. Both flags must agree with
-        // defaultPubsubTopic or relay/store REST calls 404 on the topic.
-        '--cluster-id=16',
-        '--pubsub-topic=/waku/2/rs/16/32',
-        // Keep messages we ingest for 3 days so a contact's store query
-        // (run on their cold start) can reach back that far. Default in
-        // go-waku v0.9.0 is only 48h.
-        '--store=true',
-        '--store-message-retention-time=72h',
-        // Without a discovery mechanism the daemon comes up but never peers,
-        // so "running · 0 peers" forever and nothing routes. The relayed
-        // traffic is end-to-end encrypted by our ratchet anyway, so the
-        // public fleet nodes only see opaque blobs.
-        //
-        // The old wakuv2.prod enrtrees (AOGECG2S/ANEDLO25 keys) are gone —
-        // that fleet was retired and its nodes sit in permanent dial
-        // backoff, which is why storeQuery returned "no suitable peers
-        // found" for entire sessions. This is status.prod's boot enrtree
-        // (from status-go params/cluster.go).
-        '--dns-discovery=true',
-        '--dns-discovery-url=enrtree://AMOJVZX4V6EXP7NTJPMAYJYST2QP6AJXYW76IU6VGJS7UVSNDYZG4@boot.prod.status.nodes.status.im',
-        // Pin store nodes (one per region, from fleets.status.im) as static
-        // peers so the peer manager always has store/lightpush-capable
-        // peers even when DNS discovery is slow, and our relay gossip has a
-        // direct path to a node that persists it.
-        '--staticnode=/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT',
-        '--staticnode=/dns4/store-01.gc-us-central1-a.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmMELCo218hncCtTvC2Dwbej3rbyHQcR8erXNnKGei7WPZ',
-        '--staticnode=/dns4/store-01.ac-cn-hongkong-c.status.prod.status.im/tcp/30303/p2p/16Uiu2HAm2M7xs7cLPc3jamawkEqbr7cUJX11uvY7LxQ6WFUdUKUT',
-        // Default peer for store client queries (with do-ams3 as primary;
-        // the staticnodes above are fallbacks the peer manager can select).
-        '--storenode=/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT',
-        // Pin the resolver. Android sandboxes don't expose a local DNS at
-        // [::1]:53 (Waydroid logged "connection refused"), so without this
-        // the enrtree lookup fails and no peers are ever discovered.
-        // 1.1.1.1 is privacy-friendly (Cloudflare's stated no-logs policy).
-        '--dns-discovery-name-server=1.1.1.1',
-        // Expose /admin/v1/peers — our status() polls it for the peer count.
-        // Without this flag the endpoint returns 404 and jsonDecode throws,
-        // making status() falsely report running=false.
-        '--rest-admin=true',
-        // Default 1 rejects publishes with HTTP 400 "not enough peers" during
-        // the 5-30s DNS-discovery bootstrap window after launch. Drop to 0 so
-        // the daemon accepts the publish and gossips it once peers connect.
-        '--min-relay-peers-to-publish=0',
-      ],
+      launchArgs(dataDir: dataDir),
       environment: env,
     );
 

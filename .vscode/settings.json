@@ -4,5 +4,6 @@
     "java.import.exclusions": [
         "**/android/**"
     ],
-    "kotlin.diagnostics.enabled": false
+    "kotlin.diagnostics.enabled": false,
+    "cmake.sourceDirectory": "/home/dreadashes/Downloads/phantom/linux"
 }

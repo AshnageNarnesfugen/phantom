@@ -113,7 +113,11 @@ class TransportManager {
     Future<void> Function(String)? i2pPersistKey,
     Future<int?> Function()? wakuLoadLastStoreUs,
     Future<void> Function(int)? wakuSaveLastStoreUs,
-  }) : _transports = [
+    /// Replaces the default Waku/Ygg/I2P/IPFS stack entirely. Used by the
+    /// local lab / e2e tests to wire an in-memory loopback transport so the
+    /// full handshake + messaging flow runs without any daemon or network.
+    List<PhantomTransport>? transportsOverride,
+  }) : _transports = transportsOverride ?? [
           // Waku: primary messaging transport (text, handshakes, metadata)
           WakuTransport(
             loadLastStoreQueryUs: wakuLoadLastStoreUs,
@@ -350,6 +354,26 @@ class TransportManager {
           }
         }());
       }
+    }
+
+    // Generic fan-out for transports outside the four built-in types (e.g.
+    // the lab's LoopbackTransport). The branches above are all type-matched,
+    // so without this an injected transport would never be fired.
+    for (final t in _activeTransports) {
+      if (t is WakuTransport || t is I2PTransport ||
+          t is YggdrasilTransport || t is IpfsTransport) {
+        continue;
+      }
+      futures.add(() async {
+        dbg.log('TRANSPORT: firing ${t.name} for ${recipientId.substring(0, 8)}…');
+        try {
+          await t.publish(recipientId: recipientId, encryptedEnvelope: encryptedEnvelope);
+          dbg.log('TRANSPORT: ${t.name} delivery OK');
+        } catch (e) {
+          dbg.log('TRANSPORT: ${t.name} failed ($e)');
+          rethrow;
+        }
+      }());
     }
 
     if (futures.isEmpty) {
@@ -1713,7 +1737,7 @@ class YggdrasilTransport implements PhantomTransport {
 class WakuTransport implements PhantomTransport {
   bool _available = false;
   bool _disposed = false;
-  final _daemon = WakuDaemon.instance;
+  final WakuDaemon _daemon;
 
   /// Persistence hooks for the last successful store-query wall clock (µs).
   /// Without them every app start re-fetches the full 72h+ store history and
@@ -1726,8 +1750,10 @@ class WakuTransport implements PhantomTransport {
   WakuTransport({
     Future<int?> Function()? loadLastStoreQueryUs,
     Future<void> Function(int)? saveLastStoreQueryUs,
+    WakuDaemon? daemon,
   })  : _loadLastStoreQueryUs = loadLastStoreQueryUs,
-        _saveLastStoreQueryUs = saveLastStoreQueryUs;
+        _saveLastStoreQueryUs = saveLastStoreQueryUs,
+        _daemon = daemon ?? WakuDaemon.instance;
 
   /// Content topic format following Waku naming convention.
   /// /phantom/1/{phantomId}/proto
@@ -1772,36 +1798,68 @@ class WakuTransport implements PhantomTransport {
     required Uint8List encryptedEnvelope,
   }) async {
     if (_disposed) throw const TransportException('WakuTransport disposed');
+    final dbg = TransportDebugger.instance;
+    final topic  = _contentTopic(recipientId);
+    final sentAt = DateTime.now();
 
-    final topic = _contentTopic(recipientId);
+    // Publish-and-CONFIRM. The desktop lab proved that every cheaper signal
+    // lies: relay returns HTTP 200 into a mesh that hasn't GRAFTed yet (the
+    // message evaporates), a nonzero admin peer count says nothing about
+    // mesh membership on our shard, and lightpush against status.prod dies
+    // with 503 "protocols not supported" (go-waku v0.9.0 only speaks
+    // /vac/waku/lightpush/2.0.0-beta1, the fleet moved on). The only signal
+    // that equals "a receiver can fetch this later" is our payload showing
+    // up in the fleet's own store — so that's what we require, republishing
+    // until it does.
+    for (int attempt = 1; attempt <= 4; attempt++) {
+      if (await hasRelayPeers()) {
+        await _daemon.relayPublish(
+            contentTopic: topic, payload: encryptedEnvelope);
+      }
+      // Best-effort — dead against today's status.prod (see above) but
+      // harmless, and covers fleets that still mount lightpush beta1.
+      await _daemon.lightpush(contentTopic: topic, payload: encryptedEnvelope);
 
-    // Relay gossips on our local mesh — but with
-    // --min-relay-peers-to-publish=0 it returns HTTP 200 even into an empty
-    // mesh, so a 200 with zero peers is NOT delivery. Only count relay as a
-    // success when we actually have peers to gossip to.
-    final hasPeers = await hasRelayPeers();
-    bool relayed = false;
-    if (hasPeers) {
-      relayed = await _daemon.relayPublish(
-        contentTopic: topic,
-        payload: encryptedEnvelope,
-      );
+      // Give the gossip time to traverse fleet relay → store node; mesh
+      // GRAFT after the first peer connects takes a few heartbeats, hence
+      // the growing delay before each verification.
+      await Future.delayed(Duration(seconds: 2 * attempt));
+
+      if (await _storeHasPayload(
+          topic: topic, payload: encryptedEnvelope, since: sentAt)) {
+        if (attempt > 1) {
+          dbg.log('Waku: ✓ publish confirmed by fleet store (attempt $attempt)');
+        }
+        return;
+      }
+      dbg.log('Waku: publish not in fleet store yet (attempt $attempt/4)');
     }
+    throw const TransportException(
+        'Waku publish never appeared in the fleet store');
+  }
 
-    // Lightpush hands the message to a remote relay node that gossips on our
-    // behalf and lands it on Waku Store — this is what makes async delivery
-    // work from a fresh boot before any peer is connected. Fire it even when
-    // relay "succeeded": relay peers ≠ peers subscribed to this pubsub
-    // topic, and the lightpush ACK (relayPeerCount ≥ 1 on the remote node)
-    // is the only end-to-end-ish confirmation we get.
-    final pushed = await _daemon.lightpush(
+  /// True when [payload] is retrievable from the fleet's store on [topic] —
+  /// the strongest delivery confirmation Waku offers.
+  Future<bool> _storeHasPayload({
+    required String topic,
+    required Uint8List payload,
+    required DateTime since,
+  }) async {
+    final msgs = await _daemon.storeQuery(
       contentTopic: topic,
-      payload: encryptedEnvelope,
+      startTime: since.subtract(const Duration(minutes: 2)),
+      pageSize: 100,
     );
+    if (msgs == null) return false;
+    return msgs.any((m) => _bytesEqual(m.payload, payload));
+  }
 
-    if (!relayed && !pushed) {
-      throw const TransportException('Waku relay + lightpush both failed');
+  static bool _bytesEqual(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
     }
+    return true;
   }
 
   @override

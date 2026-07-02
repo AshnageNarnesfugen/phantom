@@ -49,6 +49,17 @@ class PhantomStorage {
   HiveAesCipher? _cipher;
   bool _initialized = false;
 
+  /// Prepended to every Hive box name. Hive's box registry is global and
+  /// keyed by NAME only (the path is ignored for lookup), so two storage
+  /// instances in one process — e.g. Alice and Bob in the loopback lab —
+  /// need distinct prefixes or they'd silently share boxes.
+  String _boxPrefix = '';
+
+  /// Where this instance's boxes live on disk. Passed explicitly to every
+  /// openBox so multiple instances don't depend on the global Hive.init
+  /// home (last init call would win otherwise).
+  String? _storagePath;
+
   final _preKeyLock = _AsyncLock();
   final Map<String, _AsyncLock> _opkLocks = {};
   _AsyncLock _opkLock(String contactId) =>
@@ -61,12 +72,20 @@ class PhantomStorage {
     return _instance!;
   }
 
+  /// A storage instance independent of the app-wide singleton. Used by the
+  /// local lab / e2e tests to run several identities in one process. Pass a
+  /// unique [boxNamespace] to initialize for each one.
+  factory PhantomStorage.isolated() => PhantomStorage._();
+
   Future<void> initialize({
     required String seedPhrase,
     required String storagePath,
+    String boxNamespace = '',
   }) async {
     if (_initialized) return;
     Hive.init(storagePath);
+    _storagePath = storagePath;
+    _boxPrefix   = boxNamespace.isEmpty ? '' : '${boxNamespace}_';
     final aesKey = await _deriveStorageKey(seedPhrase);
     _cipher = HiveAesCipher(aesKey);
     _initialized = true;
@@ -570,8 +589,9 @@ class PhantomStorage {
   // ── Internals ─────────────────────────────────────────────────────────────────
 
   Future<Box> _openBox(String name) async {
-    if (Hive.isBoxOpen(name)) return Hive.box(name);
-    return Hive.openBox(name, encryptionCipher: _cipher);
+    final fullName = '$_boxPrefix$name';
+    if (Hive.isBoxOpen(fullName)) return Hive.box(fullName);
+    return Hive.openBox(fullName, encryptionCipher: _cipher, path: _storagePath);
   }
 
   static Future<Uint8List> _deriveStorageKey(String seedPhrase) async {

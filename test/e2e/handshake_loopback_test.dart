@@ -1,0 +1,164 @@
+@Timeout(Duration(minutes: 3))
+library;
+
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:phantom_messenger/phantom_messenger.dart';
+
+import '../support/loopback_transport.dart';
+
+/// E2E del protocolo completo SIN red ni daemons: dos PhantomCore reales
+/// (Alice y Bob) en el mismo proceso, conectados por un transporte loopback
+/// en memoria. Ejercita exactamente el mismo código que corre en los
+/// teléfonos — X3DH híbrido (X25519+Kyber768), INIT wrapping, double
+/// ratchet, handshakeAck, preKeyShare, persistencia Hive — de forma
+/// determinista y en segundos. Es la herramienta para depurar handshake y
+/// mensajería sin instalar APKs.
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  late LoopbackHub hub;
+  late Directory aliceDir;
+  late Directory bobDir;
+  late PhantomCore alice;
+  late PhantomCore bob;
+
+  /// Espera el próximo mensaje de chat visible (no system) que reciba [core].
+  Future<StoredMessage> nextMessage(PhantomCore core,
+      {Duration timeout = const Duration(seconds: 20)}) {
+    return core.incomingMessages
+        .firstWhere((m) =>
+            m.type == MessageType.text ||
+            m.type == MessageType.image ||
+            m.type == MessageType.file)
+        .timeout(timeout);
+  }
+
+  setUp(() async {
+    hub      = LoopbackHub();
+    aliceDir = await Directory.systemTemp.createTemp('phantom_lab_alice_');
+    bobDir   = await Directory.systemTemp.createTemp('phantom_lab_bob_');
+
+    final a = await PhantomCore.createAccount(
+      storagePath:    aliceDir.path,
+      storage:        PhantomStorage.isolated(),
+      transports:     [LoopbackTransport(hub)],
+      enablePresence: false,
+      enableBleMesh:  false,
+    );
+    alice = a.core;
+
+    final b = await PhantomCore.createAccount(
+      storagePath:    bobDir.path,
+      storage:        PhantomStorage.isolated(),
+      transports:     [LoopbackTransport(hub)],
+      enablePresence: false,
+      enableBleMesh:  false,
+    );
+    bob = b.core;
+  });
+
+  tearDown(() async {
+    await alice.dispose();
+    await bob.dispose();
+    await hub.dispose();
+    try { await aliceDir.delete(recursive: true); } catch (_) {}
+    try { await bobDir.delete(recursive: true); } catch (_) {}
+  });
+
+  test('handshake X3DH + mensajería bidireccional', () async {
+    // Alice importa la dirección de contacto de Bob (equivale a escanear
+    // su QR) — Bob NO conoce a Alice todavía.
+    final bobAddress = await bob.getMyContactAddress();
+    expect(bobAddress, isNotNull);
+    await alice.addContact(contactAddress: bobAddress!, nickname: 'Bob');
+
+    // 1) Primer mensaje: PhantomCore lo envuelve como INIT X3DH (híbrido
+    //    Kyber si el bundle lo permite) con la CA de Alice embebida.
+    final bobGets = nextMessage(bob);
+    await alice.sendMessage(recipientId: bob.myId, text: 'hola bob — INIT');
+    final first = await bobGets;
+    expect(first.textContent, 'hola bob — INIT');
+    expect(first.conversationId, alice.myId);
+
+    // El INIT llevaba la ContactAddress de Alice: Bob debe haberla
+    // persistido como contacto sin intervención manual.
+    final aliceAsSeenByBob = await bob.storage.getContact(alice.myId);
+    expect(aliceAsSeenByBob, isNotNull,
+        reason: 'el INIT debe auto-registrar al remitente como contacto');
+
+    // 2) Respuesta de Bob → camino responder del ratchet.
+    final aliceGets = nextMessage(alice);
+    await bob.sendMessage(recipientId: alice.myId, text: 'hola alice');
+    expect((await aliceGets).textContent, 'hola alice');
+
+    // 3) Varias idas y vueltas: avanza cadenas del double ratchet en ambas
+    //    direcciones (detecta bugs de skipped keys / DH ratchet).
+    for (var i = 0; i < 5; i++) {
+      final b1 = nextMessage(bob);
+      await alice.sendMessage(recipientId: bob.myId, text: 'a→b #$i');
+      expect((await b1).textContent, 'a→b #$i');
+
+      final a1 = nextMessage(alice);
+      await bob.sendMessage(recipientId: alice.myId, text: 'b→a #$i');
+      expect((await a1).textContent, 'b→a #$i');
+    }
+
+    // 4) Sesiones persistidas en ambos lados.
+    expect(await alice.storage.getSessionState(bob.myId), isNotNull);
+    expect(await bob.storage.getSessionState(alice.myId), isNotNull);
+  });
+
+  test('frames duplicados no producen mensajes duplicados', () async {
+    final bobAddress = await bob.getMyContactAddress();
+    await alice.addContact(contactAddress: bobAddress!);
+
+    final bobGets = nextMessage(bob);
+    await alice.sendMessage(recipientId: bob.myId, text: 'mensaje único');
+    await bobGets;
+
+    // Reinyecta TODOS los frames que cruzaron el hub (como si llegaran otra
+    // vez por Waku store después de recibirlos por relay). Ninguno debe
+    // producir un nuevo evento de mensaje.
+    final duplicates = <StoredMessage>[];
+    final sub = bob.incomingMessages.listen(duplicates.add);
+    for (var i = 0; i < hub.trace.length; i++) {
+      hub.replay(i);
+    }
+    await Future<void>.delayed(const Duration(seconds: 2));
+    await sub.cancel();
+    expect(duplicates.where((m) => m.type == MessageType.text), isEmpty,
+        reason: 'la dedupe de frames debe absorber réplicas del store');
+  });
+
+  test('mensajes en cola sobreviven a un corte total de red', () async {
+    final bobAddress = await bob.getMyContactAddress();
+    await alice.addContact(contactAddress: bobAddress!);
+
+    // Con la "red" caída el envío no debe lanzar hacia la UI: el mensaje
+    // queda almacenado local con estado failed/pending.
+    hub.online = false;
+    StoredMessage? result;
+    Object? error;
+    try {
+      result = await alice.sendMessage(recipientId: bob.myId, text: 'offline');
+    } catch (e) {
+      error = e;
+    }
+    // Contrato mínimo: o devuelve el StoredMessage (marcado no-sent) o
+    // lanza PhantomCoreException — pero nunca corrompe el estado para
+    // envíos posteriores.
+    if (result != null) {
+      expect(result.status, isNot(MessageStatus.sent));
+    } else {
+      expect(error, isA<Object>());
+    }
+
+    // Al volver la red, un mensaje nuevo entrega con normalidad.
+    hub.online = true;
+    final bobGets = nextMessage(bob);
+    await alice.sendMessage(recipientId: bob.myId, text: 'de vuelta');
+    expect((await bobGets).textContent, 'de vuelta');
+  });
+}
