@@ -380,12 +380,32 @@ class TransportManager {
       throw const TransportException('No valid transport target for recipient.');
     }
 
-    final results = await Future.wait(
-      futures.map((f) => f.then((_) => true).catchError((_) => false)),
-    );
-    if (!results.any((s) => s)) {
+    // Resolve on the FIRST transport that succeeds; stragglers finish in the
+    // background (each branch above already logs its own outcome). Waiting
+    // for all of them meant every send was gated on the slowest backend —
+    // in the field, Waku's store-confirmation retries (up to ~45s when the
+    // store nodes were unreachable) serialized a burst of handshake frames
+    // into a minutes-long queue.
+    if (!await _firstSuccess(futures)) {
       throw const TransportException('All simultaneous transport layers failed.');
     }
+  }
+
+  /// Completes with true as soon as any future succeeds, or false when all
+  /// have failed. Never throws; failures are already logged by the callers.
+  static Future<bool> _firstSuccess(List<Future<void>> futures) {
+    final done = Completer<bool>();
+    var remaining = futures.length;
+    for (final f in futures) {
+      f.then((_) {
+        remaining--;
+        if (!done.isCompleted) done.complete(true);
+      }).catchError((_) {
+        remaining--;
+        if (remaining == 0 && !done.isCompleted) done.complete(false);
+      });
+    }
+    return done.future;
   }
 
   Future<void> dispose() async {
@@ -1833,6 +1853,10 @@ class WakuTransport implements PhantomTransport {
         return;
       }
       dbg.log('Waku: publish not in fleet store yet (attempt $attempt/4)');
+      // The usual reason: NAT churn silently dropped our store-node
+      // connections and go-waku never re-dials staticnodes. Heal before
+      // the next round (throttled internally).
+      await _daemon.ensureServicePeers();
     }
     throw const TransportException(
         'Waku publish never appeared in the fleet store');
@@ -1891,6 +1915,10 @@ class WakuTransport implements PhantomTransport {
           storeCursorReady = true;
           return;
         }
+        // Failed store query usually means the store-node connections are
+        // gone (NAT churn / discovery not warm yet) — re-dial them before
+        // the next attempt instead of just waiting.
+        await _daemon.ensureServicePeers();
         await Future.delayed(const Duration(seconds: 15));
       }
       dbg.log('Waku: ✗ store backlog never fetched (no store peers in 10m)');

@@ -499,6 +499,17 @@ class WakuDaemon {
   ///   400 during the discovery bootstrap window. The flip side (a 200 into
   ///   an empty mesh means nothing) is handled by WakuTransport.publish's
   ///   live peer check + lightpush.
+  /// status.prod store nodes (one per region, from fleets.status.im). Used
+  /// as --staticnode at launch AND re-dialed at runtime by
+  /// [ensureServicePeers] — mobile NATs silently kill the TCP connections,
+  /// after which go-waku's peer manager never re-dials staticnodes on its
+  /// own and every store query / lightpush fails with "no suitable peers".
+  static const pinnedStoreNodes = [
+    '/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT',
+    '/dns4/store-01.gc-us-central1-a.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmMELCo218hncCtTvC2Dwbej3rbyHQcR8erXNnKGei7WPZ',
+    '/dns4/store-01.ac-cn-hongkong-c.status.prod.status.im/tcp/30303/p2p/16Uiu2HAm2M7xs7cLPc3jamawkEqbr7cUJX11uvY7LxQ6WFUdUKUT',
+  ];
+
   static List<String> launchArgs({
     required String dataDir,
     int restPort = 8645,
@@ -519,14 +530,59 @@ class WakuDaemon {
         '--store-message-retention-time=72h',
         '--dns-discovery=true',
         '--dns-discovery-url=enrtree://AMOJVZX4V6EXP7NTJPMAYJYST2QP6AJXYW76IU6VGJS7UVSNDYZG4@boot.prod.status.nodes.status.im',
-        '--staticnode=/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT',
-        '--staticnode=/dns4/store-01.gc-us-central1-a.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmMELCo218hncCtTvC2Dwbej3rbyHQcR8erXNnKGei7WPZ',
-        '--staticnode=/dns4/store-01.ac-cn-hongkong-c.status.prod.status.im/tcp/30303/p2p/16Uiu2HAm2M7xs7cLPc3jamawkEqbr7cUJX11uvY7LxQ6WFUdUKUT',
-        '--storenode=/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT',
+        for (final node in pinnedStoreNodes) '--staticnode=$node',
+        '--storenode=${pinnedStoreNodes.first}',
         '--dns-discovery-name-server=1.1.1.1',
         '--rest-admin=true',
         '--min-relay-peers-to-publish=0',
+        // Default keep-alive is 5m — mobile NAT mappings die well before
+        // that, taking the store/lightpush connections with them (observed
+        // in the field: store worked at boot, then "no suitable peers
+        // found" for the rest of the session).
+        '--keep-alive=30s',
       ];
+
+  DateTime? _lastPeerHeal;
+
+  /// Re-dials the pinned store nodes through the REST admin API. go-waku
+  /// only dials --staticnode at startup; once NAT/radio churn drops those
+  /// TCP connections the store client is dead for the rest of the session.
+  /// Called whenever a store query fails or a publish can't be confirmed.
+  /// Throttled to once per 30s. Verified against rest/admin.go v0.9.0: the
+  /// body is a single {"multiaddr","shards","protocols"} object per call.
+  Future<void> ensureServicePeers() async {
+    final now = DateTime.now();
+    if (_lastPeerHeal != null &&
+        now.difference(_lastPeerHeal!) < const Duration(seconds: 30)) {
+      return;
+    }
+    _lastPeerHeal = now;
+    final dbg = TransportDebugger.instance;
+    for (final node in pinnedStoreNodes) {
+      try {
+        final client = HttpClient()
+          ..connectionTimeout = const Duration(seconds: 5);
+        final req = await client.postUrl(Uri.parse('$apiUrl/admin/v1/peers'));
+        req.headers.contentType = ContentType.json;
+        req.write(jsonEncode({
+          'multiaddr': node,
+          'shards': [32],
+          'protocols': [
+            '/vac/waku/store/2.0.0-beta4',
+            '/vac/waku/lightpush/2.0.0-beta1',
+          ],
+        }));
+        final resp = await req.close();
+        await resp.drain<void>();
+        client.close(force: true);
+        if (resp.statusCode == 200) {
+          dbg.log('Waku: ✓ re-dialed store node ${node.split('/p2p/').last.substring(0, 12)}…');
+        }
+      } catch (e) {
+        dbg.log('Waku: store-node re-dial failed: $e');
+      }
+    }
+  }
 
   Future<void> _spawnDirectly(String binary, String dataDir) async {
     final env = Map<String, String>.from(Platform.environment)

@@ -25,10 +25,17 @@ El hub permite simular condiciones de red:
 - `hub.trace` — todos los frames que cruzaron, en orden, para asertar sobre
   el tráfico de wire.
 
-Primer dividendo: cazó una carrera real — frames en ráfaga descifrando
-concurrentemente contra la misma sesión ratchet (uno gana, el resto falla con
-"no session could decrypt"). En los teléfonos pasaba al llegar el backlog del
-store de golpe. Arreglado serializando entrada y salida (`_SerialLock`).
+Dividendos:
+- Cazó la carrera de frames en ráfaga descifrando concurrentemente contra la
+  misma sesión ratchet ("no session could decrypt" en cascada). Arreglado
+  serializando el procesamiento entrante (`_SerialLock`).
+- El test de ráfaga bidireccional reprodujo en 1 segundo el fallo de campo
+  donde ambos teléfonos se reseteaban sesiones sanas mutuamente: un descifrado
+  fallido restauraba la sesión desde un snapshot pre-intento y borraba el
+  avance de cadena de un envío concurrente → el siguiente envío reutilizaba un
+  índice gastado y el peer no descifraba nunca más. Arreglado unificando el
+  mutex: la fase encrypt+persist de cada envío toma el MISMO `_sessionLock`
+  que la recepción (la red queda fuera del lock).
 
 ## 2. Lab de red (Waku vivo) — `test/lab/waku_live_test.dart`
 
@@ -65,6 +72,14 @@ Dividendos del primer día:
 - **Relay HTTP 200 ≠ entrega**: publicar antes del GRAFT del mesh evapora el
   mensaje. `WakuTransport.publish` ahora republica hasta ver el payload en el
   store del fleet (la única confirmación real que ofrece Waku).
+- **go-waku no re-marca los staticnodes**: el keep-alive default (5m) deja
+  morir los NAT mappings móviles; el store funcionaba al arrancar y luego
+  "no suitable peers found" toda la sesión. Mitigado con `--keep-alive=30s`
+  + re-dial activo vía `POST /admin/v1/peers` (cuerpo: objeto único
+  `{"multiaddr","shards","protocols"}`, verificado contra rest/admin.go).
+- **La confirmación por store no debe bloquear el envío**:
+  `TransportManager.publish` resuelve al primer transporte exitoso; esperar a
+  todos serializaba las ráfagas post-handshake en colas de minutos.
 
 ## Trampas del entorno de test
 

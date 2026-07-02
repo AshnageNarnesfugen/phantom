@@ -203,6 +203,10 @@ class WakuForegroundService : Service() {
                     "--storenode=/dns4/store-01.do-ams3.status.prod.status.im/tcp/30303/p2p/16Uiu2HAmAUdrQ3uwzuE4Gy4D56hX6uLKEeerJAnhKEHZ3DxF1EfT",
                     "--rest-admin=true",
                     "--min-relay-peers-to-publish=0",
+                    // Default 5m keep-alive lets mobile NAT mappings die and
+                    // takes the store/lightpush connections with them; the
+                    // Dart side also re-dials via /admin/v1/peers on failure.
+                    "--keep-alive=30s",
                 )
                 pb.environment()["HOME"] = dataDir
                 pb.redirectErrorStream(true)

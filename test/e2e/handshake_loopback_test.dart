@@ -110,6 +110,56 @@ void main() {
     expect(await bob.storage.getSessionState(alice.myId), isNotNull);
   });
 
+  test('ráfaga bidireccional sin ping-pong (patrón post-handshake real)',
+      () async {
+    // Reproduce el patrón de campo que reseteaba sesiones sanas: tras el
+    // INIT, ambos lados encolan MUCHOS envíos (preKeyShares, connectivity,
+    // texto) mientras simultáneamente reciben frames del otro. Si el camino
+    // de envío y el de recepción no comparten exclusión sobre la sesión,
+    // los descifrados fallan en cascada y el auto-revive destruye la sesión.
+    final bobAddress = await bob.getMyContactAddress();
+    await alice.addContact(contactAddress: bobAddress!);
+
+    final bobGot   = <String>[];
+    final aliceGot = <String>[];
+    final s1 = bob.incomingMessages
+        .where((m) => m.type == MessageType.text)
+        .listen((m) => bobGot.add(m.textContent));
+    final s2 = alice.incomingMessages
+        .where((m) => m.type == MessageType.text)
+        .listen((m) => aliceGot.add(m.textContent));
+
+    // Handshake por primer mensaje.
+    await alice.sendMessage(recipientId: bob.myId, text: 'INIT');
+    // Ráfaga cruzada: cada lado dispara 8 envíos SIN esperar al otro.
+    final burst = <Future<void>>[];
+    for (var i = 0; i < 8; i++) {
+      burst.add(alice.sendMessage(recipientId: bob.myId, text: 'a→b #$i'));
+      burst.add(bob.sendMessage(recipientId: alice.myId, text: 'b→a #$i'));
+    }
+    await Future.wait(burst);
+
+    // Todo debe llegar (el orden puede variar, la pérdida no se tolera).
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while ((bobGot.length < 9 || aliceGot.length < 8) &&
+        DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+    await s1.cancel();
+    await s2.cancel();
+
+    expect(bobGot.toSet(),
+        {'INIT', for (var i = 0; i < 8; i++) 'a→b #$i'},
+        reason: 'Bob perdió mensajes de la ráfaga: $bobGot');
+    expect(aliceGot.toSet(),
+        {for (var i = 0; i < 8; i++) 'b→a #$i'},
+        reason: 'Alice perdió mensajes de la ráfaga: $aliceGot');
+
+    // Y las sesiones deben seguir vivas (sin auto-revive destructivo).
+    expect(await alice.storage.getSessionState(bob.myId), isNotNull);
+    expect(await bob.storage.getSessionState(alice.myId), isNotNull);
+  });
+
   test('frames duplicados no producen mensajes duplicados', () async {
     final bobAddress = await bob.getMyContactAddress();
     await alice.addContact(contactAddress: bobAddress!);

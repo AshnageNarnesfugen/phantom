@@ -711,16 +711,20 @@ class PhantomCore {
         recipientId: recipientId, message: message));
   }
 
-  Future<StoredMessage> _sendPhantomMessageInner({
+  /// Ratchet-mutating phase of a send: encrypt, wrap (INIT on first message)
+  /// and persist the advanced session. MUST run inside [_sessionLock] — the
+  /// caller guards it. Everything network-related stays outside the lock.
+  Future<({Uint8List wire, bool isHandshake, RatchetSession session})>
+      _encryptAndPersist({
     required String recipientId,
     required PhantomMessage message,
   }) async {
     final session  = await _getOrCreateSession(recipientId);
     final protocol = PhantomProtocol(session);
-    
+
     // Check if this is a new session (handshake) by seeing if we still need
     // to embed our ephemeral keys.
-    bool isHandshake = session.pendingX3dhEphemeralKey != null;
+    final bool isHandshake = session.pendingX3dhEphemeralKey != null;
 
     // Capture BEFORE encode() calls session.encrypt(), which clears these.
     final x3dhEk      = session.pendingX3dhEphemeralKey;
@@ -780,6 +784,26 @@ class PhantomCore {
 
     // Persist updated session state
     await _saveSession(recipientId, session);
+
+    return (wire: wire, isHandshake: isHandshake, session: session);
+  }
+
+  Future<StoredMessage> _sendPhantomMessageInner({
+    required String recipientId,
+    required PhantomMessage message,
+  }) async {
+    // Ratchet mutation (encrypt + persist) runs under the SAME lock as
+    // inbound processing — see _sessionLock. The network publish below runs
+    // OUTSIDE it so a slow transport (Waku store confirmation) can't stall
+    // frame decryption or other sends' encrypts. Lock order is always
+    // sendLock(recipient) → _sessionLock; inbound takes _sessionLock only,
+    // and sends triggered from inbound handlers are unawaited, so they only
+    // queue — no deadlock.
+    final prep = await _sessionLock.guard(() => _encryptAndPersist(
+        recipientId: recipientId, message: message));
+    final wire        = prep.wire;
+    final isHandshake = prep.isHandshake;
+    final session     = prep.session;
 
     final stored = StoredMessage.fromPhantomMessage(
       msg:            message,
@@ -1978,20 +2002,22 @@ class PhantomCore {
     return false;
   }
 
-  /// Serializes ALL inbound frame processing. Decrypting mutates ratchet
-  /// session state; when several frames land at once (Waku store backlog on
-  /// cold start, multi-transport fan-in, the loopback lab) concurrent
-  /// handling advances the same session from the same snapshot — the first
-  /// save wins and every other frame fails with "no session could decrypt".
-  /// Found by the loopback e2e lab, where zero latency makes the race fire
-  /// on every run.
-  final _inboundLock = _SerialLock();
+  /// Serializes EVERY ratchet session read-modify-write: all inbound frame
+  /// processing AND the encrypt+persist phase of every send. Both paths
+  /// mutate the same live RatchetSession objects; worse, a failed inbound
+  /// decrypt restores the session from a pre-attempt snapshot
+  /// (_tryDecryptAsMsg), which — interleaved with a concurrent send — wiped
+  /// out the send's chain advance, so the NEXT send reused a spent chain
+  /// index and the peer could never decrypt again ("no session could
+  /// decrypt" cascade → mutual auto-revive resets, seen in the field and
+  /// reproduced deterministically by the lab's burst test).
+  final _sessionLock = _SerialLock();
 
   Future<void> _handleIncomingBytes(Uint8List data, {String? i2pSourceDest}) {
     // Dedupe outside the lock: duplicates are the common case under
     // multi-transport fan-out and shouldn't queue behind decrypts.
     if (_disposed || _isDuplicateFrame(data)) return Future.value();
-    return _inboundLock.guard(
+    return _sessionLock.guard(
         () => _handleIncomingBytesInner(data, i2pSourceDest: i2pSourceDest));
   }
 
