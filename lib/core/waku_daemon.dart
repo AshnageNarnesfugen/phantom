@@ -542,6 +542,44 @@ class WakuDaemon {
         '--keep-alive=30s',
       ];
 
+  /// True when at least one pinned store node shows connected=true in
+  /// /admin/v1/peers. A 200 from the peers POST only means "accepted" — the
+  /// dial happens async and can sit in go-waku's dial backoff, so callers
+  /// must verify with this before trusting a re-dial (field logs showed
+  /// "✓ re-dialed ×3" followed by store 500s for the rest of the session).
+  Future<bool> hasConnectedStorePeer() async {
+    try {
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 3);
+      final req = await client.getUrl(Uri.parse('$apiUrl/admin/v1/peers'));
+      final resp = await req.close();
+      final body = await resp.transform(utf8.decoder).join();
+      client.close(force: true);
+      if (resp.statusCode != 200) return false;
+      final decoded = jsonDecode(body);
+      if (decoded is! List) return false;
+      final pinnedIds =
+          pinnedStoreNodes.map((m) => m.split('/p2p/').last).toSet();
+      return decoded.any((p) =>
+          p is Map &&
+          pinnedIds.contains(p['id']) &&
+          (p['connected'] == true));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Full daemon restart — the last-resort store cure when re-dialing the
+  /// pinned nodes doesn't reconnect them (go-waku's internal dial backoff
+  /// has no reset API). Android only: lab/desktop daemons are spawned and
+  /// owned externally.
+  Future<void> restart() async {
+    if (!Platform.isAndroid) return;
+    debugPrint('[WakuDaemon] restarting daemon');
+    await stop();
+    await ensure();
+  }
+
   DateTime? _lastPeerHeal;
 
   /// Re-dials the pinned store nodes through the REST admin API. go-waku

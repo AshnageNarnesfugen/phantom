@@ -1812,6 +1812,35 @@ class WakuTransport implements PhantomTransport {
     }
   }
 
+  DateTime? _lastDaemonRestart;
+
+  /// Store-connectivity cure, escalating:
+  ///  1. re-dial the pinned store nodes (throttled inside the daemon);
+  ///  2. VERIFY one actually shows connected=true — the POST 200 alone is
+  ///     meaningless while go-waku holds the address in dial backoff;
+  ///  3. if still dead, restart the whole daemon (fresh process = fresh
+  ///     dial state), at most once per 3 minutes.
+  Future<void> _healStore(TransportDebugger dbg) async {
+    await _daemon.ensureServicePeers();
+    // Give the freshly-POSTed dials a moment before judging them.
+    await Future.delayed(const Duration(seconds: 2));
+    if (await _daemon.hasConnectedStorePeer()) return;
+
+    final now = DateTime.now();
+    if (_lastDaemonRestart != null &&
+        now.difference(_lastDaemonRestart!) < const Duration(minutes: 3)) {
+      return;
+    }
+    _lastDaemonRestart = now;
+    dbg.log('Waku: store nodes still unreachable after re-dial '
+        '(dial backoff?) — restarting daemon');
+    try {
+      await _daemon.restart();
+    } catch (e) {
+      dbg.log('Waku: daemon restart failed: $e');
+    }
+  }
+
   @override
   Future<void> publish({
     required String recipientId,
@@ -1856,7 +1885,7 @@ class WakuTransport implements PhantomTransport {
       // The usual reason: NAT churn silently dropped our store-node
       // connections and go-waku never re-dials staticnodes. Heal before
       // the next round (throttled internally).
-      await _daemon.ensureServicePeers();
+      await _healStore(dbg);
     }
     throw const TransportException(
         'Waku publish never appeared in the fleet store');
@@ -1918,7 +1947,7 @@ class WakuTransport implements PhantomTransport {
         // Failed store query usually means the store-node connections are
         // gone (NAT churn / discovery not warm yet) — re-dial them before
         // the next attempt instead of just waiting.
-        await _daemon.ensureServicePeers();
+        await _healStore(dbg);
         await Future.delayed(const Duration(seconds: 15));
       }
       dbg.log('Waku: ✗ store backlog never fetched (no store peers in 10m)');

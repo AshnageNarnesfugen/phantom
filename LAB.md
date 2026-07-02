@@ -80,6 +80,15 @@ Dividendos del primer día:
 - **La confirmación por store no debe bloquear el envío**:
   `TransportManager.publish` resuelve al primer transporte exitoso; esperar a
   todos serializaba las ráfagas post-handshake en colas de minutos.
+- **El 200 del POST /admin/v1/peers no significa conectado**: el dial es
+  asíncrono y puede quedar en dial backoff. Hay que verificar
+  `connected=true` en el GET y, si el store sigue muerto, reiniciar el
+  daemon (única forma de resetear el backoff en v0.9.0).
+- **Los frames del store son replays históricos**: un frame ya consumido por
+  el ratchet es indescifrable POR DISEÑO (forward secrecy). Con cursor
+  obsoleto, un arranque en frío replayea la sesión anterior entera y sin
+  guard eso disparaba auto-revive contra una sesión sana en el primer
+  segundo del boot. Los frames `Waku-Store` jamás escalan a revive.
 
 ## Trampas del entorno de test
 

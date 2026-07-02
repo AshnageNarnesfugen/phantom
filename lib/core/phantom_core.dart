@@ -1742,6 +1742,9 @@ class PhantomCore {
       (envelope) => _handleIncomingBytes(
         envelope.data,
         i2pSourceDest: envelope.i2pSourceDestination,
+        // Store frames are historical replays by definition — they must
+        // never trigger auto-revive (see _handleMsgFrame).
+        fromStore: envelope.transportName == 'Waku-Store',
       ),
       onError: (_) {},
     );
@@ -2013,15 +2016,17 @@ class PhantomCore {
   /// reproduced deterministically by the lab's burst test).
   final _sessionLock = _SerialLock();
 
-  Future<void> _handleIncomingBytes(Uint8List data, {String? i2pSourceDest}) {
+  Future<void> _handleIncomingBytes(Uint8List data,
+      {String? i2pSourceDest, bool fromStore = false}) {
     // Dedupe outside the lock: duplicates are the common case under
     // multi-transport fan-out and shouldn't queue behind decrypts.
     if (_disposed || _isDuplicateFrame(data)) return Future.value();
-    return _sessionLock.guard(
-        () => _handleIncomingBytesInner(data, i2pSourceDest: i2pSourceDest));
+    return _sessionLock.guard(() => _handleIncomingBytesInner(data,
+        i2pSourceDest: i2pSourceDest, fromStore: fromStore));
   }
 
-  Future<void> _handleIncomingBytesInner(Uint8List data, {String? i2pSourceDest}) async {
+  Future<void> _handleIncomingBytesInner(Uint8List data,
+      {String? i2pSourceDest, bool fromStore = false}) async {
     if (_disposed) return;
     final dbg = TransportDebugger.instance;
 
@@ -2044,7 +2049,8 @@ class PhantomCore {
         // attribute the I2P source dest until after decrypt. _handleMsgFrame
         // takes the dest and pins it to whichever session successfully
         // decodes the frame.
-        await _handleMsgFrame(frame, i2pSourceDest: i2pSourceDest);
+        await _handleMsgFrame(frame,
+            i2pSourceDest: i2pSourceDest, fromStore: fromStore);
       }
     } catch (e) {
       dbg.log('MSG: ✗ frame parse/handle error: $e');
@@ -2509,11 +2515,25 @@ class PhantomCore {
     return false;
   }
 
-  Future<bool> _handleMsgFrame(ParsedFrame frame, {String? i2pSourceDest}) async {
+  Future<bool> _handleMsgFrame(ParsedFrame frame,
+      {String? i2pSourceDest, bool fromStore = false}) async {
     final dbg = TransportDebugger.instance;
     dbg.log('MSG: trying ${_sessions.length} session(s) for MSG decrypt');
     if (await _tryDecryptAsMsg(frame, i2pSourceDest: i2pSourceDest)) return true;
     dbg.log('MSG: ✗ no session could decrypt this MSG frame');
+
+    // Waku Store frames are historical replays by definition: any frame the
+    // ratchet already consumed is legitimately undecryptable (its message
+    // keys are gone — that's forward secrecy working). On a cold start with
+    // a stale store cursor the ENTIRE previous session can replay, and there
+    // is no recent "good decrypt" yet to trip the straggler guard below —
+    // observed in the field: boot → 20 replayed frames → auto-revive reset a
+    // healthy session within the first second. Store frames therefore never
+    // escalate to auto-revive; live transports are the only desync signal.
+    if (fromStore) {
+      dbg.log('MSG: undecryptable store replay — dropped (no revive)');
+      return false;
+    }
 
     // ── Auto-revive: detect ratchet desync and re-handshake ──────────────
     // If we have a session for the sender but decryption fails, the ratchet
