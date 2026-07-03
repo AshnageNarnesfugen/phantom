@@ -2042,7 +2042,8 @@ class PhantomCore {
         // sending a bogus INIT from their own dest, redirecting Bob's future
         // replies to a void. Pinning happens inside _handleInitFrameInner
         // only after the X3DH respond + decrypt succeeds.
-        await _handleInitFrame(frame, i2pSourceDest: i2pSourceDest);
+        await _handleInitFrame(frame,
+            i2pSourceDest: i2pSourceDest, fromStore: fromStore);
       } else {
         dbg.log('MSG: ← MSG frame (${data.length} bytes)');
         // MSG frames don't carry sender identity in cleartext, so we can't
@@ -2120,7 +2121,8 @@ class PhantomCore {
   }
 
   /// Handle an INIT frame: run X3DH respond, create receiver session, decrypt.
-  Future<void> _handleInitFrame(ParsedFrame frame, {String? i2pSourceDest}) async {
+  Future<void> _handleInitFrame(ParsedFrame frame,
+      {String? i2pSourceDest, bool fromStore = false}) async {
     final senderPhantomId = frame.senderPhantomId;
 
     // Serialize INIT processing per sender to prevent the concurrent-session
@@ -2132,14 +2134,16 @@ class PhantomCore {
     final completer = Completer<void>();
     _initProcessingLocks[senderPhantomId] = completer.future;
     try {
-      await _handleInitFrameInner(frame, i2pSourceDest: i2pSourceDest);
+      await _handleInitFrameInner(frame,
+          i2pSourceDest: i2pSourceDest, fromStore: fromStore);
     } finally {
       _initProcessingLocks.remove(senderPhantomId);
       completer.complete();
     }
   }
 
-  Future<void> _handleInitFrameInner(ParsedFrame frame, {String? i2pSourceDest}) async {
+  Future<void> _handleInitFrameInner(ParsedFrame frame,
+      {String? i2pSourceDest, bool fromStore = false}) async {
     final dbg = TransportDebugger.instance;
     final senderIkBytes   = frame.senderIdentityKeyBytes!;
     final senderEkBytes   = frame.senderEphemeralKeyBytes!;
@@ -2170,7 +2174,7 @@ class PhantomCore {
     // transport replay of a frame we already consumed — drop silently without
     // arming auto-revive.
     if (isKnownEk) {
-      final ok = await _tryDecryptAsMsg(frame);
+      final ok = await _tryDecryptAsMsg(frame, fromStore: fromStore);
       dbg.log(ok
           ? 'MSG: known-EK INIT payload decrypted via existing session'
           : 'MSG: replay (known EK) — dropping duplicate');
@@ -2186,7 +2190,7 @@ class PhantomCore {
     if (storedEkHex == null && (hasMemSession || hasStoredSession)) {
       dbg.log('MSG: no stored EK but session exists (mem=$hasMemSession, '
           'disk=$hasStoredSession) → trying as MSG');
-      final success = await _handleMsgFrame(frame);
+      final success = await _handleMsgFrame(frame, fromStore: fromStore);
       if (success) return;
       dbg.log('MSG: ✗ decryption as MSG failed, falling back to process as fresh INIT');
     }
@@ -2327,12 +2331,14 @@ class PhantomCore {
       // Last resort: maybe a duplicate INIT raced an existing session.
       if (_sessions.containsKey(senderPhantomId) ||
           await storage.getSessionState(senderPhantomId) != null) {
-        await _handleMsgFrame(frame);
+        await _handleMsgFrame(frame, fromStore: fromStore);
       }
       return;
     }
 
     dbg.log('MSG: ✓ INIT decrypted OK — type=${message.type.name}');
+    // A live INIT that just passed X3DH is direct proof the sender is online.
+    if (!fromStore) _presence?.noteActivity(senderPhantomId);
 
     // Build a full ContactRecord from the embedded ContactAddress when possible,
     // so we can re-initiate sessions later without the sender needing to resend.
@@ -2489,7 +2495,8 @@ class PhantomCore {
   /// Returns true on the first successful decrypt. Does NOT trigger auto-revive
   /// on failure — caller decides whether to escalate (used by the known-EK
   /// INIT path where a failure is a legit transport replay, not desync).
-  Future<bool> _tryDecryptAsMsg(ParsedFrame frame, {String? i2pSourceDest}) async {
+  Future<bool> _tryDecryptAsMsg(ParsedFrame frame,
+      {String? i2pSourceDest, bool fromStore = false}) async {
     final dbg = TransportDebugger.instance;
     for (final entry in List.of(_sessions.entries)) {
       final snapshot = entry.value.takeSnapshot();
@@ -2500,6 +2507,10 @@ class PhantomCore {
         await _saveSession(entry.key, entry.value);
         await _dispatchIncoming(message, entry.key);
         dbg.log('MSG: ✓ MSG decrypted via session ${entry.key.substring(0, 8)}');
+        // Implicit presence: a live frame that decrypts is direct proof the
+        // contact is online right now. Store replays are historical and say
+        // nothing about the present, so they don't count.
+        if (!fromStore) _presence?.noteActivity(entry.key);
         _lastSuccessfulDecryptAt[entry.key] = DateTime.now();
         _autoReviveStreak.remove(entry.key);
         _cancelHandshakeRetry(entry.key);
@@ -2519,7 +2530,10 @@ class PhantomCore {
       {String? i2pSourceDest, bool fromStore = false}) async {
     final dbg = TransportDebugger.instance;
     dbg.log('MSG: trying ${_sessions.length} session(s) for MSG decrypt');
-    if (await _tryDecryptAsMsg(frame, i2pSourceDest: i2pSourceDest)) return true;
+    if (await _tryDecryptAsMsg(frame,
+        i2pSourceDest: i2pSourceDest, fromStore: fromStore)) {
+      return true;
+    }
     dbg.log('MSG: ✗ no session could decrypt this MSG frame');
 
     // Waku Store frames are historical replays by definition: any frame the

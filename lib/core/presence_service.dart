@@ -5,10 +5,18 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'ipfs_daemon.dart';
 
-/// Lightweight presence layer using the bundled IPFS daemon as a pubsub bus.
+/// Lightweight presence layer using the bundled IPFS daemon as a pubsub bus,
+/// enriched with implicit signals: any successfully decrypted LIVE frame from
+/// a contact proves they're online right now ([noteActivity]), which is far
+/// more reliable than pubsub heartbeats riding a gossipsub mesh that takes
+/// minutes to form after boot.
 class PresenceService {
-  static const _interval             = Duration(minutes: 2);
-  static const _threshold            = Duration(minutes: 7);
+  /// 30s heartbeat / 90s threshold: three missed beats flip the dot to
+  /// offline. The previous 2min/7min meant the green dot could lag reality
+  /// by several minutes in both directions (and a task-killed app kept
+  /// glowing green for up to 7 minutes).
+  static const _interval             = Duration(seconds: 30);
+  static const _threshold            = Duration(seconds: 90);
   static const _dhtAdvertiseInterval = Duration(minutes: 20);
   static const _dhtDiscoverInterval  = Duration(minutes: 2);
 
@@ -26,6 +34,7 @@ class PresenceService {
   final Map<String, String> _contactIpfsPeerIds = {};
 
   Timer? _heartbeatTimer;
+  Timer? _sweepTimer;
   Timer? _dhtAdvertiseTimer;
   Timer? _dhtDiscoverTimer;
   bool _disposed = false;
@@ -44,16 +53,73 @@ class PresenceService {
 
   Future<void> start(List<String> contactIds) async {
     _subscribeAll(contactIds);
+    // Burst the first heartbeats: the gossipsub mesh for the prs topic takes
+    // seconds-to-minutes to form after boot (field logs: prs-topic peers=0
+    // for minutes), so the very first publishes usually vanish. Repeating at
+    // 5/15/30s covers the formation window instead of waiting a full period.
     await _publishHeartbeat();
-    Timer(const Duration(seconds: 10), () => _publishHeartbeat(online: _isForeground));
+    for (final s in const [5, 15, 30]) {
+      Timer(Duration(seconds: s), () => _publishHeartbeat(online: _isForeground));
+    }
     _heartbeatTimer = Timer.periodic(_interval, (_) => _publishHeartbeat(online: _isForeground));
+
+    // Threshold sweeper: expiry produces no pubsub event, so without this
+    // the UI (which repaints on `changes` only) kept a stale green dot
+    // forever once a contact vanished silently.
+    _sweepTimer = Timer.periodic(const Duration(seconds: 15), (_) => _sweepExpired());
 
     unawaited(_advertiseOnDht());
     Timer(const Duration(seconds: 15), _advertiseOnDht);
-    
+
     Timer(const Duration(seconds: 5), () => _discoverAll(contactIds));
     _dhtAdvertiseTimer = Timer.periodic(_dhtAdvertiseInterval, (_) => _advertiseOnDht());
     _dhtDiscoverTimer = Timer.periodic(_dhtDiscoverInterval, (_) => _discoverAll(_subscribed.toList()));
+  }
+
+  /// Implicit presence: called by the core whenever a LIVE frame from
+  /// [contactId] decrypts successfully — direct proof they're online, no
+  /// heartbeat needed. Store replays must NOT feed this (historical frames
+  /// say nothing about now); the core filters those out.
+  void noteActivity(String contactId) {
+    if (_disposed) return;
+    final wasOnline = isOnline(contactId);
+    _lastSeen[contactId] = DateTime.now();
+    if (!wasOnline) {
+      _changesCtrl.add(contactId);
+      // They just came online — answer with our own heartbeat so THEIR dot
+      // for us converges immediately too (throttled).
+      unawaited(_answerHeartbeat());
+    }
+  }
+
+  DateTime? _lastAnswerAt;
+
+  /// Publishes our heartbeat in response to hearing from a contact, at most
+  /// once per 20s, only while foregrounded. Makes both sides' dots converge
+  /// within seconds of one side coming online instead of waiting out the
+  /// other's timer period.
+  Future<void> _answerHeartbeat() async {
+    if (!_isForeground || _disposed) return;
+    final now = DateTime.now();
+    if (_lastAnswerAt != null &&
+        now.difference(_lastAnswerAt!) < const Duration(seconds: 20)) {
+      return;
+    }
+    _lastAnswerAt = now;
+    await _publishHeartbeat();
+  }
+
+  void _sweepExpired() {
+    if (_disposed) return;
+    final now = DateTime.now();
+    final expired = _lastSeen.entries
+        .where((e) => now.difference(e.value) >= _threshold)
+        .map((e) => e.key)
+        .toList();
+    for (final id in expired) {
+      _lastSeen.remove(id);
+      _changesCtrl.add(id);
+    }
   }
 
   void addContacts(List<String> contactIds) {
@@ -99,7 +165,12 @@ class PresenceService {
         final wasOnline = isOnline(contactId);
         if (event.online) {
           _lastSeen[contactId] = event.at;
-          if (!wasOnline) _changesCtrl.add(contactId);
+          if (!wasOnline) {
+            _changesCtrl.add(contactId);
+            // Answer so their dot for us converges without waiting our
+            // timer period (throttled inside).
+            unawaited(_answerHeartbeat());
+          }
         } else {
           final hadSeen = _lastSeen.remove(contactId) != null;
           if (wasOnline || hadSeen) _changesCtrl.add(contactId);
@@ -278,6 +349,7 @@ class PresenceService {
   void dispose() {
     _disposed = true;
     _heartbeatTimer?.cancel();
+    _sweepTimer?.cancel();
     _dhtAdvertiseTimer?.cancel();
     _dhtDiscoverTimer?.cancel();
     _changesCtrl.close();
