@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -70,6 +71,15 @@ Future<void> _dumpPreviousCrashIfAny() async {
 }
 
 void main() {
+  // Global kill switch for every debugPrint in the app AND the framework.
+  // In release these lines leak network locators and the social graph
+  // (I2P dests, IPFS peer IDs, contact IDs, who talks to whom) to logcat,
+  // which `adb logcat` and any READ_LOGS-holding app on a rooted device can
+  // read. A metadata-minimising messenger must emit nothing there. Crashes
+  // are still captured privately via _writeCrashLog + the in-app debugger.
+  if (kReleaseMode) {
+    debugPrint = (String? message, {int? wrapWidth}) {};
+  }
   runZonedGuarded<void>(() {
     WidgetsFlutterBinding.ensureInitialized();
 

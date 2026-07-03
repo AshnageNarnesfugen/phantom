@@ -136,13 +136,41 @@ class PresenceService {
     return last != null && DateTime.now().difference(last) < _threshold;
   }
 
-  Future<void> goOffline() {
+  List<String> _contactIds() =>
+      _subscribed.where((id) => id != _myId).toList();
+
+  /// App backgrounded: publish one offline beat and STOP all periodic work.
+  /// Previously goOffline() only flipped a flag while the heartbeat (30s),
+  /// sweeper (15s) and DHT discover (2m, which fires a swarm/connect storm)
+  /// kept firing forever in the background — waking the radio every few
+  /// seconds for presence nobody is looking at. Cancelling them is one of
+  /// the largest battery wins available. The long-lived pubsub SSE streams
+  /// stay up: they're event-driven, not polling, and message receipt rides
+  /// the same daemon.
+  Future<void> goOffline() async {
     _isForeground = false;
-    return _publishHeartbeat(online: false);
+    _heartbeatTimer?.cancel();
+    _sweepTimer?.cancel();
+    _dhtDiscoverTimer?.cancel();
+    _dhtAdvertiseTimer?.cancel();
+    await _publishHeartbeat(online: false);
   }
-  Future<void> publishOnline() {
+
+  /// App foregrounded: announce online and restart the periodic work that
+  /// goOffline() cancelled, with the same startup burst as a cold start so
+  /// the dot converges within seconds.
+  Future<void> publishOnline() async {
+    if (_isForeground) return; // already active — avoid duplicate timers
     _isForeground = true;
-    return _publishHeartbeat(online: true);
+    await _publishHeartbeat(online: true);
+    for (final s in const [3, 10, 20]) {
+      Timer(Duration(seconds: s), () => _publishHeartbeat(online: _isForeground));
+    }
+    _heartbeatTimer = Timer.periodic(_interval, (_) => _publishHeartbeat(online: _isForeground));
+    _sweepTimer = Timer.periodic(const Duration(seconds: 15), (_) => _sweepExpired());
+    _dhtDiscoverTimer = Timer.periodic(_dhtDiscoverInterval, (_) => _discoverAll(_subscribed.toList()));
+    _dhtAdvertiseTimer = Timer.periodic(_dhtAdvertiseInterval, (_) => _advertiseOnDht());
+    unawaited(_discoverAll(_contactIds()));
   }
 
   void _subscribeAll(List<String> ids) {

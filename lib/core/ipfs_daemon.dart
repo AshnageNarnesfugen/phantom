@@ -157,8 +157,18 @@ class IpfsDaemon {
     final req = await client.postUrl(Uri.parse('$apiUrl/api/v0/add?pin=true'));
     final boundary = '----PhantomBoundary${DateTime.now().millisecondsSinceEpoch}';
     req.headers.contentType = ContentType('multipart', 'form-data', parameters: {'boundary': boundary});
-    
-    final header = '--$boundary\r\nContent-Disposition: form-data; name="file"; filename="$fileName"\r\nContent-Type: application/octet-stream\r\n\r\n';
+
+    // The filename is interpolated raw into a MIME header, so a name
+    // containing a double-quote or CR/LF could close the field early, inject
+    // extra headers, or split the multipart body (HTTP request smuggling
+    // against our own daemon). Strip everything that could break out of the
+    // quoted string — no legitimate filename needs quotes, control chars, or
+    // path separators here (the CID is what identifies the content anyway).
+    final safeFileName = fileName
+        .replaceAll(RegExp(r'[\x00-\x1f"\\/]'), '_')
+        .replaceAll('..', '_');
+
+    final header = '--$boundary\r\nContent-Disposition: form-data; name="file"; filename="$safeFileName"\r\nContent-Type: application/octet-stream\r\n\r\n';
     req.write(header);
     req.add(bytes);
     req.write('\r\n--$boundary--\r\n');
