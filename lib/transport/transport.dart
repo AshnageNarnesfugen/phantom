@@ -86,6 +86,12 @@ class TransportManager {
   final List<PhantomTransport> _activeTransports = [];
   final StreamController<IncomingEnvelope> _incomingController =
       StreamController.broadcast();
+  // Live subscriptions to each active transport's incoming stream. Cancelled
+  // in dispose() BEFORE the controller closes — otherwise a late delivery
+  // (a queued frame arriving after teardown) hits a closed controller and
+  // throws "Cannot add new events after calling close".
+  final List<StreamSubscription<IncomingEnvelope>> _incomingSubs = [];
+  bool _disposedMgr = false;
 
   // Used by _activateLateTransports to subscribe newly-available transports.
   String _ourId = '';
@@ -156,11 +162,12 @@ class TransportManager {
     );
 
     for (final t in reachable.whereType<PhantomTransport>()) {
+      if (_disposedMgr) break;
       _activeTransports.add(t);
-      t.subscribe(ourId: ourId).listen(
-        _incomingController.add,
+      _incomingSubs.add(t.subscribe(ourId: ourId).listen(
+        (e) { if (!_incomingController.isClosed) _incomingController.add(e); },
         onError: (e) => dbg.log('TRANSPORT: ${t.name} stream error: $e'),
-      );
+      ));
     }
     
     if (_activeTransports.isEmpty) {
@@ -186,14 +193,15 @@ class TransportManager {
 
     try {
       for (final t in _transports) {
+        if (_disposedMgr) break;
         if (_activeTransports.contains(t)) { continue; }
         try {
           if (await t.checkAvailability()) {
             _activeTransports.add(t);
-            t.subscribe(ourId: _ourId).listen(
-              _incomingController.add,
+            _incomingSubs.add(t.subscribe(ourId: _ourId).listen(
+              (e) { if (!_incomingController.isClosed) _incomingController.add(e); },
               onError: (_) {},
-            );
+            ));
             TransportDebugger.instance
                 .log('TRANSPORT: ${t.name} activated late');
           }
@@ -411,6 +419,13 @@ class TransportManager {
   }
 
   Future<void> dispose() async {
+    _disposedMgr = true;
+    // Cancel incoming subscriptions BEFORE closing the controller so a
+    // late delivery can't add to a closed sink.
+    for (final s in _incomingSubs) {
+      await s.cancel();
+    }
+    _incomingSubs.clear();
     for (final t in _transports) {
       await t.dispose();
     }

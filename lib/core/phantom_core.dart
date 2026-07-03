@@ -312,7 +312,13 @@ class PhantomCore {
     await store.initialize(
       seedPhrase: result.seedPhrase,
       storagePath: storagePath,
-      boxNamespace: storage == null ? '' : 'lab${identityHashCode(storage)}',
+      boxNamespace: storage == null
+          ? ''
+          // Derived from the path (unique per lab identity, stable across
+          // restores) — identityHashCode collided between tests: Hive's
+          // global registry then served a PREVIOUS test's open box, whose
+          // old cipher turned every read into garbage.
+          : 'lab${storagePath.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '')}',
     );
 
     final transport = _buildTransport(transportConfig, store, transports);
@@ -351,7 +357,13 @@ class PhantomCore {
     await store.initialize(
       seedPhrase: seedPhrase,
       storagePath: storagePath,
-      boxNamespace: storage == null ? '' : 'lab${identityHashCode(storage)}',
+      boxNamespace: storage == null
+          ? ''
+          // Derived from the path (unique per lab identity, stable across
+          // restores) — identityHashCode collided between tests: Hive's
+          // global registry then served a PREVIOUS test's open box, whose
+          // old cipher turned every read into garbage.
+          : 'lab${storagePath.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '')}',
     );
 
     final transport = _buildTransport(transportConfig, store, transports);
@@ -564,14 +576,23 @@ class PhantomCore {
     );
   }
 
+  /// Media up to this size travels INLINE through the normal encrypted
+  /// message path instead of as an IPFS CID pointer. Inline media rides the
+  /// Waku fleet store like text does — loss-free async delivery with the
+  /// sender free to go offline immediately. The CID path requires the
+  /// SENDER's IPFS node to stay reachable until every recipient fetches,
+  /// which the duty-cycled background mode reduced to a narrow window
+  /// (field bug: receiver stuck on "[image]" forever because the sender's
+  /// daemon slept before the DHT fetch began). 64 KiB + 1 KiB padding +
+  /// frame overhead stays comfortably under the fleet's ~150 KiB relay
+  /// message cap.
+  static const int inlineMediaMax = 64 * 1024;
+
   Future<StoredMessage> sendFile({
     required String recipientId,
     required Uint8List bytes,
     required String fileName,
   }) async {
-    // 1. IPFS On-Demand: Ensure the daemon is running only when needed
-    await IpfsDaemon.instance.ensure();
-
     // The wire format reserves a single byte for the name length, so the
     // name must fit in 255 UTF-8 bytes. Trim from the front to preserve the
     // extension (the receiver uses it to pick image/audio rendering).
@@ -580,17 +601,36 @@ class PhantomCore {
       safeName = safeName.substring(1);
     }
 
-    // 2. Upload file to IPFS and pin it locally
-    final cid = await IpfsDaemon.instance.uploadFile(bytes, safeName);
-
-    // 3. Prepare the Waku message containing only the CID + filename
     final lower = safeName.toLowerCase();
     final isImage = lower.endsWith('.jpg') || lower.endsWith('.jpeg') ||
         lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp');
 
     final type = isImage ? MessageType.image : MessageType.file;
 
-    // Wire format for files: [name_len(1)][fileName][CID]
+    // ── Inline path: small media needs no IPFS at all ─────────────────────
+    // The content sent IS the display form (raw bytes for images,
+    // name\0bytes for files/audio), which the receiver renders directly:
+    // tryParseFileWireContent returns null for it, so no resolution step,
+    // no dependency on anyone's IPFS daemon, store-and-forward included.
+    if (bytes.length <= inlineMediaMax) {
+      return _sendPhantomMessage(
+        recipientId: recipientId,
+        message: PhantomMessage(
+          type: type,
+          content:
+              isImage ? bytes : encodeFileDisplayContent(safeName, bytes),
+        ),
+      );
+    }
+
+    // ── CID path: large media via IPFS ────────────────────────────────────
+    // 1. IPFS On-Demand: Ensure the daemon is running only when needed
+    await IpfsDaemon.instance.ensure();
+
+    // 2. Upload file to IPFS and pin it locally
+    final cid = await IpfsDaemon.instance.uploadFile(bytes, safeName);
+
+    // 3. Wire format for files: [name_len(1)][fileName][CID]
     // (CID is small enough that Waku easily handles it)
     final nameBytes = utf8.encode(safeName);
     final cidBytes = utf8.encode(cid);
@@ -794,6 +834,18 @@ class PhantomCore {
     required String recipientId,
     required PhantomMessage message,
   }) async {
+    // Queued (unawaited) sends may reach here after dispose(); writing to
+    // storage at that point races teardown. No-op instead of throwing — the
+    // callers are fire-and-forget system sends.
+    if (_disposed) {
+      return StoredMessage.fromPhantomMessage(
+        msg: message,
+        conversationId: recipientId,
+        direction: MessageDirection.outgoing,
+        status: MessageStatus.failed,
+      );
+    }
+
     // Ratchet mutation (encrypt + persist) runs under the SAME lock as
     // inbound processing — see _sessionLock. The network publish below runs
     // OUTSIDE it so a slow transport (Waku store confirmation) can't stall
@@ -2864,6 +2916,16 @@ class PhantomCore {
     _disposed = true;
     _powerSaveGraceTimer?.cancel();
     _resyncSentinel?.cancel();
+    // Drain barriers: guard() chains are FIFO, so awaiting an empty guarded
+    // block guarantees every already-queued handler (inbound decrypts,
+    // outbound encrypts) finished — whatever was mid-write completes BEFORE
+    // the caller tears down the storage directory underneath it. The lab's
+    // temp-dir cleanup used to race a straggler saveSession and blow up
+    // with PathNotFoundException attributed to a passing test.
+    await _sessionLock.guard(() async {});
+    for (final lock in _sendLocks.values.toList()) {
+      await lock.guard(() async {});
+    }
     for (final t in _handshakeRetryTimers.values) {
       t.cancel();
     }

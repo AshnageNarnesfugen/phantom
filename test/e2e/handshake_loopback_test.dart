@@ -2,6 +2,7 @@
 library;
 
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:phantom_messenger/phantom_messenger.dart';
@@ -158,6 +159,43 @@ void main() {
     // Y las sesiones deben seguir vivas (sin auto-revive destructivo).
     expect(await alice.storage.getSessionState(bob.myId), isNotNull);
     expect(await bob.storage.getSessionState(alice.myId), isNotNull);
+  });
+
+  test('media pequeño viaja inline (sin IPFS) y llega íntegro', () async {
+    final bobAddress = await bob.getMyContactAddress();
+    await alice.addContact(contactAddress: bobAddress!);
+
+    // Handshake por primer mensaje.
+    final warm = nextMessage(bob);
+    await alice.sendMessage(recipientId: bob.myId, text: 'hola');
+    await warm;
+
+    // Imagen de 30 KB — bajo el umbral inline: NO debe tocar IPFS (en este
+    // lab no hay daemon, así que si lo tocara fallaría o quedaría pendiente
+    // como "[image]"). El receptor debe obtener los bytes EXACTOS, listos
+    // para renderizar, sin paso de resolución.
+    final img = Uint8List.fromList(
+        List<int>.generate(30 * 1024, (i) => (i * 31 + 7) & 0xff));
+    final bobGets = bob.incomingMessages
+        .firstWhere((m) => m.type == MessageType.image)
+        .timeout(const Duration(seconds: 20));
+    await alice.sendFile(
+        recipientId: bob.myId, bytes: img, fileName: 'foto.png');
+    final got = await bobGets;
+    expect(got.content, img,
+        reason: 'la imagen inline debe llegar byte a byte, sin CID');
+    expect(PhantomCore.tryParseFileWireContent(got.content), isNull,
+        reason: 'el contenido inline no debe parsear como puntero CID');
+
+    // Archivo genérico (no imagen): display form name\0bytes.
+    final doc = Uint8List.fromList(List<int>.generate(2048, (i) => i & 0xff));
+    final bobGetsFile = bob.incomingMessages
+        .firstWhere((m) => m.type == MessageType.file)
+        .timeout(const Duration(seconds: 20));
+    await alice.sendFile(
+        recipientId: bob.myId, bytes: doc, fileName: 'notas.pdf');
+    final gotFile = await bobGetsFile;
+    expect(gotFile.content, PhantomCore.encodeFileDisplayContent('notas.pdf', doc));
   });
 
   test('frames duplicados no producen mensajes duplicados', () async {

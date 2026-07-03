@@ -185,23 +185,39 @@ class IpfsDaemon {
     return json['Hash'] as String;
   }
 
+  /// Overall deadline for one fetch. connectionTimeout only covers the TCP
+  /// connect to the LOCAL daemon (instant); `/api/v0/cat` itself blocks
+  /// indefinitely while kubo hunts the DHT for providers. With the sender's
+  /// node asleep (duty-cycled background) that hunt never ends — observed in
+  /// the field as a "[image]" bubble stuck forever with no error and the
+  /// in-flight guard blocking every retry.
+  static const _downloadDeadline = Duration(seconds: 90);
+
   Future<Uint8List> downloadFile(String cid) async {
     _idleTimer?.cancel();
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
+    try {
+      return await _catAll(client, cid).timeout(_downloadDeadline);
+    } finally {
+      // Also aborts the in-flight request on timeout — otherwise the hung
+      // socket (and kubo's DHT hunt) would outlive the deadline.
+      client.close(force: true);
+    }
+  }
+
+  Future<Uint8List> _catAll(HttpClient client, String cid) async {
     final req = await client.postUrl(Uri.parse('$apiUrl/api/v0/cat?arg=$cid'));
     final resp = await req.close();
-    
+
     if (resp.statusCode != 200) {
       final body = await resp.transform(utf8.decoder).join();
-      client.close(force: true);
       throw Exception('IPFS download failed: HTTP ${resp.statusCode}\n$body');
     }
-    
+
     final builder = BytesBuilder();
     await for (final chunk in resp) {
       builder.add(chunk);
     }
-    client.close(force: true);
     return builder.toBytes();
   }
 
