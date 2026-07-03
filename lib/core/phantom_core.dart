@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:convert';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:crypto/crypto.dart' as crypto_lib;
 import 'package:cryptography/cryptography.dart';
@@ -630,14 +631,19 @@ class PhantomCore {
     // 2. Upload file to IPFS and pin it locally
     final cid = await IpfsDaemon.instance.uploadFile(bytes, safeName);
 
-    // 3. Wire format for files: [name_len(1)][fileName][CID]
-    // (CID is small enough that Waku easily handles it)
+    // 3. Wire format for files: [name_len(1)][fileName][size(4 BE)][CID].
+    // The size lets the receiver show "Download · N MB" before fetching.
     final nameBytes = utf8.encode(safeName);
     final cidBytes = utf8.encode(cid);
-    final content = Uint8List(1 + nameBytes.length + cidBytes.length)
+    final sz = bytes.length;
+    final content = Uint8List(1 + nameBytes.length + 4 + cidBytes.length)
       ..[0] = nameBytes.length
       ..setAll(1, nameBytes)
-      ..setAll(1 + nameBytes.length, cidBytes);
+      ..[1 + nameBytes.length] = (sz >> 24) & 0xff
+      ..[2 + nameBytes.length] = (sz >> 16) & 0xff
+      ..[3 + nameBytes.length] = (sz >> 8) & 0xff
+      ..[4 + nameBytes.length] = sz & 0xff
+      ..setAll(5 + nameBytes.length, cidBytes);
 
     // 4. Send CID via Waku (WakuTransport will handle this in _sendPhantomMessage)
     final stored = await _sendPhantomMessage(
@@ -675,25 +681,35 @@ class PhantomCore {
     return out;
   }
 
-  /// Attempts to parse [content] as the on-wire file payload
-  /// `[name_len(1)][fileName][CID]`. Returns null when the bytes don't match
-  /// (already-resolved media is raw image bytes or `name\0bytes`, neither of
-  /// which passes the strict CID check).
-  static ({String name, String cid})? tryParseFileWireContent(Uint8List content) {
+  /// On-wire CID pointer for large media:
+  /// `[name_len(1)][fileName][size(4, big-endian)][CID]`. The size lets the
+  /// receiver show "Download · 2.3 MB" WITHOUT fetching anything — the whole
+  /// point of manual/metered download control. Returns null when the bytes
+  /// don't match (already-resolved media is raw image bytes or `name\0bytes`,
+  /// neither of which passes the strict CID check).
+  static ({String name, int size, String cid})? tryParseFileWireContent(
+      Uint8List content) {
     if (content.length < 2) return null;
     final nameLen = content[0];
-    if (nameLen == 0 || content.length <= 1 + nameLen) return null;
+    // 1 (len) + name + 4 (size) + at least a few CID bytes.
+    if (nameLen == 0 || content.length < 1 + nameLen + 4 + 4) return null;
     String name;
+    int size;
     String cid;
     try {
       name = utf8.decode(content.sublist(1, 1 + nameLen));
-      cid  = ascii.decode(content.sublist(1 + nameLen));
+      final sizeOff = 1 + nameLen;
+      size = (content[sizeOff] << 24) |
+          (content[sizeOff + 1] << 16) |
+          (content[sizeOff + 2] << 8) |
+          content[sizeOff + 3];
+      cid = ascii.decode(content.sublist(sizeOff + 4));
     } catch (_) {
       return null;
     }
     final cidOk = RegExp(r'^(Qm[1-9A-HJ-NP-Za-km-z]{44}|baf[a-zA-Z0-9]{20,})$')
         .hasMatch(cid);
-    return cidOk ? (name: name, cid: cid) : null;
+    return cidOk ? (name: name, size: size, cid: cid) : null;
   }
 
   // Media messages travel as a tiny CID pointer; the actual bytes live on
@@ -701,10 +717,13 @@ class PhantomCore {
   // the displayable form. Keyed set prevents duplicate concurrent downloads.
   final Set<String> _mediaResolutionInFlight = {};
 
-  /// Re-attempts resolution of any unresolved media in [conversationId].
-  /// Called by the chat screen on load so a download that failed earlier
-  /// (IPFS still bootstrapping, sender offline) gets retried on each visit.
+  /// Re-attempts resolution of any unresolved media in [conversationId] —
+  /// but only when the auto-download policy allows it on the current network
+  /// (Always / WiFi-only / Manual, see [_shouldAutoDownloadMedia]). In manual
+  /// mode or on metered data this is a no-op; the UI shows a download button
+  /// and the user pulls each file explicitly via [downloadMedia].
   Future<void> resolvePendingMedia(String conversationId) async {
+    if (!await _shouldAutoDownloadMedia()) return;
     final msgs = await storage.getMessages(conversationId, limit: 100);
     for (final m in msgs) {
       if (m.type != MessageType.image && m.type != MessageType.file) continue;
@@ -714,10 +733,38 @@ class PhantomCore {
     }
   }
 
-  Future<void> _resolveMediaMessage(
-      StoredMessage m, ({String name, String cid}) file) async {
+  /// Explicit, user-initiated download of one media message — bypasses the
+  /// auto-download policy (the user tapped the button). Returns true on
+  /// success. No-op (true) if already resolved.
+  Future<bool> downloadMedia(String conversationId, String messageId) async {
+    final msgs = await storage.getMessages(conversationId, limit: 500);
+    final m = msgs.where((x) => x.id == messageId).firstOrNull;
+    if (m == null) return false;
+    final parsed = tryParseFileWireContent(m.content);
+    if (parsed == null) return true; // already resolved
+    return _resolveMediaMessage(m, parsed);
+  }
+
+  /// Auto-download policy: 'always' | 'wifi' (default) | 'never', gated by
+  /// the live connection type for 'wifi'. Unknown network → conservative
+  /// (don't auto-download).
+  Future<bool> _shouldAutoDownloadMedia() async {
+    final mode = await storage.getSetting<String>('media_autodownload') ?? 'wifi';
+    if (mode == 'always') return true;
+    if (mode == 'never') return false;
+    try {
+      final results = await Connectivity().checkConnectivity();
+      return results.any((r) =>
+          r == ConnectivityResult.wifi || r == ConnectivityResult.ethernet);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> _resolveMediaMessage(
+      StoredMessage m, ({String name, int size, String cid}) file) async {
     final key = '${m.conversationId}:${m.id}';
-    if (!_mediaResolutionInFlight.add(key)) return;
+    if (!_mediaResolutionInFlight.add(key)) return false;
     final dbg = TransportDebugger.instance;
     try {
       await IpfsDaemon.instance.ensure();
@@ -730,8 +777,10 @@ class PhantomCore {
       // contactChanges (not incomingMessages) so a pending resendHandshake
       // ack-wait isn't falsely completed by a media refresh.
       notifyContactChanged(m.conversationId);
+      return true;
     } catch (e) {
       dbg.log('MEDIA: ✗ download failed for ${file.name} (${file.cid}): $e');
+      return false;
     } finally {
       _mediaResolutionInFlight.remove(key);
     }
@@ -2747,11 +2796,16 @@ class PhantomCore {
     await storage.saveMessage(stored);
     _incomingController.add(stored);
 
-    // Media arrives as a CID pointer — fetch the real bytes from IPFS in the
-    // background and rewrite the stored message into displayable form.
+    // Media arrives as a CID pointer. Auto-fetch only when the download
+    // policy allows it on the current network (Always / WiFi-only / Manual);
+    // otherwise the message stays a pointer and the chat renders a download
+    // button. Inline media never reaches here as a pointer (its bytes ARE
+    // the content), so it always shows immediately.
     if (stored.type == MessageType.image || stored.type == MessageType.file) {
       final parsed = tryParseFileWireContent(stored.content);
-      if (parsed != null) unawaited(_resolveMediaMessage(stored, parsed));
+      if (parsed != null && await _shouldAutoDownloadMedia()) {
+        unawaited(_resolveMediaMessage(stored, parsed));
+      }
     }
 
     if (_activeChatId != senderId) {

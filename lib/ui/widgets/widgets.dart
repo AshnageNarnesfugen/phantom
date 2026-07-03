@@ -25,6 +25,12 @@ class ChatBubble extends StatelessWidget {
   final String? replyPreview;
   final Uint8List? mediaContent;
   final MessageType messageType;
+  /// Non-null when this media is an unresolved CID pointer: the bytes haven't
+  /// been downloaded, so render a download card (name + size + button)
+  /// instead of trying to show content. Cleared once resolved.
+  final ({String name, int size})? pendingDownload;
+  final bool downloading;
+  final VoidCallback? onDownload;
   final bool glassEnabled;
   final double glassOpacity;
   final double glassBlur;
@@ -44,6 +50,9 @@ class ChatBubble extends StatelessWidget {
     this.replyPreview,
     this.mediaContent,
     this.messageType = MessageType.text,
+    this.pendingDownload,
+    this.downloading = false,
+    this.onDownload,
     this.glassEnabled = false,
     this.glassOpacity = 0.12,
     this.glassBlur = 10.0,
@@ -257,6 +266,17 @@ class ChatBubble extends StatelessWidget {
   }
 
   Widget _buildContent(Color textColor) {
+    // Unresolved CID media: show the download card regardless of type.
+    if (pendingDownload != null) {
+      return _MediaDownloadCard(
+        name: pendingDownload!.name,
+        size: pendingDownload!.size,
+        isImage: messageType == MessageType.image,
+        downloading: downloading,
+        textColor: textColor,
+        onDownload: onDownload,
+      );
+    }
     switch (messageType) {
       case MessageType.image:
         if (mediaContent != null) {
@@ -540,6 +560,86 @@ class _FileTile extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+/// Card shown for a received media message that hasn't been downloaded yet
+/// (CID pointer). Shows the file name + human size and a download button;
+/// while [downloading] it shows a spinner. On failure the parent re-renders
+/// this card so the user can retry.
+class _MediaDownloadCard extends StatelessWidget {
+  final String name;
+  final int size;
+  final bool isImage;
+  final bool downloading;
+  final Color textColor;
+  final VoidCallback? onDownload;
+
+  const _MediaDownloadCard({
+    required this.name,
+    required this.size,
+    required this.isImage,
+    required this.downloading,
+    required this.textColor,
+    required this.onDownload,
+  });
+
+  static String _humanSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(0)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sub = textColor.withValues(alpha: 0.6);
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 240),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(isImage ? Icons.image_outlined : Icons.insert_drive_file_outlined,
+              color: textColor, size: 26),
+          const SizedBox(width: 10),
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(name,
+                    style: TextStyle(
+                        color: textColor, fontSize: 13, fontFamily: 'monospace'),
+                    overflow: TextOverflow.ellipsis),
+                const SizedBox(height: 2),
+                Text(_humanSize(size),
+                    style: TextStyle(
+                        color: sub, fontSize: 11, fontFamily: 'monospace')),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          if (downloading)
+            SizedBox(
+              width: 22, height: 22,
+              child: CircularProgressIndicator(
+                  strokeWidth: 2, valueColor: AlwaysStoppedAnimation(textColor)),
+            )
+          else
+            InkWell(
+              onTap: onDownload,
+              customBorder: const CircleBorder(),
+              child: Container(
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: textColor.withValues(alpha: 0.12),
+                ),
+                child: Icon(Icons.download_rounded, color: textColor, size: 20),
+              ),
+            ),
+        ],
+      ),
     );
   }
 }

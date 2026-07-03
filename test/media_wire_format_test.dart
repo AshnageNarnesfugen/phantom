@@ -4,13 +4,19 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:phantom_messenger/core/phantom_core.dart';
 
-Uint8List _wireContent(String name, String cid) {
+/// Mirrors PhantomCore.sendFile's CID wire encoding:
+/// [name_len(1)][name][size(4 BE)][cid].
+Uint8List _wireContent(String name, String cid, {int size = 12345}) {
   final nameBytes = utf8.encode(name);
   final cidBytes = utf8.encode(cid);
-  return Uint8List(1 + nameBytes.length + cidBytes.length)
+  return Uint8List(1 + nameBytes.length + 4 + cidBytes.length)
     ..[0] = nameBytes.length
     ..setAll(1, nameBytes)
-    ..setAll(1 + nameBytes.length, cidBytes);
+    ..[1 + nameBytes.length] = (size >> 24) & 0xff
+    ..[2 + nameBytes.length] = (size >> 16) & 0xff
+    ..[3 + nameBytes.length] = (size >> 8) & 0xff
+    ..[4 + nameBytes.length] = size & 0xff
+    ..setAll(5 + nameBytes.length, cidBytes);
 }
 
 void main() {
@@ -18,11 +24,12 @@ void main() {
     const cidV0 = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
     const cidV1 = 'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi';
 
-    test('round-trip: encode wire → parse back name + CID', () {
-      final content = _wireContent('photo.jpg', cidV0);
+    test('round-trip: encode wire → parse back name + size + CID', () {
+      final content = _wireContent('photo.jpg', cidV0, size: 2500000);
       final parsed = PhantomCore.tryParseFileWireContent(content);
       expect(parsed, isNotNull);
       expect(parsed!.name, 'photo.jpg');
+      expect(parsed.size, 2500000);
       expect(parsed.cid, cidV0);
     });
 

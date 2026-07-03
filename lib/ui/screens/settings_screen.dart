@@ -54,6 +54,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       core.storage.getSetting<String>('my_alias').then((alias) {
         if (mounted && alias != null) _myAliasCtrl.text = alias;
       });
+      core.storage.getSetting<String>('media_autodownload').then((m) {
+        if (mounted && m != null) setState(() => _mediaMode = m);
+      });
       _loadGlass(core);
       _refreshStatus();
       _refreshTimer ??= Timer.periodic(const Duration(seconds: 2), (_) => _refreshStatus());
@@ -61,6 +64,61 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Timer? _refreshTimer;
+
+  /// Media auto-download policy: 'always' | 'wifi' (default) | 'never'.
+  String _mediaMode = 'wifi';
+
+  static const _mediaModeLabels = {
+    'always': 'always',
+    'wifi': 'wi-fi only',
+    'never': 'manual',
+  };
+
+  void _showMediaModeSheet(PhantomTokens t, PhantomCore? core) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: t.bgSurface,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text('auto-download media',
+                    style: TextStyle(
+                        color: t.textPrimary,
+                        fontFamily: 'monospace',
+                        fontSize: 15)),
+              ),
+            ),
+            for (final e in const [
+              ('always', 'always', 'download on any network'),
+              ('wifi', 'wi-fi only', 'manual button on mobile data'),
+              ('never', 'manual', 'always ask — tap to download'),
+            ])
+              ListTile(
+                title: Text(e.$2,
+                    style: TextStyle(
+                        color: t.textPrimary, fontFamily: 'monospace', fontSize: 14)),
+                subtitle: Text(e.$3,
+                    style: TextStyle(
+                        color: t.textSecondary, fontFamily: 'monospace', fontSize: 11)),
+                trailing: _mediaMode == e.$1
+                    ? Icon(Icons.check, color: t.accentLight, size: 18)
+                    : null,
+                onTap: () {
+                  setState(() => _mediaMode = e.$1);
+                  core?.storage.setSetting('media_autodownload', e.$1);
+                  Navigator.of(ctx).pop();
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 
   void _refreshStatus() {
     final core = CoreProvider.of(context).core;
@@ -308,6 +366,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
             label: 'show seed phrase',
             tokens: t,
             onTap: () => _showSeedWarning(t),
+          ),
+          // ── Media ────────────────────────────────────────────
+          _SectionHeader('media', t),
+          _SettingTile(
+            icon: Icons.download_outlined,
+            label: 'auto-download',
+            value: _mediaModeLabels[_mediaMode],
+            tokens: t,
+            onTap: () => _showMediaModeSheet(t, core),
           ),
           // ── Appearance ───────────────────────────────────────
           _SectionHeader('appearance', t),

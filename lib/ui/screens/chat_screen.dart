@@ -35,6 +35,35 @@ class _ChatScreenState extends State<ChatScreen> {
   /// receipts out → peer's screen reloads → receipts back, ~2 msg/s forever
   /// (observed in the field, both devices, sustained).
   bool _receiptsRefired = false;
+
+  /// Message ids currently downloading (tapped the download button) — drives
+  /// the spinner in the media card.
+  final Set<String> _downloading = {};
+
+  /// Parses a media message's content as an unresolved CID pointer, or null
+  /// if it's a text message or already-resolved media.
+  ({String name, int size, String cid})? _pointerFor(StoredMessage msg) {
+    if (msg.type != MessageType.image && msg.type != MessageType.file) {
+      return null;
+    }
+    return PhantomCore.tryParseFileWireContent(msg.content);
+  }
+
+  Future<void> _downloadMedia(PhantomCore? core, StoredMessage msg) async {
+    if (core == null || _downloading.contains(msg.id)) return;
+    setState(() => _downloading.add(msg.id));
+    final ok = await core.downloadMedia(widget.contactId, msg.id);
+    if (!mounted) return;
+    setState(() => _downloading.remove(msg.id));
+    if (ok) {
+      _loadMessages(core); // now resolved — re-render as image/file/audio
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('download failed — tap to retry'),
+        duration: Duration(seconds: 2),
+      ));
+    }
+  }
   String?   _wallpaperPath;
   BoxFit    _bgFit       = BoxFit.cover;
   Alignment _bgAlignment = Alignment.center;
@@ -570,11 +599,13 @@ class _ChatScreenState extends State<ChatScreen> {
         final nextSame = i < _messages!.length - 1 &&
             (_messages![i + 1].direction == MessageDirection.outgoing) ==
                 isOut;
+        // Non-null while this media is still an undownloaded CID pointer.
+        final ptr = _pointerFor(msg);
         return Padding(
           padding: EdgeInsets.only(bottom: nextSame ? 2 : 10),
           child: GestureDetector(
             onLongPress: () => _showMsgMenu(context, t, core, msg),
-            onTap: msg.type == MessageType.image
+            onTap: (msg.type == MessageType.image && ptr == null)
                 ? () => _openImageViewer(context, t, core, msg.content)
                 : null,
             child: ChatBubble(
@@ -586,7 +617,15 @@ class _ChatScreenState extends State<ChatScreen> {
               showTail:     !nextSame,
               status:       msg.status,
               replyPreview: _replyPreviewFor(msg),
-              mediaContent: msg.type != MessageType.text ? msg.content : null,
+              // A media message still holding a CID pointer hasn't been
+              // downloaded yet → render the download card, not the bytes.
+              mediaContent: (msg.type != MessageType.text && ptr == null)
+                  ? msg.content
+                  : null,
+              pendingDownload:
+                  ptr == null ? null : (name: ptr.name, size: ptr.size),
+              downloading: _downloading.contains(msg.id),
+              onDownload: () => _downloadMedia(core, msg),
               messageType:  msg.type,
               glassEnabled:    _glassEnabled,
               glassOpacity:    _glassOpacity,
