@@ -327,13 +327,15 @@ class TransportManager {
       }());
     }
 
-    // IPFS: fallback when Waku can't actually gossip (down OR zero peers),
-    // and always for handshake / control / broadcast frames — session
+    // IPFS: fallback when Waku can't actually gossip (down, zero peers, or
+    // its store is in dead-cooldown — async delivery unavailable), and
+    // always for handshake / control / broadcast frames — session
     // establishment is too important to trust a single backend.
     final ipfsList = _activeTransports.whereType<IpfsTransport>();
     if (waku == null ||
         !waku.isAvailable ||
         !wakuHasPeers ||
+        waku.storeLikelyDead ||
         isHandshake ||
         priority == TransportPriority.control ||
         priority == TransportPriority.broadcast) {
@@ -1814,6 +1816,16 @@ class WakuTransport implements PhantomTransport {
 
   DateTime? _lastDaemonRestart;
 
+  /// Set when a full publish-confirm cycle exhausts its attempts. While in
+  /// the window, publishes go best-effort (relay + lightpush, no confirm
+  /// loop) and fail fast: field logs showed 15+ concurrent 40-second
+  /// confirm loops hammering a daemon whose store was already known-dead.
+  /// TransportManager also uses this to fan data frames out via IPFS.
+  DateTime? _storeDeadUntil;
+
+  bool get storeLikelyDead =>
+      _storeDeadUntil != null && DateTime.now().isBefore(_storeDeadUntil!);
+
   /// Store-connectivity cure, escalating:
   ///  1. re-dial the pinned store nodes (throttled inside the daemon);
   ///  2. VERIFY one actually shows connected=true — the POST 200 alone is
@@ -1851,6 +1863,21 @@ class WakuTransport implements PhantomTransport {
     final topic  = _contentTopic(recipientId);
     final sentAt = DateTime.now();
 
+    // Store known-dead: publish best-effort on the relay mesh (live
+    // delivery may still work) but skip the confirm loop and fail fast so
+    // TransportManager counts Waku as failed and the other backends carry
+    // the message. Without this, every send during an outage spawned its
+    // own ~40s confirm loop — 15+ ran concurrently in field logs.
+    if (storeLikelyDead) {
+      if (await hasRelayPeers()) {
+        await _daemon.relayPublish(contentTopic: topic, payload: encryptedEnvelope);
+      }
+      await _daemon.lightpush(contentTopic: topic, payload: encryptedEnvelope);
+      unawaited(_healStore(dbg));
+      throw const TransportException(
+          'Waku store in dead-cooldown — sent best-effort, unconfirmed');
+    }
+
     // Publish-and-CONFIRM. The desktop lab proved that every cheaper signal
     // lies: relay returns HTTP 200 into a mesh that hasn't GRAFTed yet (the
     // message evaporates), a nonzero admin peer count says nothing about
@@ -1879,6 +1906,7 @@ class WakuTransport implements PhantomTransport {
         if (attempt > 1) {
           dbg.log('Waku: ✓ publish confirmed by fleet store (attempt $attempt)');
         }
+        _storeDeadUntil = null;
         return;
       }
       dbg.log('Waku: publish not in fleet store yet (attempt $attempt/4)');
@@ -1887,6 +1915,7 @@ class WakuTransport implements PhantomTransport {
       // the next round (throttled internally).
       await _healStore(dbg);
     }
+    _storeDeadUntil = DateTime.now().add(const Duration(seconds: 60));
     throw const TransportException(
         'Waku publish never appeared in the fleet store');
   }
@@ -1942,6 +1971,7 @@ class WakuTransport implements PhantomTransport {
         final ok = await _fetchStoreBacklog(topic, controller, dbg);
         if (ok) {
           storeCursorReady = true;
+          _storeDeadUntil = null;
           return;
         }
         // Failed store query usually means the store-node connections are
