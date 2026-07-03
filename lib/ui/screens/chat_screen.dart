@@ -27,6 +27,14 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _displayName;
   bool _isVerified = false;
   StoredMessage? _replyTo;
+
+  /// The already-read receipt re-fire (see _loadMessages) may run only once
+  /// per screen lifetime. _loadMessages re-runs on EVERY incoming event —
+  /// including the peer's own readReceipt events — so re-firing on each
+  /// reload created a receipt ping-pong storm: receipt in → reload →
+  /// receipts out → peer's screen reloads → receipts back, ~2 msg/s forever
+  /// (observed in the field, both devices, sustained).
+  bool _receiptsRefired = false;
   String?   _wallpaperPath;
   BoxFit    _bgFit       = BoxFit.cover;
   Alignment _bgAlignment = Alignment.center;
@@ -218,20 +226,25 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     // Re-fire receipts for recent incoming messages even if already marked
-    // read locally. The first batch can get lost when the initial handshake
-    // is still churning (auto-revive resets the session right after the
-    // receipt goes out, leaving it undecryptable on the sender side). The
-    // sender treats duplicate receipts as no-ops, so this is safe.
-    final recentRead = msgs
-        .where((m) =>
-            m.direction == MessageDirection.incoming &&
-            m.status == MessageStatus.read &&
-            !unread.contains(m.id))
-        .map((m) => m.id)
-        .toList()
-        .reversed
-        .take(10)
-        .toList();
+    // read locally — ONCE per screen open. The first batch can get lost when
+    // the initial handshake is still churning; the sender treats duplicate
+    // receipts as no-ops, so one re-fire is cheap insurance. It must NOT run
+    // on every reload: reloads are triggered by incoming events including
+    // the peer's readReceipts, so re-firing each time bounced receipts back
+    // and forth in an endless storm (see _receiptsRefired).
+    final recentRead = _receiptsRefired
+        ? const <String>[]
+        : msgs
+            .where((m) =>
+                m.direction == MessageDirection.incoming &&
+                m.status == MessageStatus.read &&
+                !unread.contains(m.id))
+            .map((m) => m.id)
+            .toList()
+            .reversed
+            .take(10)
+            .toList();
+    _receiptsRefired = true;
 
     final toAck = <String>{...unread, ...recentRead}.toList();
     if (toAck.isNotEmpty) {
