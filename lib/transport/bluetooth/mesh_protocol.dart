@@ -358,6 +358,161 @@ class MeshAdvertisement {
   }
 }
 
+// ── Fragmentación de nivel de aplicación ──────────────────────────────────────
+//
+// BLE entrega cada write/notify como un evento independiente acotado por el
+// MTU (~20 bytes en chipsets viejos, hasta ~512 negociado). Un MeshPacket
+// serializado supera eso fácil: un frame cifrado ronda 1130 bytes y un INIT de
+// handshake ~3699. Sin reensamblaje, el receptor hacía deserialize sobre cada
+// fragmento suelto → magic/CRC inválidos → descartado. Es decir, el mesh solo
+// podía cargar paquetes que cupieran en un MTU y los handshakes eran
+// imposibles.
+//
+// Esta capa parte un paquete en fragmentos autodescriptivos y los reensambla
+// del otro lado. Se distingue de un MeshPacket por su magic 'PF' (vs 'PH'),
+// así que los paquetes que caben en un chunk pueden seguir viajando crudos.
+
+const int kFragMagic0 = 0x50; // 'P'
+const int kFragMagic1 = 0x46; // 'F'
+
+/// Cabecera de fragmento (9 bytes) + datos:
+/// [0] 'P' [1] 'F' [2..3] groupId(BE) [4] idx [5] total [6..7] len(BE) [8..]
+const int kFragHeaderSize = 8;
+
+class MeshFragment {
+  /// Parte [full] en fragmentos de a lo sumo [chunkSize] bytes de payload
+  /// cada uno (sin contar la cabecera de 8 bytes), etiquetados con [groupId]
+  /// para que el receptor los reagrupe. Máximo 255 fragmentos.
+  static List<Uint8List> split(
+    Uint8List full, {
+    required int chunkSize,
+    required int groupId,
+  }) {
+    if (chunkSize < 1) {
+      throw const MeshProtocolException('chunkSize inválido');
+    }
+    final total = (full.length + chunkSize - 1) ~/ chunkSize;
+    if (total == 0) return const [];
+    if (total > 255) {
+      throw MeshProtocolException(
+          'paquete demasiado grande para fragmentar: $total > 255 fragmentos');
+    }
+    final out = <Uint8List>[];
+    for (int idx = 0; idx < total; idx++) {
+      final start = idx * chunkSize;
+      final end = (start + chunkSize) < full.length ? start + chunkSize : full.length;
+      final len = end - start;
+      final frame = Uint8List(kFragHeaderSize + len);
+      frame[0] = kFragMagic0;
+      frame[1] = kFragMagic1;
+      frame[2] = (groupId >> 8) & 0xFF;
+      frame[3] = groupId & 0xFF;
+      frame[4] = idx;
+      frame[5] = total;
+      frame[6] = (len >> 8) & 0xFF;
+      frame[7] = len & 0xFF;
+      frame.setRange(kFragHeaderSize, kFragHeaderSize + len, full, start);
+      out.add(frame);
+    }
+    return out;
+  }
+
+  /// True si [data] es un frame de fragmento (empieza con el magic 'PF').
+  static bool isFragment(Uint8List data) =>
+      data.length >= kFragHeaderSize &&
+      data[0] == kFragMagic0 &&
+      data[1] == kFragMagic1;
+}
+
+/// Reensambla fragmentos por groupId. Acotado en memoria y en tiempo: como el
+/// mesh puede reordenar/duplicar/perder fragmentos, cada grupo caduca y el
+/// total de grupos concurrentes está limitado (se descarta el más viejo).
+class MeshReassembler {
+  final int maxGroups;
+  final Duration groupTtl;
+
+  MeshReassembler({this.maxGroups = 64, this.groupTtl = const Duration(seconds: 30)});
+
+  final Map<int, _FragGroup> _groups = {};
+
+  /// Procesa un frame recibido:
+  ///  - si NO es fragmento → lo devuelve tal cual (el caller hace deserialize);
+  ///  - si es fragmento incompleto → null;
+  ///  - si completa un grupo → devuelve el paquete reensamblado.
+  Uint8List? offer(Uint8List data) {
+    if (!MeshFragment.isFragment(data)) return data;
+    if (data.length < kFragHeaderSize) return null;
+
+    final groupId = (data[2] << 8) | data[3];
+    final idx = data[4];
+    final total = data[5];
+    final len = (data[6] << 8) | data[7];
+    if (total == 0 || idx >= total) return null;
+    if (kFragHeaderSize + len > data.length) return null;
+
+    final payload = Uint8List.sublistView(data, kFragHeaderSize, kFragHeaderSize + len);
+
+    _evictStale();
+    final group = _groups.putIfAbsent(groupId, () {
+      if (_groups.length >= maxGroups) {
+        // Descartar el grupo más viejo para acotar memoria.
+        final oldest = _groups.entries
+            .reduce((a, b) => a.value.createdAt.isBefore(b.value.createdAt) ? a : b);
+        _groups.remove(oldest.key);
+      }
+      return _FragGroup(total);
+    });
+
+    if (group.total != total) {
+      // Colisión de groupId con distinto total → reiniciar el grupo.
+      _groups[groupId] = _FragGroup(total)..add(idx, payload);
+      return _tryComplete(groupId);
+    }
+
+    group.add(idx, payload);
+    return _tryComplete(groupId);
+  }
+
+  Uint8List? _tryComplete(int groupId) {
+    final group = _groups[groupId];
+    if (group == null || !group.isComplete) return null;
+    final full = group.assemble();
+    _groups.remove(groupId);
+    return full;
+  }
+
+  void _evictStale() {
+    final now = DateTime.now();
+    _groups.removeWhere((_, g) => now.difference(g.createdAt) > groupTtl);
+  }
+
+  void clear() => _groups.clear();
+}
+
+class _FragGroup {
+  final int total;
+  final DateTime createdAt = DateTime.now();
+  final Map<int, Uint8List> _parts = {};
+
+  _FragGroup(this.total);
+
+  void add(int idx, Uint8List data) => _parts[idx] = data;
+
+  bool get isComplete => _parts.length == total;
+
+  Uint8List assemble() {
+    final size = _parts.values.fold<int>(0, (s, p) => s + p.length);
+    final out = Uint8List(size);
+    int o = 0;
+    for (int i = 0; i < total; i++) {
+      final part = _parts[i]!;
+      out.setRange(o, o + part.length, part);
+      o += part.length;
+    }
+    return out;
+  }
+}
+
 class MeshProtocolException implements Exception {
   final String message;
   const MeshProtocolException(this.message);

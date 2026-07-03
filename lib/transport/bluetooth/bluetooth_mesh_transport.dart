@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
-import 'dart:math';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:meta/meta.dart';
 import 'mesh_protocol.dart';
@@ -73,6 +72,22 @@ class BluetoothMeshTransport {
 
   // Característica GATT cacheada por peer para evitar discoverServices() en cada envío
   final Map<String, BluetoothCharacteristic> _peerChars = {};
+
+  // MTU negociado por peer (deviceId → bytes útiles por write). Conservador
+  // por defecto para chipsets viejos; se sube tras requestMtu().
+  final Map<String, int> _peerMtu = {};
+
+  // Reensamblador de fragmentos entrantes (ver MeshFragment/MeshReassembler).
+  // Uno global: los groupId incluidos en cada fragmento evitan cruces.
+  final MeshReassembler _reassembler = MeshReassembler();
+
+  // Contador rolling de groupId para fragmentar salientes.
+  int _fragGroupCounter = 0;
+  int _nextFragGroup() => _fragGroupCounter = (_fragGroupCounter + 1) & 0xFFFF;
+
+  // Chunk conservador cuando aún no conocemos el MTU del peer. ATT reserva 3
+  // bytes de cabecera; 20 es el MTU mínimo garantizado por BLE.
+  static const int _minChunk = 20 - 3;
 
   // Suscripciones activas
   final List<StreamSubscription> _subs = [];
@@ -283,11 +298,17 @@ class BluetoothMeshTransport {
       // Conectar con timeout
       await peer.device.connect(license: License.free, timeout: const Duration(seconds: 8));
 
-      // Request maximum MTU so large mesh packets don't get fragmented into
-      // dozens of 20-byte ATT writes. Android negotiates; iOS does it automatically.
+      // Request maximum MTU so large mesh packets ride in as few writes as
+      // possible. Android negotiates; iOS does it automatically. We record
+      // the result and fragment our writes to fit it (see _sendBytesToPeer).
       if (Platform.isAndroid) {
-        await peer.device.requestMtu(517);
+        try { await peer.device.requestMtu(517); } catch (_) {}
       }
+      try {
+        final mtu = peer.device.mtuNow;
+        // ATT reserves 3 bytes; keep a small safety margin.
+        if (mtu > 23) _peerMtu[deviceId] = mtu - 3;
+      } catch (_) {}
 
       // Descubrir servicios y cachear la característica
       final services = await peer.device.discoverServices();
@@ -312,13 +333,15 @@ class BluetoothMeshTransport {
         }));
       }
 
+      final mtu = _peerMtu[deviceId];
+
       // Enviar ANNOUNCE primero
-      await _writePacket(characteristic, _router.buildAnnounce());
+      await _writePacket(characteristic, _router.buildAnnounce(), mtu: mtu);
 
       // Enviar pending messages que podrían ser para este peer
       final pending = _store.getPendingForHint(peer.nodeHint);
       for (final pendingMsg in pending) {
-        await _writePacket(characteristic, pendingMsg.packet);
+        await _writePacket(characteristic, pendingMsg.packet, mtu: mtu);
         _store.recordAttempt(pendingMsg.packet.messageIdHex);
         await Future.delayed(const Duration(milliseconds: 50));
       }
@@ -343,29 +366,51 @@ class BluetoothMeshTransport {
 
   Future<void> _writePacket(
     BluetoothCharacteristic char,
-    MeshPacket packet,
-  ) async {
-    final data = packet.serialize();
+    MeshPacket packet, {
+    int? mtu,
+  }) async {
+    await _writeBytes(char, packet.serialize(), mtu: mtu);
+  }
 
-    // BLE MTU típico: 20-512 bytes. Fragmentar si es necesario.
-    // flutter_blue_plus maneja Write With Response automáticamente.
-    if (data.length <= 512) {
+  /// Writes [data] to [char], fragmenting at the application layer so the
+  /// receiver can reassemble regardless of MTU. Each fragment is a
+  /// self-describing MeshFragment frame; the peer's [MeshReassembler] rebuilds
+  /// the original bytes. Sending the raw packet in >MTU chunks (the old code)
+  /// produced garbage on the wire because each ATT write arrived as a separate
+  /// deserialize attempt.
+  Future<void> _writeBytes(
+    BluetoothCharacteristic char,
+    Uint8List data, {
+    int? mtu,
+  }) async {
+    final chunk = (mtu ?? _minChunk).clamp(_minChunk, 509);
+    if (data.length <= chunk && !MeshFragment.isFragment(data)) {
+      // Cabe en un write y no colisiona con el magic de fragmento → crudo.
       await char.write(data, withoutResponse: false);
-    } else {
-      // Fragmentar en chunks de 512 bytes
-      for (int i = 0; i < data.length; i += 512) {
-        final end = min(i + 512, data.length);
-        await char.write(data.sublist(i, end), withoutResponse: false);
-      }
+      return;
+    }
+    final frames = MeshFragment.split(
+      data,
+      chunkSize: chunk - kFragHeaderSize > 0 ? chunk - kFragHeaderSize : 1,
+      groupId: _nextFragGroup(),
+    );
+    for (final frame in frames) {
+      await char.write(frame, withoutResponse: false);
     }
   }
 
   // ── Recepción ─────────────────────────────────────────────────────────────
 
   Future<void> _receivePacket(Uint8List data, {MeshPeer? fromPeer}) async {
+    // Reensamblar: si es un fragmento, offer() devuelve null hasta que el
+    // grupo esté completo. Si es un paquete crudo (cabía en un MTU), lo
+    // devuelve tal cual.
+    final assembled = _reassembler.offer(data);
+    if (assembled == null) return;
+
     MeshPacket packet;
     try {
-      packet = MeshPacket.deserialize(data);
+      packet = MeshPacket.deserialize(assembled);
     } catch (e) {
       return;
     }
@@ -420,17 +465,11 @@ class BluetoothMeshTransport {
   }
 
   Future<void> _sendBytesToPeer(MeshPeer peer, Uint8List data) async {
-    final char = _peerChars[peer.device.remoteId.str];
+    final deviceId = peer.device.remoteId.str;
+    final char = _peerChars[deviceId];
     if (char == null || !peer.device.isConnected) return;
     try {
-      if (data.length <= 512) {
-        await char.write(data, withoutResponse: false);
-      } else {
-        for (int i = 0; i < data.length; i += 512) {
-          final end = min(i + 512, data.length);
-          await char.write(data.sublist(i, end), withoutResponse: false);
-        }
-      }
+      await _writeBytes(char, data, mtu: _peerMtu[deviceId]);
     } catch (_) {
       // Peer desconectado mientras intentábamos escribir — ignorar
     }

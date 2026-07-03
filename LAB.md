@@ -115,6 +115,34 @@ notificaciones en background llegan con la cadencia de la alarma (~15-30 min
 bajo Doze) en vez de al instante — salvo cargando, donde sigue siendo
 instantáneo.
 
+## 3. Lab de mesh BLE (sin radio) — `test/mesh/` + `test/support/mesh_sim.dart`
+
+`MeshSim` cablea instancias REALES de `MeshRouter` + `MessageStore` (el núcleo
+de routing, independiente de la plataforma) a través de una radio en memoria
+con topología arbitraria y mutable, igual que el loopback hizo con internet.
+Reproduce fielmente lo que hace `BluetoothMeshTransport` con un `RouterResult`
+(flood de relay, ACK unicast al origen, store-and-forward por ANNOUNCE) y —con
+`chunkSize`— simula el límite de MTU BLE fragmentando/reensamblando con el
+MISMO código de producción (`MeshFragment`/`MeshReassembler`).
+
+```bash
+flutter test test/mesh/          # 17 tests, deterministas, ~1s
+```
+
+Cubre: entrega directa, multi-hop A→B→C, dedup en diamante, horizonte de TTL,
+store-and-forward (C aparece después del envío), ACK_DELIV que limpia el store
+del emisor, no-entrega a relays intermedios, re-ruteo cuando un enlace se cae,
+y round-trips del fragmentador (desorden, duplicados, grupos concurrentes).
+
+Bug crítico que encontró: **no había reensamblaje de fragmentos**. El receptor
+hacía `deserialize` sobre cada evento BLE, pero un MeshPacket serializado supera
+un MTU (frame cifrado ~1130 B, INIT de handshake ~3699 B) → cada fragmento
+fallaba el deserialize y se descartaba. En la práctica el mesh solo cargaba
+paquetes que cupieran en un MTU y **los handshakes por Bluetooth eran
+imposibles**. Se añadió `MeshFragment`/`MeshReassembler` (magic 'PF' vs 'PH' de
+MeshPacket, reensamblaje por groupId con caducidad) y se cableó en el
+transporte (split según MTU negociado al enviar, offer() al recibir).
+
 ## Flujo recomendado antes de tocar un teléfono
 
 ```bash
