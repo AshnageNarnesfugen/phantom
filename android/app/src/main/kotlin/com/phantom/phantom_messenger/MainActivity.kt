@@ -221,6 +221,27 @@ class MainActivity : FlutterActivity() {
                     ).getString(WakuForegroundService.KEY_API_PORT, null)
                     result.success(port)
                 }
+                // Duty-cycle power modes (see WakuForegroundService docs):
+                // background = wakelock off + daemon down + ~15-min sync
+                // windows; foreground = hot. Plain startService is fine for
+                // delivering an action to the already-running foreground
+                // service.
+                "enterBackground" -> {
+                    try {
+                        startService(WakuForegroundService.modeIntent(applicationContext, true))
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("WAKU_MODE_FAILED", e.message, null)
+                    }
+                }
+                "enterForeground" -> {
+                    try {
+                        startService(WakuForegroundService.modeIntent(applicationContext, false))
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("WAKU_MODE_FAILED", e.message, null)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }

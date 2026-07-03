@@ -119,6 +119,28 @@ class WakuDaemon {
     }
   }
 
+  /// Switches the Android service to background duty-cycle mode: wakelock
+  /// released, daemon down, a short sync window every ~15 min (stays hot on
+  /// charger). No-op off Android. See WakuForegroundService.
+  Future<void> enterBackgroundMode() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _ch.invokeMethod<void>('enterBackground');
+    } catch (e) {
+      debugPrint('[WakuDaemon] enterBackground error: $e');
+    }
+  }
+
+  /// Back to hot mode: wakelock held, daemon always up.
+  Future<void> enterForegroundMode() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _ch.invokeMethod<void>('enterForeground');
+    } catch (e) {
+      debugPrint('[WakuDaemon] enterForeground error: $e');
+    }
+  }
+
   /// Reads the dynamically-assigned REST API port from the Kotlin service.
   Future<void> _readApiPort() async {
     try {

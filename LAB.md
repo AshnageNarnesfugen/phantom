@@ -98,6 +98,23 @@ Dividendos del primer día:
 - Hive registra boxes por nombre global: cada `PhantomStorage.isolated()`
   recibe un prefijo de namespace propio en `initialize()`.
 
+## Modelo de energía (duty-cycle)
+
+En background la app YA NO mantiene el CPU despierto. `WakuForegroundService`
+tiene tres modos: **hot** (app en primer plano, o cargando: wakelock + daemon
+siempre arriba), y **duty-cycle** (background sin cargador: wakelock liberado,
+go-waku muerto, una alarma `setAndAllowWhileIdle` abre una ventana de ~2 min
+cada ~15 min). Durante la ventana, el sentinel de Dart (`PhantomCore`) detecta
+"daemon vivo + resync vencido" y drena el fleet store
+(`WakuTransport.resyncStore`) — no hace falta MethodChannel desde el servicio:
+la propia ventana es la señal, porque los timers de Dart solo corren con el
+CPU despierto. IPFS e i2pd se apagan por completo en background (gracia de
+3 min tras pausar). La entrega es loss-free por construcción: cursor del
+store + dedupe + no-revive-en-replay + no-presence-en-replay. Trade-off:
+notificaciones en background llegan con la cadencia de la alarma (~15-30 min
+bajo Doze) en vez de al instante — salvo cargando, donde sigue siendo
+instantáneo.
+
 ## Flujo recomendado antes de tocar un teléfono
 
 ```bash

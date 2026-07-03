@@ -35,12 +35,44 @@ class WakuForegroundService : Service() {
     private var wakuProcess: Process? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
+    /** True while the app is backgrounded and we're duty-cycling. */
+    @Volatile private var dozeMode = false
+
+    /** Set before an intentional kill so spawnWaku's crash-restart loop
+     *  doesn't immediately respawn the daemon we just put to sleep. */
+    @Volatile private var intentionalKill = false
+
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
     companion object {
         const val TAG          = "WakuForegroundService"
         const val CHANNEL_ID   = "phantom_waku_node"
         const val NOTIF_ID     = 45
         const val ACTION_START = "phantom.waku.START"
         const val ACTION_STOP  = "phantom.waku.STOP"
+
+        // ── Duty-cycle power model ────────────────────────────────────────
+        // Holding a PARTIAL_WAKE_LOCK 24/7 (this service + IPFS + i2pd) kept
+        // the CPU permanently awake — the single biggest battery drain. But
+        // the Waku fleet store already persists every message for days and
+        // the Dart side proved store resync is loss-free (cursor + dedupe +
+        // no-revive-on-replay). So delivery does NOT require staying hot:
+        //   BACKGROUND → release the lock, kill go-waku, truly sleep; an alarm
+        //     every ~15 min opens a 2-minute sync window (short wakelock +
+        //     daemon up) during which the Dart sentinel drains the store.
+        //   FOREGROUND → hot as before (lock + daemon always up).
+        //   Charging   → stay hot even in background (no battery cost).
+        // Latency trade-off: background notifications arrive within the
+        // alarm cadence (~15-30 min under Doze batching) instead of
+        // instantly — the standard push-less compromise, except charging.
+        const val ACTION_BACKGROUND = "phantom.waku.BACKGROUND"
+        const val ACTION_FOREGROUND = "phantom.waku.FOREGROUND"
+        const val ACTION_SYNC       = "phantom.waku.SYNC"
+
+        const val SYNC_INTERVAL_MS  = 15 * 60 * 1000L  // alarm cadence
+        const val SYNC_WINDOW_MS    = 2 * 60 * 1000L   // wakelock per window
+        const val SYNC_DAEMON_MS    = 100 * 1000L      // daemon uptime per window
+
         const val EXTRA_BINARY = "binaryPath"
         const val EXTRA_DATA   = "dataDir"
         const val PREFS_NAME   = "phantom_waku_prefs"
@@ -58,6 +90,11 @@ class WakuForegroundService : Service() {
         fun stopIntent(ctx: Context): Intent =
             Intent(ctx, WakuForegroundService::class.java).apply {
                 action = ACTION_STOP
+            }
+
+        fun modeIntent(ctx: Context, background: Boolean): Intent =
+            Intent(ctx, WakuForegroundService::class.java).apply {
+                action = if (background) ACTION_BACKGROUND else ACTION_FOREGROUND
             }
     }
 
@@ -94,9 +131,26 @@ class WakuForegroundService : Service() {
                     .putString(KEY_DATA, dataDir)
                     .apply()
 
+                dozeMode = false
+                cancelSyncAlarm()
                 startForeground(NOTIF_ID, buildNotification("Connecting to Waku network…"))
                 acquireWakeLock()
                 if (wakuProcess == null) spawnWaku(binary, dataDir)
+            }
+            ACTION_FOREGROUND -> {
+                Log.i(TAG, "FOREGROUND — hot mode")
+                dozeMode = false
+                cancelSyncAlarm()
+                startForeground(NOTIF_ID, buildNotification("Waku relay active"))
+                acquireWakeLock()
+                respawnFromPrefsIfDead()
+            }
+            ACTION_BACKGROUND -> {
+                Log.i(TAG, "BACKGROUND — entering duty-cycle")
+                enterDozeSync()
+            }
+            ACTION_SYNC -> {
+                doSyncWindow()
             }
             else -> {
                 // START_STICKY re-delivery
@@ -119,38 +173,143 @@ class WakuForegroundService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.i(TAG, "onTaskRemoved — re-asserting foreground")
+        // App swiped away: keep delivering, but in duty-cycle mode — the old
+        // behaviour re-asserted HOT mode and kept the CPU awake indefinitely
+        // for a user who just dismissed the app.
+        Log.i(TAG, "onTaskRemoved — switching to duty-cycle")
         try {
             startForeground(NOTIF_ID, buildNotification("Waku relay active"))
         } catch (e: Exception) {
             Log.w(TAG, "startForeground in onTaskRemoved failed: $e")
         }
+        enterDozeSync()
     }
 
     override fun onDestroy() {
         Log.i(TAG, "onDestroy — killing Waku process")
+        cancelSyncAlarm()
         releaseWakeLock()
-        wakuProcess?.destroyForcibly()
-        wakuProcess = null
+        killWaku()
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    // ── Duty-cycle machinery ──────────────────────────────────────────────────
+
+    private fun isCharging(): Boolean = try {
+        val bm = getSystemService(Context.BATTERY_SERVICE) as android.os.BatteryManager
+        bm.isCharging
+    } catch (_: Exception) { false }
+
+    /** Background transition: on charger stay hot (free power); otherwise
+     *  release the wakelock + kill the daemon and let the alarm cadence
+     *  drive short sync windows. Either way an alarm keeps re-evaluating,
+     *  so plugging/unplugging mid-background self-corrects within a cycle. */
+    private fun enterDozeSync() {
+        dozeMode = true
+        if (isCharging()) {
+            Log.i(TAG, "duty-cycle: charging — staying hot")
+            acquireWakeLock()
+            respawnFromPrefsIfDead()
+            updateNotification("Waku relay active (charging)")
+        } else {
+            releaseWakeLock()
+            killWaku()
+            updateNotification("Power save — syncing every ~15 min")
+        }
+        scheduleSyncAlarm()
+    }
+
+    /** One sync window: short wakelock, daemon up, let the Dart sentinel
+     *  drain the fleet store, then back to sleep. */
+    private fun doSyncWindow() {
+        if (!dozeMode) return // foreground took over since the alarm was set
+        Log.i(TAG, "sync window: charging=${isCharging()}")
+        if (isCharging()) {
+            acquireWakeLock()
+            respawnFromPrefsIfDead()
+            updateNotification("Waku relay active (charging)")
+        } else {
+            acquireWakeLock(SYNC_WINDOW_MS)
+            respawnFromPrefsIfDead()
+            updateNotification("Syncing messages…")
+            handler.postDelayed({
+                if (dozeMode && !isCharging()) {
+                    Log.i(TAG, "sync window over — sleeping")
+                    killWaku()
+                    releaseWakeLock()
+                    updateNotification("Power save — syncing every ~15 min")
+                }
+            }, SYNC_DAEMON_MS)
+        }
+        scheduleSyncAlarm()
+    }
+
+    private fun syncPendingIntent(): PendingIntent =
+        PendingIntent.getService(
+            this, 46,
+            Intent(this, WakuForegroundService::class.java).apply { action = ACTION_SYNC },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+    private fun scheduleSyncAlarm() {
+        try {
+            val am = getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+            // Inexact-while-idle: fires within the Doze maintenance window,
+            // no SCHEDULE_EXACT_ALARM permission needed. Cadence may stretch
+            // to ~30 min under deep Doze — acceptable for background sync.
+            am.setAndAllowWhileIdle(
+                android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                android.os.SystemClock.elapsedRealtime() + SYNC_INTERVAL_MS,
+                syncPendingIntent(),
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "scheduleSyncAlarm failed: $e")
+        }
+    }
+
+    private fun cancelSyncAlarm() {
+        try {
+            val am = getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+            am.cancel(syncPendingIntent())
+        } catch (_: Exception) {}
+    }
+
+    private fun killWaku() {
+        intentionalKill = true
+        wakuProcess?.destroyForcibly()
+        wakuProcess = null
+    }
+
+    private fun respawnFromPrefsIfDead() {
+        if (wakuProcess != null) return
+        val p = prefs()
+        val binary  = p.getString(KEY_BINARY, null)
+        val dataDir = p.getString(KEY_DATA, null)
+        if (binary != null && dataDir != null) {
+            intentionalKill = false
+            spawnWaku(binary, dataDir)
+        }
+    }
+
     // ── WakeLock ──────────────────────────────────────────────────────────────
 
-    private fun acquireWakeLock() {
-        if (wakeLock != null) return
+    /** (Re-)acquires the partial wakelock with [timeoutMs]. Always re-acquires
+     *  instead of early-returning on a non-null field: a timed-out lock leaves
+     *  the field set but not held, which used to make later acquires no-ops
+     *  (hot mode silently lost its lock after the first 30 minutes). */
+    private fun acquireWakeLock(timeoutMs: Long = 30 * 60 * 1000L) {
+        releaseWakeLock()
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "phantom:waku_node"
         ).apply {
             setReferenceCounted(false)
-            // Waku is lightweight — 30 min timeout instead of indefinite
-            acquire(30 * 60 * 1000L)
+            acquire(timeoutMs)
         }
-        Log.i(TAG, "WakeLock acquired (30 min timeout)")
+        Log.i(TAG, "WakeLock acquired (${timeoutMs / 1000}s timeout)")
     }
 
     private fun releaseWakeLock() {
@@ -238,13 +397,20 @@ class WakuForegroundService : Service() {
                 Log.e(TAG, "Waku spawn failed", e)
             } finally {
                 wakuProcess = null
-                val p = prefs()
-                val savedBinary = p.getString(KEY_BINARY, null)
-                val savedData   = p.getString(KEY_DATA, null)
-                if (savedBinary != null && savedData != null) {
-                    Log.i(TAG, "Waku died unexpectedly — restarting in 5s")
-                    try { Thread.sleep(5000) } catch (_: Exception) {}
-                    spawnWaku(savedBinary, savedData)
+                if (intentionalKill) {
+                    // We put the daemon to sleep on purpose (duty-cycle) —
+                    // do NOT let the crash-restart loop wake it back up.
+                    intentionalKill = false
+                    Log.i(TAG, "Waku stopped intentionally — no restart")
+                } else {
+                    val p = prefs()
+                    val savedBinary = p.getString(KEY_BINARY, null)
+                    val savedData   = p.getString(KEY_DATA, null)
+                    if (savedBinary != null && savedData != null) {
+                        Log.i(TAG, "Waku died unexpectedly — restarting in 5s")
+                        try { Thread.sleep(5000) } catch (_: Exception) {}
+                        spawnWaku(savedBinary, savedData)
+                    }
                 }
             }
         }.start()

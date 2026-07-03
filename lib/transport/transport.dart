@@ -1944,6 +1944,30 @@ class WakuTransport implements PhantomTransport {
     return true;
   }
 
+  /// Kept from subscribe() so [resyncStore] can re-drain the fleet store
+  /// into the same envelope stream at any later point (background sync
+  /// windows, app resume).
+  String? _subTopic;
+  StreamController<IncomingEnvelope>? _subController;
+
+  /// Re-runs one store backlog fetch since the persisted cursor. This is
+  /// what makes duty-cycled background sync loss-free: every wake window
+  /// (and every app resume) drains whatever accumulated in the fleet store
+  /// while the daemon was asleep. Duplicate frames are absorbed by the
+  /// frame dedupe + cursor overlap; store frames never trigger auto-revive
+  /// or presence. Returns true when the fetch fully succeeded.
+  Future<bool> resyncStore() async {
+    final topic = _subTopic;
+    final controller = _subController;
+    if (_disposed || topic == null || controller == null || controller.isClosed) {
+      return false;
+    }
+    final ok =
+        await _fetchStoreBacklog(topic, controller, TransportDebugger.instance);
+    if (ok) _storeDeadUntil = null;
+    return ok;
+  }
+
   @override
   Stream<IncomingEnvelope> subscribe({required String ourId}) {
     final topic = _contentTopic(ourId);
@@ -1951,6 +1975,8 @@ class WakuTransport implements PhantomTransport {
     dbg.log('Waku: subscribing to $topic');
 
     final controller = StreamController<IncomingEnvelope>();
+    _subTopic = topic;
+    _subController = controller;
 
     // Set once the offline backlog has been fetched successfully this
     // session. Live messages may only advance the persisted store cursor

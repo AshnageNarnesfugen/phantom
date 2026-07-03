@@ -19,6 +19,8 @@ import 'storage/backup_manager.dart';
 import 'presence_service.dart';
 import 'notification_service.dart';
 import 'ipfs_daemon.dart';
+import 'i2pd_daemon.dart';
+import 'waku_daemon.dart';
 import 'transport_debugger.dart';
 import '../transport/transport.dart';
 import '../transport/transport_manager_v2.dart' hide IncomingEnvelope;
@@ -1737,6 +1739,8 @@ class PhantomCore {
       _transportAvailable = false;
     }
 
+    _startResyncSentinel();
+
     // v1 internet transport
     _transportSub = transport.incoming.listen(
       (envelope) => _handleIncomingBytes(
@@ -2734,16 +2738,94 @@ class PhantomCore {
 
   // ── App lifecycle ──────────────────────────────────────────────────────────
 
+  // ── Power save (duty-cycled background) ────────────────────────────────────
+  //
+  // Backgrounded, the three daemons' wakelocks kept the CPU awake 24/7 — the
+  // dominant battery drain. The Waku fleet store already guarantees loss-free
+  // delivery (cursor + dedupe + no-revive-on-replay), so the app can truly
+  // sleep and drain the store in short windows instead:
+  //   pause → grace period (quick app switches don't churn daemons) →
+  //   Waku service to duty-cycle mode + IPFS/i2pd fully stopped.
+  //   Every ~15 min the service opens a 2-min window with the daemon up; the
+  //   sentinel below notices ("daemon reachable + resync overdue") and drains
+  //   the store, which decrypts + notifies as usual.
+  //   resume → hot mode + daemons back + immediate resync to close any gap.
+
+  static const _powerSaveGrace = Duration(minutes: 3);
+  static const _resyncMinGap   = Duration(minutes: 4);
+
+  Timer? _powerSaveGraceTimer;
+  Timer? _resyncSentinel;
+  bool _powerSaveActive = false;
+  bool _appInBackground = false;
+  DateTime? _lastWakuResyncAt;
+
   /// Call when the app goes to background / is closed.
   Future<void> onAppPaused() async {
+    _appInBackground = true;
     await _presence?.goOffline();
+    _powerSaveGraceTimer?.cancel();
+    _powerSaveGraceTimer = Timer(_powerSaveGrace, () {
+      if (_appInBackground && !_disposed) unawaited(_enterPowerSave());
+    });
   }
 
   /// Call when the app returns to foreground.
   Future<void> onAppResumed() async {
+    _appInBackground = false;
+    _powerSaveGraceTimer?.cancel();
+    if (_powerSaveActive) await _exitPowerSave();
     await _presence?.publishOnline();
     // Retry any messages that were queued while the transport was offline.
     _transportV2?.flushStore();
+    // Close any delivery gap from the sleep period right away.
+    unawaited(resyncWaku());
+  }
+
+  Future<void> _enterPowerSave() async {
+    _powerSaveActive = true;
+    TransportDebugger.instance.log('POWER: entering power save '
+        '(Waku duty-cycle, IPFS/i2pd stopped)');
+    await WakuDaemon.instance.enterBackgroundMode();
+    try { await IpfsDaemon.instance.stop(); } catch (_) {}
+    try { await I2pdDaemon.instance.stop(); } catch (_) {}
+  }
+
+  Future<void> _exitPowerSave() async {
+    _powerSaveActive = false;
+    TransportDebugger.instance.log('POWER: exiting power save — hot mode');
+    await WakuDaemon.instance.enterForegroundMode();
+    unawaited(IpfsDaemon.instance.ensure());
+    unawaited(I2pdDaemon.instance.ensure());
+  }
+
+  /// Re-drains the Waku fleet store since the persisted cursor. Cheap and
+  /// idempotent (dedupe + cursor overlap absorb repeats).
+  Future<void> resyncWaku() async {
+    final waku = transport.transports.whereType<WakuTransport>().firstOrNull;
+    if (waku == null) return;
+    final ok = await waku.resyncStore();
+    if (ok) _lastWakuResyncAt = DateTime.now();
+  }
+
+  /// Runs every minute. Outside power save it's a no-op. Inside it, the
+  /// timer only actually fires while the CPU is awake — i.e. exactly during
+  /// the service's sync windows — where it finds the daemon reachable and
+  /// drains the store. No MethodChannel round-trip from the service needed:
+  /// the wake window itself is the signal.
+  void _startResyncSentinel() {
+    _resyncSentinel = Timer.periodic(const Duration(minutes: 1), (_) async {
+      if (!_powerSaveActive || _disposed) return;
+      final last = _lastWakuResyncAt;
+      if (last != null && DateTime.now().difference(last) < _resyncMinGap) {
+        return;
+      }
+      final st = await WakuDaemon.instance.status();
+      if (st.running) {
+        TransportDebugger.instance.log('POWER: sync window detected — draining store');
+        await resyncWaku();
+      }
+    });
   }
 
   // ── Read receipts ──────────────────────────────────────────────────────────
@@ -2780,6 +2862,8 @@ class PhantomCore {
     // Set the flag first so any in-flight _handleIncomingBytes returns before
     // we tear down storage / transports underneath them.
     _disposed = true;
+    _powerSaveGraceTimer?.cancel();
+    _resyncSentinel?.cancel();
     for (final t in _handshakeRetryTimers.values) {
       t.cancel();
     }
