@@ -9,6 +9,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:open_file/open_file.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import '../theme/phantom_theme.dart';
@@ -301,11 +302,23 @@ class ChatBubble extends StatelessWidget {
           final isAudio = lower.endsWith('.m4a') || lower.endsWith('.mp3') ||
               lower.endsWith('.ogg') || lower.endsWith('.wav') ||
               lower.endsWith('.aac');
-          if (isAudio && nullIdx >= 0) {
-            final audioBytes = mediaContent!.sublist(nullIdx + 1);
-            return _AudioPlayerBubble(bytes: audioBytes, textColor: textColor);
+          final isVideo = lower.endsWith('.mp4') || lower.endsWith('.mov') ||
+              lower.endsWith('.webm') || lower.endsWith('.mkv') ||
+              lower.endsWith('.3gp') || lower.endsWith('.avi') ||
+              lower.endsWith('.m4v');
+          final bytes = nullIdx >= 0 ? mediaContent!.sublist(nullIdx + 1) : null;
+          if (isAudio && bytes != null) {
+            return _AudioPlayerBubble(bytes: bytes, textColor: textColor);
           }
-          return _FileTile(fileName: fileName, textColor: textColor);
+          // Video and every other file are tappable: bytes are written to a
+          // temp file and handed to the system viewer via open_file. Videos
+          // get a play affordance so they read as playable, not just "a file".
+          return _FileTile(
+            fileName: fileName,
+            bytes: bytes,
+            isVideo: isVideo,
+            textColor: textColor,
+          );
         }
         return _fallbackText(textColor);
 
@@ -538,28 +551,94 @@ class _AudioPlayerBubbleState extends State<_AudioPlayerBubble> {
 
 // ── FileTile ──────────────────────────────────────────────────────────────────
 
-class _FileTile extends StatelessWidget {
+/// A resolved file/video message. Tapping writes the bytes to a temp file and
+/// opens it with the system viewer (open_file). Videos show a play affordance
+/// so they read as playable rather than an inert attachment — the field bug
+/// was that a sent video showed only its name with no way to open or view it.
+class _FileTile extends StatefulWidget {
   final String fileName;
+  final Uint8List? bytes;
+  final bool isVideo;
   final Color textColor;
 
-  const _FileTile({required this.fileName, required this.textColor});
+  const _FileTile({
+    required this.fileName,
+    required this.textColor,
+    this.bytes,
+    this.isVideo = false,
+  });
+
+  @override
+  State<_FileTile> createState() => _FileTileState();
+}
+
+class _FileTileState extends State<_FileTile> {
+  bool _opening = false;
+
+  Future<void> _open() async {
+    final bytes = widget.bytes;
+    if (bytes == null || _opening) return;
+    setState(() => _opening = true);
+    try {
+      final dir = await getTemporaryDirectory();
+      // The filename is untrusted (from a contact) and becomes a real path,
+      // so strip separators / traversal — keep only a safe basename+ext.
+      final safe = widget.fileName
+          .replaceAll(RegExp(r'[\x00-\x1f/\\]'), '_')
+          .replaceAll('..', '_');
+      final file = File('${dir.path}/ph_open_'
+          '${DateTime.now().millisecondsSinceEpoch}_$safe');
+      await file.writeAsBytes(bytes);
+      final res = await OpenFile.open(file.path);
+      if (res.type != ResultType.done && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('no app to open ${widget.fileName}'),
+          duration: const Duration(seconds: 2),
+        ));
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('could not open file'),
+          duration: Duration(seconds: 2),
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _opening = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(Icons.insert_drive_file_outlined, color: textColor, size: 22),
-        const SizedBox(width: 8),
-        Flexible(
-          child: Text(
-            fileName,
-            style: TextStyle(
-                color: textColor, fontSize: 13, fontFamily: 'monospace'),
-            overflow: TextOverflow.ellipsis,
+    final tappable = widget.bytes != null;
+    final icon = widget.isVideo
+        ? Icons.play_circle_outline
+        : Icons.insert_drive_file_outlined;
+    return InkWell(
+      onTap: tappable ? _open : null,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (_opening)
+            SizedBox(
+              width: 22, height: 22,
+              child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  valueColor: AlwaysStoppedAnimation(widget.textColor)),
+            )
+          else
+            Icon(icon, color: widget.textColor, size: widget.isVideo ? 26 : 22),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              widget.fileName,
+              style: TextStyle(
+                  color: widget.textColor, fontSize: 13, fontFamily: 'monospace'),
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }

@@ -65,8 +65,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Timer? _refreshTimer;
 
-  /// Media auto-download policy: 'always' | 'wifi' (default) | 'never'.
-  String _mediaMode = 'wifi';
+  /// Media auto-download policy: 'always' | 'wifi' | 'never' (default manual).
+  String _mediaMode = 'never';
 
   static const _mediaModeLabels = {
     'always': 'always',

@@ -745,11 +745,12 @@ class PhantomCore {
     return _resolveMediaMessage(m, parsed);
   }
 
-  /// Auto-download policy: 'always' | 'wifi' (default) | 'never', gated by
-  /// the live connection type for 'wifi'. Unknown network → conservative
-  /// (don't auto-download).
+  /// Auto-download policy: 'always' | 'wifi' | 'never' (default), gated by
+  /// the live connection type for 'wifi'. Default is manual so no large
+  /// file downloads without an explicit tap — nothing saturates data or
+  /// storage silently. Unknown network → conservative (don't auto-download).
   Future<bool> _shouldAutoDownloadMedia() async {
-    final mode = await storage.getSetting<String>('media_autodownload') ?? 'wifi';
+    final mode = await storage.getSetting<String>('media_autodownload') ?? 'never';
     if (mode == 'always') return true;
     if (mode == 'never') return false;
     try {
