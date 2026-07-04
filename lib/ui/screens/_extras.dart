@@ -301,7 +301,8 @@ class _ImageViewer extends StatelessWidget {
           borderRadius:
               BorderRadius.vertical(top: Radius.circular(tokens.radiusCard))),
       builder: (_) => _ForwardSheet(
-        imageBytes:         imageBytes,
+        bytes:              imageBytes,
+        fileName:           'shared_${DateTime.now().millisecondsSinceEpoch}.jpg',
         tokens:             tokens,
         core:               core,
         currentContactId:   contactId,
@@ -314,14 +315,16 @@ class _ImageViewer extends StatelessWidget {
 // ── Forward sheet ─────────────────────────────────────────────────────────────
 
 class _ForwardSheet extends StatefulWidget {
-  final Uint8List     imageBytes;
+  final Uint8List     bytes;
+  final String        fileName;
   final PhantomTokens tokens;
   final PhantomCore?  core;
   final String        currentContactId;
   final String        currentContactName;
 
   const _ForwardSheet({
-    required this.imageBytes,
+    required this.bytes,
+    required this.fileName,
     required this.tokens,
     required this.core,
     required this.currentContactId,
@@ -350,8 +353,8 @@ class _ForwardSheetState extends State<_ForwardSheet> {
     try {
       await widget.core!.sendFile(
         recipientId: contactId,
-        bytes:       widget.imageBytes,
-        fileName:    'shared_${DateTime.now().millisecondsSinceEpoch}.jpg',
+        bytes:       widget.bytes,
+        fileName:    widget.fileName,
       );
     } on PhantomCoreException catch (e) {
       if (mounted) {

@@ -8,6 +8,7 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:gal/gal.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:open_file/open_file.dart';
 import 'package:path_provider/path_provider.dart';
@@ -33,6 +34,8 @@ class ChatBubble extends StatelessWidget {
   final ({String name, int size})? pendingDownload;
   final bool downloading;
   final VoidCallback? onDownload;
+  /// Opens the forward sheet for a video message (screens-layer picker).
+  final VoidCallback? onForwardVideo;
   final bool glassEnabled;
   final double glassOpacity;
   final double glassBlur;
@@ -55,6 +58,7 @@ class ChatBubble extends StatelessWidget {
     this.pendingDownload,
     this.downloading = false,
     this.onDownload,
+    this.onForwardVideo,
     this.glassEnabled = false,
     this.glassOpacity = 0.12,
     this.glassBlur = 10.0,
@@ -314,7 +318,11 @@ class ChatBubble extends StatelessWidget {
           if (isVideo && bytes != null) {
             // Video shows a poster (first frame) with a centred play button,
             // like an image message, and plays inside the app on tap.
-            return _VideoTile(bytes: bytes, fileName: fileName);
+            return _VideoTile(
+              bytes: bytes,
+              fileName: fileName,
+              onForward: onForwardVideo,
+            );
           }
           // Any other file is tappable: bytes are written to a temp file and
           // handed to the system viewer via open_file.
@@ -652,7 +660,11 @@ class _FileTileState extends State<_FileTile> {
 class _VideoTile extends StatefulWidget {
   final Uint8List bytes;
   final String fileName;
-  const _VideoTile({required this.bytes, required this.fileName});
+  /// Opens the forward sheet for this video. Provided by the chat screen
+  /// (the sheet + contact picker live in the screens layer); null hides the
+  /// forward action.
+  final VoidCallback? onForward;
+  const _VideoTile({required this.bytes, required this.fileName, this.onForward});
 
   @override
   State<_VideoTile> createState() => _VideoTileState();
@@ -691,7 +703,11 @@ class _VideoTileState extends State<_VideoTile> {
     final file = _file;
     if (file == null) return;
     Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => _VideoViewerScreen(file: file, title: widget.fileName),
+      builder: (_) => _VideoViewerScreen(
+        file: file,
+        title: widget.fileName,
+        onForward: widget.onForward,
+      ),
       fullscreenDialog: true,
     ));
   }
@@ -762,7 +778,12 @@ class _VideoTileState extends State<_VideoTile> {
 class _VideoViewerScreen extends StatefulWidget {
   final File file;
   final String title;
-  const _VideoViewerScreen({required this.file, required this.title});
+  final VoidCallback? onForward;
+  const _VideoViewerScreen({
+    required this.file,
+    required this.title,
+    this.onForward,
+  });
 
   @override
   State<_VideoViewerScreen> createState() => _VideoViewerScreenState();
@@ -772,6 +793,37 @@ class _VideoViewerScreenState extends State<_VideoViewerScreen> {
   late final VideoPlayerController _ctrl;
   bool _ready = false;
   bool _showControls = true;
+  bool _saving = false;
+
+  Future<void> _save() async {
+    if (_saving) return;
+    setState(() => _saving = true);
+    String msg;
+    try {
+      await Gal.putVideo(widget.file.path, album: 'Phantom');
+      msg = 'saved to gallery';
+    } catch (_) {
+      msg = 'failed to save';
+    }
+    if (!mounted) return;
+    setState(() => _saving = false);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      backgroundColor: const Color(0xFF1E1E1E),
+      content: Text(msg,
+          style: const TextStyle(
+              color: Colors.white, fontFamily: 'monospace', fontSize: 13)),
+      duration: const Duration(seconds: 2),
+    ));
+  }
+
+  void _forward() {
+    // The forward sheet + contact picker live in the screens layer; the chat
+    // provides the callback. Close the player first, then open the sheet.
+    final cb = widget.onForward;
+    if (cb == null) return;
+    Navigator.of(context).pop();
+    cb();
+  }
 
   @override
   void initState() {
@@ -843,7 +895,7 @@ class _VideoViewerScreenState extends State<_VideoViewerScreen> {
                   ),
                 ),
               ),
-            // Top bar: close + name
+            // Top bar: close + name + save/forward actions
             if (_showControls)
               SafeArea(
                 child: Row(
@@ -860,6 +912,22 @@ class _VideoViewerScreenState extends State<_VideoViewerScreen> {
                               fontFamily: 'monospace',
                               fontSize: 13)),
                     ),
+                    IconButton(
+                      icon: _saving
+                          ? const SizedBox(
+                              width: 20, height: 20,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2, color: Colors.white))
+                          : const Icon(Icons.download_outlined, color: Colors.white),
+                      tooltip: 'save to gallery',
+                      onPressed: _saving ? null : _save,
+                    ),
+                    if (widget.onForward != null)
+                      IconButton(
+                        icon: const Icon(Icons.forward_outlined, color: Colors.white),
+                        tooltip: 'forward',
+                        onPressed: _forward,
+                      ),
                   ],
                 ),
               ),

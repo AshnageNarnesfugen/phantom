@@ -64,6 +64,31 @@ class _ChatScreenState extends State<ChatScreen> {
       ));
     }
   }
+
+  /// Opens the forward sheet for a resolved video message. The stored content
+  /// is `name\0bytes`; we hand the raw video bytes to the shared _ForwardSheet
+  /// (same picker the image viewer uses).
+  void _forwardVideo(PhantomCore? core, StoredMessage msg) {
+    final nullIdx = msg.content.indexOf(0);
+    if (nullIdx < 0) return;
+    final name  = utf8.decode(msg.content.sublist(0, nullIdx));
+    final bytes = msg.content.sublist(nullIdx + 1);
+    final t = PhantomTheme.tokensOf(context);
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: t.bgSurface,
+      shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(t.radiusCard))),
+      builder: (_) => _ForwardSheet(
+        bytes:              bytes,
+        fileName:           name,
+        tokens:             t,
+        core:               core,
+        currentContactId:   widget.contactId,
+        currentContactName: _displayName ?? widget.contactName,
+      ),
+    );
+  }
   String?   _wallpaperPath;
   BoxFit    _bgFit       = BoxFit.cover;
   Alignment _bgAlignment = Alignment.center;
@@ -650,6 +675,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ptr == null ? null : (name: ptr.name, size: ptr.size),
               downloading: _downloading.contains(msg.id),
               onDownload: () => _downloadMedia(core, msg),
+              onForwardVideo: () => _forwardVideo(core, msg),
               messageType:  msg.type,
               glassEnabled:    _glassEnabled,
               glassOpacity:    _glassOpacity,
