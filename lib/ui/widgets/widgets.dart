@@ -1528,7 +1528,12 @@ class _Avatar extends StatelessWidget {
 
 // ── PhantomIdDisplay ──────────────────────────────────────────────────────────
 
-class PhantomIdDisplay extends StatefulWidget {
+/// Read-only display of a phantom ID. NOT copyable: a bare phantom ID is a
+/// display identifier, not an actionable token — nothing in the app accepts
+/// it as input (recovery uses the seed phrase, adding a contact uses the full
+/// contact address, verification uses the safety number). The old tap-to-copy
+/// was a dead end.
+class PhantomIdDisplay extends StatelessWidget {
   final String phantomId;
   final bool compact;
 
@@ -1539,70 +1544,34 @@ class PhantomIdDisplay extends StatefulWidget {
   });
 
   @override
-  State<PhantomIdDisplay> createState() => _PhantomIdDisplayState();
-}
-
-class _PhantomIdDisplayState extends State<PhantomIdDisplay> {
-  bool _copied = false;
-
-  void _copy() async {
-    await Clipboard.setData(ClipboardData(text: widget.phantomId));
-    setState(() => _copied = true);
-    await Future.delayed(const Duration(seconds: 2));
-    if (mounted) setState(() => _copied = false);
-  }
-
-  @override
   Widget build(BuildContext context) {
     final t = PhantomTheme.tokensOf(context);
 
-    if (widget.compact) {
-      return GestureDetector(
-        onTap: _copy,
-        child: Text(
-          _shortId(widget.phantomId),
-          style: TextStyle(
-            color: t.accentLight,
-            fontSize: 12,
-            fontFamily: 'monospace',
-          ),
+    if (compact) {
+      return Text(
+        _shortId(phantomId),
+        style: TextStyle(
+          color: t.accentLight,
+          fontSize: 12,
+          fontFamily: 'monospace',
         ),
       );
     }
 
-    return GestureDetector(
-      onTap: _copy,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: t.bgSubtle,
-          borderRadius: BorderRadius.circular(t.radiusCard),
-          border: Border.all(color: t.inputBorder, width: 0.5),
-        ),
-        child: Row(
-          children: [
-            Expanded(
-              child: Text(
-                widget.phantomId,
-                style: TextStyle(
-                  color: t.accentLight,
-                  fontSize: 12,
-                  fontFamily: 'monospace',
-                  letterSpacing: 0.5,
-                ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            AnimatedSwitcher(
-              duration: const Duration(milliseconds: 200),
-              child: Icon(
-                _copied ? Icons.check : Icons.copy_outlined,
-                key: ValueKey(_copied),
-                size: 16,
-                color: _copied ? t.accentLight : t.iconDefault,
-              ),
-            ),
-          ],
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: t.bgSubtle,
+        borderRadius: BorderRadius.circular(t.radiusCard),
+        border: Border.all(color: t.inputBorder, width: 0.5),
+      ),
+      child: Text(
+        phantomId,
+        style: TextStyle(
+          color: t.accentLight,
+          fontSize: 12,
+          fontFamily: 'monospace',
+          letterSpacing: 0.5,
         ),
       ),
     );
