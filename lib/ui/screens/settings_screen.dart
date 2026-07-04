@@ -301,18 +301,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           // ── Identity ─────────────────────────────────────────
           _SectionHeader('identity', t),
           if (core != null) ...[
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('your phantom id',
-                      style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
-                  const SizedBox(height: 6),
-                  PhantomIdDisplay(phantomId: core.myId),
-                ],
-              ),
-            ),
+            // The phantom id is backend addressing (routing topics, storage
+            // keys) — not something the user acts on. What's actually
+            // shareable is the contact address below, so we don't surface the
+            // raw id here.
             if (_contactAddress != null)
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),

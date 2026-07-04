@@ -1526,60 +1526,11 @@ class _Avatar extends StatelessWidget {
   }
 }
 
-// ── PhantomIdDisplay ──────────────────────────────────────────────────────────
-
-/// Read-only display of a phantom ID. NOT copyable: a bare phantom ID is a
-/// display identifier, not an actionable token — nothing in the app accepts
-/// it as input (recovery uses the seed phrase, adding a contact uses the full
-/// contact address, verification uses the safety number). The old tap-to-copy
-/// was a dead end.
-class PhantomIdDisplay extends StatelessWidget {
-  final String phantomId;
-  final bool compact;
-
-  const PhantomIdDisplay({
-    super.key,
-    required this.phantomId,
-    this.compact = false,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final t = PhantomTheme.tokensOf(context);
-
-    if (compact) {
-      return Text(
-        _shortId(phantomId),
-        style: TextStyle(
-          color: t.accentLight,
-          fontSize: 12,
-          fontFamily: 'monospace',
-        ),
-      );
-    }
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      decoration: BoxDecoration(
-        color: t.bgSubtle,
-        borderRadius: BorderRadius.circular(t.radiusCard),
-        border: Border.all(color: t.inputBorder, width: 0.5),
-      ),
-      child: Text(
-        phantomId,
-        style: TextStyle(
-          color: t.accentLight,
-          fontSize: 12,
-          fontFamily: 'monospace',
-          letterSpacing: 0.5,
-        ),
-      ),
-    );
-  }
-
-  static String _shortId(String id) =>
-      id.length > 12 ? '${id.substring(0, 6)}…${id.substring(id.length - 4)}' : id;
-}
+// PhantomIdDisplay removed: the phantom id is backend addressing (routing
+// topics, storage keys) derived from the identity keys, not something the
+// user acts on. It's no longer surfaced as an id anywhere in the UI; a short
+// fingerprint still serves as a fallback NAME for contacts without a nickname
+// (ContactRecord.displayName), which is a different, legitimate use.
 
 // ── SeedPhraseGrid ────────────────────────────────────────────────────────────
 

@@ -152,7 +152,6 @@ class _NewAccountStep extends StatefulWidget {
 
 class _NewAccountStepState extends State<_NewAccountStep> {
   String? _seedPhrase;
-  String? _phantomId;
   PhantomCore? _core;
   bool _generating = true;
   bool _confirmed = false;
@@ -173,7 +172,6 @@ class _NewAccountStepState extends State<_NewAccountStep> {
         setState(() {
           _core      = result.core;
           _seedPhrase = result.seedPhrase;
-          _phantomId  = result.core.myId;
           _generating = false;
         });
       }
@@ -279,12 +277,9 @@ class _NewAccountStepState extends State<_NewAccountStep> {
             const SizedBox(height: 8),
             SeedPhraseGrid(seedPhrase: _seedPhrase!, obscured: _obscured),
 
-            const SizedBox(height: 24),
-            Text('your phantom id',
-                style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
-            const SizedBox(height: 8),
-            PhantomIdDisplay(phantomId: _phantomId!),
-
+            // The phantom id is a backend identifier derived from the keys —
+            // nothing the user needs to see or act on at setup. The seed
+            // phrase above is what actually recovers the account.
             const SizedBox(height: 32),
             GestureDetector(
               onTap: () => setState(() => _confirmed = !_confirmed),

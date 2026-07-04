@@ -478,7 +478,9 @@ class _ChatScreenState extends State<ChatScreen> {
                     ],
                   ],
                 ),
-                PhantomIdDisplay(phantomId: widget.contactId, compact: true),
+                // The raw phantom id is backend addressing, not user-facing —
+                // the contact's name (nickname, alias, or a short fingerprint
+                // fallback) already identifies them here.
               ],
             ),
           ),
