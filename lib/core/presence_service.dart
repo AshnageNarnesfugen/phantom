@@ -92,6 +92,17 @@ class PresenceService {
     }
   }
 
+  /// Presence signal from the Bluetooth mesh: a contact was detected in range.
+  /// Marks them online WITHOUT the IPFS answer-heartbeat — over the mesh there
+  /// may be no internet, and the BLE advertisement itself is the bidirectional
+  /// signal (both phones see each other's node hint).
+  void noteMeshInRange(String contactId) {
+    if (_disposed) return;
+    final wasOnline = isOnline(contactId);
+    _lastSeen[contactId] = DateTime.now();
+    if (!wasOnline) _changesCtrl.add(contactId);
+  }
+
   DateTime? _lastAnswerAt;
 
   /// Publishes our heartbeat in response to hearing from a contact, at most

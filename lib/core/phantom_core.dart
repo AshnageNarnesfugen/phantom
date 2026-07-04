@@ -78,6 +78,7 @@ class PhantomCore {
   TransportManagerV2? _transportV2;
   StreamSubscription? _transportV2Sub;
   StreamSubscription? _meshStoreSub;
+  StreamSubscription? _meshRangeSub;
   bool _transportAvailable = false;
   bool get isTransportAvailable => _transportAvailable;
 
@@ -1193,6 +1194,10 @@ class PhantomCore {
 
     _presence?.addContacts([contact.phantomId]);
 
+    // Share the updated address book with the BLE mesh so it can recognise
+    // this contact by their node hint (rendezvous / presence-in-range).
+    unawaited(_shareContactsWithMesh());
+
     // Pre-warm: trigger DHT discovery + cross-subscription in the background
     // so the GossipSub mesh starts forming BEFORE the user sends their first
     // message. This dramatically improves handshake success rate.
@@ -1873,7 +1878,21 @@ class PhantomCore {
         (env) => _handleIncomingBytes(env.data),
         onError: (_) {},
       );
+
+      // Rendezvous: share the address book so the mesh can recognise contacts
+      // by their node hint, and mark them online when they're detected in
+      // Bluetooth range (presence works with zero internet). Contacts added
+      // later are re-shared by addContact.
+      unawaited(_shareContactsWithMesh());
+      _meshRangeSub = _transportV2!.contactInRange.listen((contactId) {
+        _presence?.noteMeshInRange(contactId);
+      });
     }
+  }
+
+  Future<void> _shareContactsWithMesh() async {
+    final contacts = await storage.getAllContacts();
+    _transportV2?.setKnownContacts(contacts.map((c) => c.phantomId));
   }
 
   // ── Presence ───────────────────────────────────────────────────────────────
@@ -2990,6 +3009,7 @@ class PhantomCore {
     await _transportSub?.cancel();
     await _transportV2Sub?.cancel();
     await _meshStoreSub?.cancel();
+    await _meshRangeSub?.cancel();
     await transport.dispose();
     await _transportV2?.dispose();
     _presence?.dispose();

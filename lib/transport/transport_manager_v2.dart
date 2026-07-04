@@ -46,6 +46,16 @@ class TransportManagerV2 {
   Stream<TransportMode> get modeChanges => _modeController.stream;
   TransportMode get currentMode => _mode;
 
+  /// Contactos detectados a rango de Bluetooth (rendezvous). PhantomCore lo
+  /// usa para marcar presencia por mesh.
+  Stream<String> get contactInRange => _btMesh.contactInRange;
+
+  /// Comparte la libreta con el mesh para reconocer contactos por su nodeHint.
+  void setKnownContacts(Iterable<String> phantomIds) =>
+      _btMesh.setKnownContacts(phantomIds);
+
+  bool isContactInRange(String phantomId) => _btMesh.isContactInRange(phantomId);
+
   final List<StreamSubscription> _subs = [];
   Timer? _retryTimer;
 
@@ -109,6 +119,17 @@ class TransportManagerV2 {
   }) async {
     switch (_mode) {
       case TransportMode.internet:
+        // Rendezvous: si el destinatario está a rango de Bluetooth, mándalo
+        // TAMBIÉN por mesh en paralelo — llega instantáneo aunque ambos tengan
+        // datos, y el receptor deduplica el frame (mismo wire por internet y
+        // mesh). Best-effort, no bloquea ni cambia el resultado de internet.
+        if (_btMesh.peerCount > 0 && _btMesh.isContactInRange(recipientId)) {
+          unawaited(_btMesh.sendEncrypted(
+            fullMessageId: fullMessageId,
+            recipientPhantomId: recipientId,
+            encryptedEnvelope: encryptedEnvelope,
+          ).catchError((_) {}));
+        }
         try {
           await _internetPublish?.call(
             recipientId: recipientId,

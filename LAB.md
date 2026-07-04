@@ -134,6 +134,15 @@ store-and-forward (C aparece después del envío), ACK_DELIV que limpia el store
 del emisor, no-entrega a relays intermedios, re-ruteo cuando un enlace se cae,
 y round-trips del fragmentador (desorden, duplicados, grupos concurrentes).
 
+Rendezvous WiFi→mesh: `ContactHintRegistry` (puro, testeable) cruza el
+`nodeHint` de 4 bytes que se ve por Bluetooth con la libreta, así el mesh
+reconoce "este de al lado es Bob". El transporte lo usa para (1) marcar
+presencia por Bluetooth sin internet (`PresenceService.noteMeshInRange`) y
+(2) enviar TAMBIÉN por mesh en paralelo cuando el destinatario está en rango
+(el receptor deduplica el frame). El mesh ya estaba siempre encendido
+(advertise+scan); lo que faltaba era el cruce hint↔contacto que dispara el
+cambio. `test/mesh/contact_hint_registry_test.dart` (7 tests).
+
 Bug crítico que encontró: **no había reensamblaje de fragmentos**. El receptor
 hacía `deserialize` sobre cada evento BLE, pero un MeshPacket serializado supera
 un MTU (frame cifrado ~1130 B, INIT de handshake ~3699 B) → cada fragmento

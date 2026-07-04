@@ -7,6 +7,7 @@ import 'mesh_protocol.dart';
 import 'mesh_router.dart';
 import 'message_store.dart';
 import 'gatt_server_channel.dart';
+import 'contact_hint_registry.dart';
 
 /// BluetoothMeshTransport — capa BLE del sistema de transporte Phantom.
 ///
@@ -108,6 +109,26 @@ class BluetoothMeshTransport {
 
   // Stream de envelopes entregados (para PhantomCore)
   Stream<Uint8List> get deliveredEnvelopes => _router.deliveredEnvelopes;
+
+  // Cruce hint↔contacto: qué contactos de la libreta están a rango de BLE.
+  final ContactHintRegistry _contactHints = ContactHintRegistry();
+  final _contactInRangeController = StreamController<String>.broadcast();
+
+  /// Emite el phantomId de un contacto cada vez que se lo detecta en rango
+  /// por Bluetooth (rendezvous). PhantomCore lo usa para marcar presencia y
+  /// para enviar también por mesh cuando el destinatario está cerca.
+  Stream<String> get contactInRange => _contactInRangeController.stream;
+
+  /// Registra la libreta para poder reconocer contactos por su nodeHint.
+  void setKnownContacts(Iterable<String> phantomIds) =>
+      _contactHints.setContacts(phantomIds);
+
+  /// ¿Este contacto está a rango de Bluetooth ahora?
+  bool isContactInRange(String phantomId) =>
+      _contactHints.isInRange(phantomId);
+
+  /// Contactos a rango de Bluetooth ahora mismo.
+  Set<String> get contactsInRange => _contactHints.inRange();
 
   BluetoothMeshTransport({
     required String myPhantomId,
@@ -257,10 +278,9 @@ class BluetoothMeshTransport {
   void _handleScanResult(ScanResult result) {
     final deviceId = result.device.remoteId.str;
 
-    // Ya conocemos este peer
-    if (_peers.containsKey(deviceId)) return;
-
-    // Extraer nodeHint del manufacturer data
+    // Extraer nodeHint del manufacturer data (también para peers ya conocidos:
+    // hay que refrescar su "en rango" en cada avistamiento o la presencia
+    // caducaría estando el contacto todavía al lado).
     final msd = result.advertisementData.manufacturerData;
     MeshAdvertisement? adv;
 
@@ -275,6 +295,16 @@ class BluetoothMeshTransport {
     }
 
     if (adv == null) return; // no es un nodo Phantom
+
+    // Rendezvous: ¿este hint es de un contacto nuestro? Si sí, está en rango.
+    final contactId = _contactHints.markInRange(adv.nodeHintBytes);
+    if (contactId != null && !_contactInRangeController.isClosed) {
+      _contactInRangeController.add(contactId);
+    }
+
+    // Ya conocemos el dispositivo → solo refrescamos presencia (arriba) y
+    // salimos; no reconectamos.
+    if (_peers.containsKey(deviceId)) return;
 
     final peer = MeshPeer(
       device: result.device,
@@ -512,8 +542,13 @@ class BluetoothMeshTransport {
 
   void _startPruneTimer() {
     _pruneTimer?.cancel();
-    _pruneTimer = Timer.periodic(const Duration(minutes: 2), (_) {
+    _pruneTimer = Timer.periodic(const Duration(seconds: 30), (_) {
       _router.pruneStalePeers();
+      // Contactos que salieron de rango de Bluetooth → re-emitir para que la
+      // presencia se apague (PhantomCore filtra el estado). Se re-emite el id;
+      // el consumidor decide (si sigue habiendo señal por internet, no pasa
+      // nada).
+      _contactHints.prune();
     });
   }
 
@@ -537,6 +572,7 @@ class BluetoothMeshTransport {
     for (final sub in _subs) { await sub.cancel(); }
     await _gattServer.dispose();
     await _stateController.close();
+    await _contactInRangeController.close();
     await _router.dispose();
     await _store.dispose();
   }
