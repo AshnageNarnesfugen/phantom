@@ -234,14 +234,20 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _loadMessages(PhantomCore core) async {
+  Future<void> _loadMessages(PhantomCore core, {bool jumpToBottom = false}) async {
     final msgs = await core.getMessages(widget.contactId, limit: 100);
     if (!mounted) return;
     setState(() => _messages = msgs);
     // Retry any media whose IPFS download failed earlier (daemon still
     // bootstrapping, sender briefly offline). No-op when all are resolved.
     unawaited(core.resolvePendingMedia(widget.contactId));
-    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    // No manual scroll on incoming events: the reverse ListView keeps the
+    // newest message pinned to the bottom on its own, and if the user has
+    // scrolled up to read history we must NOT yank them down. Only an
+    // explicit send jumps to the bottom so the sender sees their message.
+    if (jumpToBottom) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    }
 
     // Mark all unread incoming messages as read and notify the sender.
     final unread = msgs
@@ -281,10 +287,13 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  /// Jumps to the newest message. In a reverse ListView the bottom is
+  /// offset 0. Used only after the user sends, so they always see their own
+  /// message even if they'd scrolled up into history.
   void _scrollToBottom() {
     if (_scrollCtrl.hasClients) {
       _scrollCtrl.animateTo(
-        _scrollCtrl.position.maxScrollExtent,
+        0,
         duration: const Duration(milliseconds: 200),
         curve: Curves.easeOut,
       );
@@ -303,7 +312,7 @@ class _ChatScreenState extends State<ChatScreen> {
     );
     // Reload from storage so messages are always shown in timestamp order,
     // even when multiple sends complete out of order (e.g. large file + text).
-    if (mounted) _loadMessages(core);
+    if (mounted) _loadMessages(core, jumpToBottom: true);
   }
 
   Future<void> _sendFile(Uint8List bytes, String fileName) async {
@@ -323,7 +332,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       return;
     }
-    if (mounted) _loadMessages(core);
+    if (mounted) _loadMessages(core, jumpToBottom: true);
   }
 
   void _showMsgMenu(BuildContext ctx, PhantomTokens t, PhantomCore? core, StoredMessage msg) {
@@ -591,15 +600,28 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
     // Non-glass: wrap list in dimmed wallpaper decoration.
+    // reverse:true anchors the list at the BOTTOM (newest message). This is
+    // the standard fix for the chat-scroll jump: with a top-anchored list, a
+    // bubble above the viewport changing height (an image/video poster
+    // finishing load) shifted everything down and looked like the scroll
+    // jumped up. Anchored at the bottom, height changes above the newest
+    // messages don't disturb what you're reading, and new messages stay
+    // pinned to the bottom with no manual animateTo. Data stays chronological
+    // (index 0 = oldest); we map display index i → chronological c.
+    final n = _messages!.length;
     Widget list = ListView.builder(
       controller: _scrollCtrl,
+      reverse: true,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 16),
-      itemCount: _messages!.length,
+      itemCount: n,
       itemBuilder: (ctx, i) {
-        final msg     = _messages![i];
+        final c       = n - 1 - i; // display (0=bottom) → chronological
+        final msg     = _messages![c];
         final isOut   = msg.direction == MessageDirection.outgoing;
-        final nextSame = i < _messages!.length - 1 &&
-            (_messages![i + 1].direction == MessageDirection.outgoing) ==
+        // The bubble visually below this one is the chronologically next
+        // message; hide the tail when it's from the same sender.
+        final nextSame = c < n - 1 &&
+            (_messages![c + 1].direction == MessageDirection.outgoing) ==
                 isOut;
         // Non-null while this media is still an undownloaded CID pointer.
         final ptr = _pointerFor(msg);
