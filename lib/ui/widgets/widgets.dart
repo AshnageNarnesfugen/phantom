@@ -11,6 +11,7 @@ import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:open_file/open_file.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:video_player/video_player.dart';
 import 'package:record/record.dart';
 import '../theme/phantom_theme.dart';
 import '../../core/protocol/message.dart' show MessageStatus, MessageType;
@@ -310,13 +311,16 @@ class ChatBubble extends StatelessWidget {
           if (isAudio && bytes != null) {
             return _AudioPlayerBubble(bytes: bytes, textColor: textColor);
           }
-          // Video and every other file are tappable: bytes are written to a
-          // temp file and handed to the system viewer via open_file. Videos
-          // get a play affordance so they read as playable, not just "a file".
+          if (isVideo && bytes != null) {
+            // Video shows a poster (first frame) with a centred play button,
+            // like an image message, and plays inside the app on tap.
+            return _VideoTile(bytes: bytes, fileName: fileName);
+          }
+          // Any other file is tappable: bytes are written to a temp file and
+          // handed to the system viewer via open_file.
           return _FileTile(
             fileName: fileName,
             bytes: bytes,
-            isVideo: isVideo,
             textColor: textColor,
           );
         }
@@ -551,21 +555,18 @@ class _AudioPlayerBubbleState extends State<_AudioPlayerBubble> {
 
 // ── FileTile ──────────────────────────────────────────────────────────────────
 
-/// A resolved file/video message. Tapping writes the bytes to a temp file and
-/// opens it with the system viewer (open_file). Videos show a play affordance
-/// so they read as playable rather than an inert attachment — the field bug
-/// was that a sent video showed only its name with no way to open or view it.
+/// A resolved non-media file (docs, archives, …). Tapping writes the bytes to
+/// a temp file and opens it with the system viewer (open_file). Media types
+/// (image/audio/video) render in-app; this is the fallback for everything else.
 class _FileTile extends StatefulWidget {
   final String fileName;
   final Uint8List? bytes;
-  final bool isVideo;
   final Color textColor;
 
   const _FileTile({
     required this.fileName,
     required this.textColor,
     this.bytes,
-    this.isVideo = false,
   });
 
   @override
@@ -611,9 +612,6 @@ class _FileTileState extends State<_FileTile> {
   @override
   Widget build(BuildContext context) {
     final tappable = widget.bytes != null;
-    final icon = widget.isVideo
-        ? Icons.play_circle_outline
-        : Icons.insert_drive_file_outlined;
     return InkWell(
       onTap: tappable ? _open : null,
       child: Row(
@@ -627,7 +625,8 @@ class _FileTileState extends State<_FileTile> {
                   valueColor: AlwaysStoppedAnimation(widget.textColor)),
             )
           else
-            Icon(icon, color: widget.textColor, size: widget.isVideo ? 26 : 22),
+            Icon(Icons.insert_drive_file_outlined,
+                color: widget.textColor, size: 22),
           const SizedBox(width: 8),
           Flexible(
             child: Text(
@@ -638,6 +637,274 @@ class _FileTileState extends State<_FileTile> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+// ── VideoTile ─────────────────────────────────────────────────────────────────
+
+/// A resolved video message rendered like an image: the first frame as a
+/// poster with a centred play button. Tapping opens a fullscreen player that
+/// runs INSIDE the app (not an external gallery). The decrypted bytes are
+/// written once to a temp file, which both the poster controller and the
+/// fullscreen player read.
+class _VideoTile extends StatefulWidget {
+  final Uint8List bytes;
+  final String fileName;
+  const _VideoTile({required this.bytes, required this.fileName});
+
+  @override
+  State<_VideoTile> createState() => _VideoTileState();
+}
+
+class _VideoTileState extends State<_VideoTile> {
+  VideoPlayerController? _ctrl;
+  File? _file;
+  bool _failed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _prepare();
+  }
+
+  Future<void> _prepare() async {
+    try {
+      final dir = await getTemporaryDirectory();
+      // Stable temp name per content so scrolling back doesn't rewrite it.
+      final key = '${widget.bytes.length}_'
+          '${widget.bytes.take(8).join()}_${widget.bytes.reversed.take(8).join()}';
+      final file = File('${dir.path}/ph_vid_${key.hashCode}.mp4');
+      if (!await file.exists()) await file.writeAsBytes(widget.bytes);
+      final ctrl = VideoPlayerController.file(file);
+      await ctrl.initialize();
+      await ctrl.seekTo(Duration.zero); // ensure the first frame is shown
+      if (!mounted) { ctrl.dispose(); return; }
+      setState(() { _file = file; _ctrl = ctrl; });
+    } catch (_) {
+      if (mounted) setState(() => _failed = true);
+    }
+  }
+
+  void _openFullscreen() {
+    final file = _file;
+    if (file == null) return;
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => _VideoViewerScreen(file: file, title: widget.fileName),
+      fullscreenDialog: true,
+    ));
+  }
+
+  @override
+  void dispose() {
+    _ctrl?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ctrl = _ctrl;
+    final ready = ctrl != null && ctrl.value.isInitialized;
+    final aspect = ready ? ctrl.value.aspectRatio : 16 / 9;
+
+    return GestureDetector(
+      onTap: ready ? _openFullscreen : null,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 260, maxHeight: 320),
+          child: AspectRatio(
+            aspectRatio: aspect,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                if (ready)
+                  VideoPlayer(ctrl)
+                else
+                  Container(
+                    color: Colors.black26,
+                    child: Center(
+                      child: _failed
+                          ? const Icon(Icons.videocam_off_outlined,
+                              color: Colors.white70, size: 32)
+                          : const SizedBox(
+                              width: 26, height: 26,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2, color: Colors.white70)),
+                    ),
+                  ),
+                if (ready)
+                  Center(
+                    child: Container(
+                      width: 54, height: 54,
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.45),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.play_arrow_rounded,
+                          color: Colors.white, size: 36),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── VideoViewerScreen ─────────────────────────────────────────────────────────
+
+/// Fullscreen in-app video player: play/pause, scrub bar, current/total time.
+/// No external app is launched — playback happens entirely inside Phantom.
+class _VideoViewerScreen extends StatefulWidget {
+  final File file;
+  final String title;
+  const _VideoViewerScreen({required this.file, required this.title});
+
+  @override
+  State<_VideoViewerScreen> createState() => _VideoViewerScreenState();
+}
+
+class _VideoViewerScreenState extends State<_VideoViewerScreen> {
+  late final VideoPlayerController _ctrl;
+  bool _ready = false;
+  bool _showControls = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = VideoPlayerController.file(widget.file)
+      ..initialize().then((_) {
+        if (!mounted) return;
+        setState(() => _ready = true);
+        _ctrl.play();
+        _ctrl.setLooping(false);
+      });
+    _ctrl.addListener(_tick);
+  }
+
+  void _tick() {
+    if (mounted) setState(() {});
+  }
+
+  void _togglePlay() {
+    setState(() {
+      _ctrl.value.isPlaying ? _ctrl.pause() : _ctrl.play();
+    });
+  }
+
+  @override
+  void dispose() {
+    _ctrl.removeListener(_tick);
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  static String _fmt(Duration d) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    final m = d.inMinutes;
+    final s = d.inSeconds % 60;
+    return '${two(m)}:${two(s)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final v = _ctrl.value;
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: GestureDetector(
+        onTap: () => setState(() => _showControls = !_showControls),
+        child: Stack(
+          children: [
+            Center(
+              child: _ready
+                  ? AspectRatio(
+                      aspectRatio: v.aspectRatio,
+                      child: VideoPlayer(_ctrl))
+                  : const CircularProgressIndicator(color: Colors.white70),
+            ),
+            // Center play/pause
+            if (_ready && _showControls)
+              Center(
+                child: GestureDetector(
+                  onTap: _togglePlay,
+                  child: Container(
+                    width: 64, height: 64,
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.45),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(
+                      v.isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                      color: Colors.white, size: 42),
+                  ),
+                ),
+              ),
+            // Top bar: close + name
+            if (_showControls)
+              SafeArea(
+                child: Row(
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white),
+                      onPressed: () => Navigator.of(context).pop(),
+                    ),
+                    Expanded(
+                      child: Text(widget.title,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              color: Colors.white,
+                              fontFamily: 'monospace',
+                              fontSize: 13)),
+                    ),
+                  ],
+                ),
+              ),
+            // Bottom: scrubber + times
+            if (_ready && _showControls)
+              Positioned(
+                left: 0, right: 0, bottom: 0,
+                child: SafeArea(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        VideoProgressIndicator(
+                          _ctrl,
+                          allowScrubbing: true,
+                          colors: const VideoProgressColors(
+                            playedColor: Colors.white,
+                            bufferedColor: Colors.white24,
+                            backgroundColor: Colors.white10,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(_fmt(v.position),
+                                style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontFamily: 'monospace',
+                                    fontSize: 11)),
+                            Text(_fmt(v.duration),
+                                style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontFamily: 'monospace',
+                                    fontSize: 11)),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
