@@ -139,6 +139,17 @@ Future<void> main() async {
   );
   print('x3dh_shared       = ${hex(await aShared.extractBytes())}');
 
+  // ── Hybrid combine (HybridKEM.combineSecrets) ───────────────────────────────
+  // HKDF-SHA512(ikm = x3dhSecret || kyberSecret, salt = "phantom-hybrid-v1",
+  // info = "phantom-x3dh-kyber768", L = 32).
+  final combineIkm = Uint8List.fromList([...fill(32, 0x61), ...fill(32, 0x62)]);
+  final combined = await Hkdf(hmac: Hmac(Sha512()), outputLength: 32).deriveKey(
+    secretKey: SecretKey(combineIkm),
+    nonce: Uint8List.fromList(utf8.encode('phantom-hybrid-v1')),
+    info: Uint8List.fromList(utf8.encode('phantom-x3dh-kyber768')),
+  );
+  print('hybrid_combined   = ${hex(await combined.extractBytes())}');
+
   // ── ChaCha20-Poly1305 AEAD ──────────────────────────────────────────────────
   final key = fill(32, 0x01);
   final nonce = fill(12, 0x02);

@@ -35,6 +35,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type HmacSha512 = Hmac<Sha512>;
 
+/// The stateful double-ratchet session (slice 5).
+pub mod ratchet;
+
+/// C-ABI surface for `dart:ffi` (slice 6, stateless functions).
+pub mod ffi;
+
 /// A 32-byte secret that is wiped from memory when dropped. Use this for any
 /// key material (DH outputs, chain/root keys, derived keys) so it never
 /// lingers in RAM — the core reason this crate exists.
@@ -239,6 +245,29 @@ pub fn kdf_chain_key(chain_key: &[u8; 32]) -> (Secret32, Secret32, [u8; 32]) {
     (Secret32(new_ck), Secret32(enc_key), header_key)
 }
 
+// ── Hybrid KEM combine ────────────────────────────────────────────────────────
+//
+// NOTE: only the COMBINE step lives here. The Kyber-768 KEM itself (keygen /
+// encaps / decaps) stays in Dart (`post_quantum`) for now: that package
+// implements round-3 Kyber (SHAKE256 final KDF over the ciphertext hash), which
+// is NOT wire-compatible with the FIPS-203 `ml-kem` Rust crates — a ciphertext
+// encapsulated on one side would decapsulate to a different secret on the
+// other. Migrating the KEM must therefore happen on BOTH sides at once (the
+// FFI cutover), or Kyber stays in Dart and hands its 32-byte shared secret to
+// this combine. The combine is pure HKDF, so it IS safely portable now.
+
+/// `HybridKEM.combineSecrets`: HKDF-SHA512(ikm = x3dh || kyber,
+/// salt = "phantom-hybrid-v1", info = "phantom-x3dh-kyber768", L = 32).
+pub fn hybrid_combine(x3dh_secret: &[u8; 32], kyber_secret: &[u8; 32]) -> Secret32 {
+    let mut ikm = [0u8; 64];
+    ikm[..32].copy_from_slice(x3dh_secret);
+    ikm[32..].copy_from_slice(kyber_secret);
+    let mut out = [0u8; 32];
+    hkdf_sha512(&ikm, b"phantom-hybrid-v1", b"phantom-x3dh-kyber768", &mut out);
+    ikm.zeroize();
+    Secret32(out)
+}
+
 // ── ChaCha20-Poly1305 AEAD ────────────────────────────────────────────────────
 
 /// AEAD encrypt. Returns `(ciphertext, 16-byte tag)` split the same way the
@@ -322,6 +351,8 @@ mod tests {
          488cd004d0f9b612960536b3b568ba37ae00680341b41f1a51c096e754058b02";
     const X3DH_SHARED: &str =
         "ab788a0bd88999772b4421ec165a18541b42641c845a78358a8e484386168971";
+    const HYBRID_COMBINED: &str =
+        "5ccd54e0f6bc4c4048253e2a48330ec90b2951c988a23174dfa4dc6ec4e7618b";
 
     #[test]
     fn x25519_public_matches_dart() {
@@ -471,6 +502,12 @@ mod tests {
         );
         assert!(init_no_opk.ct_eq(&resp_no_opk));
         assert!(!init.ct_eq(&init_no_opk));
+    }
+
+    #[test]
+    fn hybrid_combine_matches_dart() {
+        let out = hybrid_combine(&seed(0x61), &seed(0x62));
+        assert_eq!(hex(out.as_bytes()), HYBRID_COMBINED);
     }
 
     #[test]

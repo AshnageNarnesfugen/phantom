@@ -6,9 +6,10 @@ description = "Memory-safe crypto core for Phantom — vetted primitives with se
 license = "MIT"
 
 [lib]
-# rlib for `cargo test` now; cdylib/staticlib get added when the FFI slice
-# (flutter_rust_bridge) lands so this links into the Flutter app.
-crate-type = ["rlib"]
+# rlib for `cargo test`; cdylib for the Android/Linux .so and staticlib for
+# the iOS xcframework — the crate now builds as a native library the Flutter
+# app can link (see src/ffi.rs and rust/README.md).
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 # Vetted, audited primitives (the same families libsignal uses).
@@ -22,6 +23,10 @@ sha2 = "0.10"
 # can't close), and constant-time comparison to avoid timing side channels.
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
+# Session (de)serialization parity with the Dart JSON, and CSPRNG for nonces /
+# new ratchet DH keys.
+serde_json = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [profile.release]
 # Keep debug asserts off but do not let the optimizer elide zeroization —
