@@ -12,6 +12,8 @@ import 'core/waku_daemon.dart';
 import 'core/yggdrasil_daemon.dart';
 import 'core/yggdrasil_peers.dart';
 import 'core/notification_service.dart';
+import 'core/transport_debugger.dart';
+import 'core/crypto/native/phantom_crypto_native.dart';
 import 'core_provider.dart';
 import 'ui/theme/phantom_theme.dart';
 import 'ui/screens/screens.dart';
@@ -212,6 +214,18 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
       try { await I2pdDaemon.instance.ensure(); } catch (e) { debugPrint('I2pd error: $e'); }
       try { await _prepareYggdrasilAndEnsure(); } catch (e) { debugPrint('Ygg error: $e'); }
     }
+    // Load the Rust crypto core and verify it agrees with the Dart crypto on
+    // this device (parity oracle). It does NOT yet handle any real message —
+    // this is the runtime gate before a hot-path cutover. Result shows in the
+    // in-app Transport Debugger as "NATIVE: …".
+    unawaited(() async {
+      final native = PhantomCryptoNative.tryLoad();
+      if (native == null) {
+        TransportDebugger.instance.log('NATIVE: Rust core not available on this build');
+      } else {
+        await native.runParityOracle();
+      }
+    }());
     await _tryRestoreAccount();
   }
 

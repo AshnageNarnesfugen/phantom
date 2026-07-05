@@ -76,6 +76,7 @@ dependencies:
   # In-app video playback (poster frame in the bubble + fullscreen player),
   # so received videos play inside Phantom instead of an external gallery.
   video_player: ^2.9.2
+  ffi: ^2.2.0
 
 dependency_overrides:
   post_quantum:
