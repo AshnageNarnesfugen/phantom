@@ -26,10 +26,13 @@
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+type HmacSha512 = Hmac<Sha512>;
 
 /// A 32-byte secret that is wiped from memory when dropped. Use this for any
 /// key material (DH outputs, chain/root keys, derived keys) so it never
@@ -103,6 +106,70 @@ pub fn x3dh_kdf(
     Secret32(out)
 }
 
+// ── Double-ratchet KDFs ───────────────────────────────────────────────────────
+//
+// Exact ports of double_ratchet.dart's _kdfInitialHeaderKey / _kdfRootKey /
+// _kdfChainKey, same domain-separation strings, proven byte-identical below.
+
+/// `_kdfInitialHeaderKey`: HKDF-SHA512(ikm = shared, salt = "", info = dir).
+pub fn kdf_initial_header_key(shared: &[u8; 32], direction: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    hkdf_sha512(shared, b"", direction, &mut out);
+    out
+}
+
+/// `_kdfRootKey`: HKDF-SHA512(ikm = dh_output, salt = root_key,
+/// info = "phantom-ratchet-root-key", L = 96) → (new_root, chain, next_header).
+pub fn kdf_root_key(
+    root_key: &[u8; 32],
+    dh_output: &[u8; 32],
+) -> (Secret32, Secret32, [u8; 32]) {
+    let hk = Hkdf::<Sha512>::new(Some(root_key), dh_output);
+    let mut buf = [0u8; 96];
+    hk.expand(b"phantom-ratchet-root-key", &mut buf)
+        .expect("hkdf expand 96");
+    let mut new_root = [0u8; 32];
+    let mut chain = [0u8; 32];
+    let mut next_hk = [0u8; 32];
+    new_root.copy_from_slice(&buf[0..32]);
+    chain.copy_from_slice(&buf[32..64]);
+    next_hk.copy_from_slice(&buf[64..96]);
+    buf.zeroize();
+    (Secret32(new_root), Secret32(chain), next_hk)
+}
+
+/// `_kdfChainKey`:
+///   new_ck  = HMAC-SHA512(key = ck, [0x01])[0..32]
+///   mk_mac  = HMAC-SHA512(key = ck, "phantom-ratchet-chain-key")   (64 bytes)
+///   mk      = HKDF-SHA512(ikm = mk_mac, salt = "",
+///             info = "phantom-ratchet-message-key", L = 64)
+///             enc_key = mk[0..32], header_key = mk[32..64]
+pub fn kdf_chain_key(chain_key: &[u8; 32]) -> (Secret32, Secret32, [u8; 32]) {
+    // new chain key
+    let mut m1 = <HmacSha512 as Mac>::new_from_slice(chain_key).expect("hmac key");
+    m1.update(&[0x01]);
+    let ck_mac = m1.finalize().into_bytes(); // 64 bytes
+    let mut new_ck = [0u8; 32];
+    new_ck.copy_from_slice(&ck_mac[0..32]);
+
+    // message-key material
+    let mut m2 = <HmacSha512 as Mac>::new_from_slice(chain_key).expect("hmac key");
+    m2.update(b"phantom-ratchet-chain-key");
+    let mut mk_mac = m2.finalize().into_bytes(); // 64 bytes, used as HKDF ikm
+
+    let mut mk = [0u8; 64];
+    hkdf_sha512(&mk_mac, b"", b"phantom-ratchet-message-key", &mut mk);
+    mk_mac.zeroize();
+
+    let mut enc_key = [0u8; 32];
+    let mut header_key = [0u8; 32];
+    enc_key.copy_from_slice(&mk[0..32]);
+    header_key.copy_from_slice(&mk[32..64]);
+    mk.zeroize();
+
+    (Secret32(new_ck), Secret32(enc_key), header_key)
+}
+
 // ── ChaCha20-Poly1305 AEAD ────────────────────────────────────────────────────
 
 /// AEAD encrypt. Returns `(ciphertext, 16-byte tag)` split the same way the
@@ -165,6 +232,20 @@ mod tests {
         "fe313ec6428b9b5204c867e4eacd78c4c83ca3528abdc41ece954cf5cac50dcd";
     const CHACHA_CT: &str = "96749340f9cc85fa05489a8df3fd814af8dc1e";
     const CHACHA_MAC: &str = "ca4f28877af57f334464cf6725ada260";
+    const RATCHET_IHK: &str =
+        "4012bb3061583eb1a61c284ffbe68d1e6210dd718e51e9e1c9d622567eb87025";
+    const RATCHET_RK_NEWRK: &str =
+        "4647733631a3096e435a3d3cd079ec64d2fc6746b4c65b920d73be841c7a75d8";
+    const RATCHET_RK_CK: &str =
+        "52c8b9e8f110d4abdc470a5f30d4a6bed309ccb12bac920e54ba73fdc56100ca";
+    const RATCHET_RK_NEXTHK: &str =
+        "c485259e1001be0e01195d95574ae098e473b817bac56729d4de9dd593c9feed";
+    const RATCHET_CK_NEWCK: &str =
+        "0839a07a4c8a9c2b42bb276e73eaff899c5828b5f706d0e572b38ea465943725";
+    const RATCHET_CK_ENCKEY: &str =
+        "06f418973c2a4600b3a9b9ccff8d8367c066ba3cfcfd0f90ff99e7608ab5c17e";
+    const RATCHET_CK_HDRKEY: &str =
+        "7e399762fb0e51881c84c51c55de20ec89c9897cb56ab1f256c886d76f6593d6";
 
     #[test]
     fn x25519_public_matches_dart() {
@@ -213,6 +294,28 @@ mod tests {
         let mut bad = tag;
         bad[0] ^= 1;
         assert!(chacha20poly1305_decrypt(&key, &nonce, &aad, &ct, &bad).is_none());
+    }
+
+    #[test]
+    fn kdf_initial_header_key_matches_dart() {
+        let hk = kdf_initial_header_key(&seed(0x55), b"phantom-ratchet-hk-atob");
+        assert_eq!(hex(&hk), RATCHET_IHK);
+    }
+
+    #[test]
+    fn kdf_root_key_matches_dart() {
+        let (new_root, ck, next_hk) = kdf_root_key(&seed(0x66), &seed(0x77));
+        assert_eq!(hex(new_root.as_bytes()), RATCHET_RK_NEWRK);
+        assert_eq!(hex(ck.as_bytes()), RATCHET_RK_CK);
+        assert_eq!(hex(&next_hk), RATCHET_RK_NEXTHK);
+    }
+
+    #[test]
+    fn kdf_chain_key_matches_dart() {
+        let (new_ck, enc_key, header_key) = kdf_chain_key(&seed(0x88));
+        assert_eq!(hex(new_ck.as_bytes()), RATCHET_CK_NEWCK);
+        assert_eq!(hex(enc_key.as_bytes()), RATCHET_CK_ENCKEY);
+        assert_eq!(hex(&header_key), RATCHET_CK_HDRKEY);
     }
 
     #[test]

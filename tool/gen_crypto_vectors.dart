@@ -55,6 +55,50 @@ Future<void> main() async {
   );
   print('x3dh_kdf          = ${hex(await x3.extractBytes())}');
 
+  // ── Ratchet: _kdfInitialHeaderKey ───────────────────────────────────────────
+  // HKDF-SHA512(ikm = sharedSecret, salt = empty, info = direction, L = 32).
+  final ihk = await Hkdf(hmac: Hmac(Sha512()), outputLength: 32).deriveKey(
+    secretKey: SecretKey(fill(32, 0x55)),
+    nonce: Uint8List(0),
+    info: Uint8List.fromList(utf8.encode('phantom-ratchet-hk-atob')),
+  );
+  print('ratchet_ihk       = ${hex(await ihk.extractBytes())}');
+
+  // ── Ratchet: _kdfRootKey ────────────────────────────────────────────────────
+  // HKDF-SHA512(ikm = dhOutput, salt = rootKey, info = "phantom-ratchet-root-key",
+  // L = 96) → (newRootKey | chainKey | nextHeaderKey).
+  final rk = await Hkdf(hmac: Hmac(Sha512()), outputLength: 96).deriveKey(
+    secretKey: SecretKey(fill(32, 0x77)), // dhOutput
+    nonce: fill(32, 0x66), // rootKey (salt)
+    info: Uint8List.fromList(utf8.encode('phantom-ratchet-root-key')),
+  );
+  final rkb = await rk.extractBytes();
+  print('ratchet_rk_newrk  = ${hex(rkb.sublist(0, 32))}');
+  print('ratchet_rk_ck     = ${hex(rkb.sublist(32, 64))}');
+  print('ratchet_rk_nexthk = ${hex(rkb.sublist(64, 96))}');
+
+  // ── Ratchet: _kdfChainKey ───────────────────────────────────────────────────
+  // newCK = HMAC-SHA512(key=CK, msg=[0x01])[0:32]
+  // mkMac = HMAC-SHA512(key=CK, msg="phantom-ratchet-chain-key")
+  // mk    = HKDF-SHA512(ikm=mkMac, salt=empty, info="phantom-ratchet-message-key", L=64)
+  //         encKey=mk[0:32]  headerKey=mk[32:64]
+  final ck = fill(32, 0x88);
+  final hmacS = Hmac(Sha512());
+  final newCKMac =
+      await hmacS.calculateMac(Uint8List.fromList([0x01]), secretKey: SecretKey(ck));
+  final mkMac = await hmacS.calculateMac(
+      Uint8List.fromList(utf8.encode('phantom-ratchet-chain-key')),
+      secretKey: SecretKey(ck));
+  final mkExp = await Hkdf(hmac: Hmac(Sha512()), outputLength: 64).deriveKey(
+    secretKey: SecretKey(mkMac.bytes),
+    nonce: Uint8List(0),
+    info: Uint8List.fromList(utf8.encode('phantom-ratchet-message-key')),
+  );
+  final mkb = await mkExp.extractBytes();
+  print('ratchet_ck_newck  = ${hex(newCKMac.bytes.sublist(0, 32))}');
+  print('ratchet_ck_enckey = ${hex(mkb.sublist(0, 32))}');
+  print('ratchet_ck_hdrkey = ${hex(mkb.sublist(32, 64))}');
+
   // ── ChaCha20-Poly1305 AEAD ──────────────────────────────────────────────────
   final key = fill(32, 0x01);
   final nonce = fill(12, 0x02);

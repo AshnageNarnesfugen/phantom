@@ -26,11 +26,17 @@ dart run tool/gen_crypto_vectors.dart      # regenerate reference vectors
 cd rust/phantom_crypto && cargo test       # 6/6 parity + round-trip + tamper
 ```
 
-Covered so far (byte-identical): X25519 public + DH, HKDF-SHA512, the X3DH KDF
-(F-prefix + concat), ChaCha20-Poly1305 AEAD (ciphertext + tag split the same
-way the ratchet stores it).
+Covered so far (byte-identical, 9/9 parity tests):
 
-## Status — this is slice 1 of the migration
+- **Slice 1** — X25519 public + DH, HKDF-SHA512, the X3DH KDF (F-prefix +
+  concat), ChaCha20-Poly1305 AEAD (ciphertext + tag split the way the ratchet
+  stores it), `Secret32` zeroization, constant-time compare.
+- **Slice 2** — the double-ratchet KDFs: `_kdfInitialHeaderKey`,
+  `_kdfRootKey` (root|chain|next-header split), `_kdfChainKey` (new-CK via
+  HMAC + message enc/header keys via HMAC→HKDF), same domain-separation
+  strings, intermediates zeroized.
+
+## Status — slices 1–2 done, not yet wired into the app
 
 **This crate is validated but NOT yet wired into the app.** The Dart crypto is
 still what ships. This slice proves the toolchain + primitives + parity, which
@@ -38,16 +44,14 @@ was the prerequisite before committing to the full port.
 
 Remaining slices, in order:
 
-1. **Ratchet KDFs** — `_kdfRootKey` / `_kdfChainKey` / `_kdfInitialHeaderKey`
-   and header AEAD, with the same domain-separation strings (parity vectors
-   already easy to add).
-2. **X3DH orchestration** — `initiate` / `respond` / bundle generation, holding
-   DH outputs in `Secret32`.
-3. **Kyber-768 hybrid** — via a FIPS-203 `ml-kem` crate, `combineSecrets`.
-4. **Double-ratchet state machine** — the stateful `RatchetSession`
-   (encrypt/decrypt/skip/DH-ratchet), with `mlock`ed secret state. Kept behind
-   a thin, byte-oriented API so the Dart session layer calls into it.
-5. **FFI via `flutter_rust_bridge`** — compile to `.so` (Android via
+1. **X3DH orchestration** — `initiate` / `respond` / bundle generation, holding
+   DH outputs in `Secret32` (the DH + KDF primitives it needs are already done).
+2. **Kyber-768 hybrid** — via a FIPS-203 `ml-kem` crate, `combineSecrets`.
+3. **Double-ratchet state machine** — the stateful `RatchetSession`
+   (encrypt/decrypt/skip/DH-ratchet), reusing the slice-2 KDFs, with `mlock`ed
+   secret state. Kept behind a thin, byte-oriented API so the Dart session
+   layer calls into it.
+4. **FFI via `flutter_rust_bridge`** — compile to `.so` (Android via
    `cargo-ndk` + NDK 28, already installed), `.a`/xcframework (iOS), `.so`
    (Linux). FRB generates the Dart bindings. Add `cdylib`/`staticlib` to
    `[lib] crate-type`. Then swap `lib/core/crypto/` call sites to the bridge,
