@@ -106,6 +106,33 @@ void main() {
         expect(_str(pt), equals('m$i'));
       }
     });
+
+    test('skipped-key store stays bounded across lossy rounds', () async {
+      // Skipped keys accumulate ACROSS DH-ratchet chains (within one chain the
+      // per-gap _maxSkip already bounds work). Ping-pong 3 rounds; each round
+      // Alice sends a burst and Bob decrypts only the last, retaining the
+      // skipped keys of that chain. 3 × ~800 > the 2000 total cap, so the
+      // store must evict oldest and stay bounded — no unbounded growth (and no
+      // unbounded serialization into the encrypted store).
+      final s = await _bootstrap();
+      const perRound = 800;
+      for (int r = 0; r < 3; r++) {
+        final cts = <EncryptedMessage>[];
+        for (int i = 0; i < perRound; i++) {
+          cts.add(await s.alice.encrypt(_msg('r${r}m$i')));
+        }
+        // Bob decrypts only the last of the burst → skips the rest (retained).
+        expect(_str(await s.bob.decrypt(cts.last)), equals('r${r}m${perRound - 1}'));
+        // Bob replies so Alice performs a DH ratchet → next round is a new
+        // chain, so its skipped keys add to the retained total.
+        final reply = await s.bob.encrypt(_msg('ack$r'));
+        expect(_str(await s.alice.decrypt(reply)), equals('ack$r'));
+      }
+
+      final sk = (await s.bob.toJson())['sk'] as Map;
+      expect(sk.length, lessThanOrEqualTo(2000),
+          reason: 'skipped-key store must be capped, not grow unbounded');
+    });
   });
 
   group('Double Ratchet — adversarial inputs', () {

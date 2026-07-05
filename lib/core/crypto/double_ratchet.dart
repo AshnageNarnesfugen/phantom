@@ -14,7 +14,17 @@ import 'package:meta/meta.dart';
 ///     first message without a circular dependency.
 ///   - _kdfRootKey now produces 3 outputs (removed the redundant 4th).
 
+/// Max message keys skipped in a SINGLE gap (one header claiming a far-future
+/// message number). Bounds per-step work.
 const int _maxSkip = 1000;
+
+/// Hard cap on the TOTAL number of retained skipped message keys across the
+/// whole session. Without this the map grows unbounded on a lossy link (every
+/// skipped key is also serialized into the encrypted store on each save), and
+/// a misbehaving contact could inflate it deliberately. When exceeded, the
+/// oldest keys are evicted FIFO — those messages simply become undecryptable
+/// if they ever arrive, which is the correct trade-off vs unbounded growth.
+const int _maxStoredSkipped = 2000;
 
 /// After this many sent messages without a reply, stop embedding the X3DH
 /// ephemeral / Kyber ciphertext in outgoing INIT frames. The receiver must
@@ -361,6 +371,18 @@ class RatchetSession {
       _skippedKeys[key] = mk;
       _receivingN++;
     }
+    _evictOldestSkipped();
+  }
+
+  /// Enforces [_maxStoredSkipped] by dropping the oldest retained keys. Dart
+  /// maps preserve insertion order, so the first keys are the oldest.
+  void _evictOldestSkipped() {
+    if (_skippedKeys.length <= _maxStoredSkipped) return;
+    final overflow = _skippedKeys.length - _maxStoredSkipped;
+    final oldest = _skippedKeys.keys.take(overflow).toList();
+    for (final k in oldest) {
+      _skippedKeys.remove(k);
+    }
   }
 
   MessageKey? _trySkippedKey(RatchetHeader header) {
@@ -630,6 +652,7 @@ class RatchetSession {
         headerKey: Uint8List.fromList(_unhexOf(v['hk'] as String)),
       );
     }
+    session._evictOldestSkipped(); // enforce the cap on sessions saved pre-fix
 
     return session;
   }
