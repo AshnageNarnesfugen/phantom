@@ -35,8 +35,13 @@ Covered so far (byte-identical, 9/9 parity tests):
   `_kdfRootKey` (root|chain|next-header split), `_kdfChainKey` (new-CK via
   HMAC + message enc/header keys via HMAC→HKDF), same domain-separation
   strings, intermediates zeroized.
+- **Slice 3** — Ed25519 (public/sign/verify, for SPK + IK signatures) and the
+  X3DH shared-secret composition (`x3dh_initiate` / `x3dh_respond`, same DH
+  ordering as `X3DHHandshake`). Tests assert the Dart vector AND the
+  fundamental property that initiate and respond derive the same secret, with
+  and without a one-time prekey.
 
-## Status — slices 1–2 done, not yet wired into the app
+## Status — slices 1–3 done, not yet wired into the app
 
 **This crate is validated but NOT yet wired into the app.** The Dart crypto is
 still what ships. This slice proves the toolchain + primitives + parity, which
@@ -44,14 +49,13 @@ was the prerequisite before committing to the full port.
 
 Remaining slices, in order:
 
-1. **X3DH orchestration** — `initiate` / `respond` / bundle generation, holding
-   DH outputs in `Secret32` (the DH + KDF primitives it needs are already done).
-2. **Kyber-768 hybrid** — via a FIPS-203 `ml-kem` crate, `combineSecrets`.
-3. **Double-ratchet state machine** — the stateful `RatchetSession`
-   (encrypt/decrypt/skip/DH-ratchet), reusing the slice-2 KDFs, with `mlock`ed
-   secret state. Kept behind a thin, byte-oriented API so the Dart session
-   layer calls into it.
-4. **FFI via `flutter_rust_bridge`** — compile to `.so` (Android via
+1. **Kyber-768 hybrid** — via a FIPS-203 `ml-kem` crate, `combineSecrets` (mix
+   the X3DH secret with the Kyber shared secret).
+2. **Double-ratchet state machine** — the stateful `RatchetSession`
+   (encrypt/decrypt/skip/DH-ratchet), reusing the slice-2 KDFs + slice-3 X3DH,
+   with `mlock`ed secret state. Kept behind a thin, byte-oriented API so the
+   Dart session layer calls into it.
+3. **FFI via `flutter_rust_bridge`** — compile to `.so` (Android via
    `cargo-ndk` + NDK 28, already installed), `.a`/xcframework (iOS), `.so`
    (Linux). FRB generates the Dart bindings. Add `cdylib`/`staticlib` to
    `[lib] crate-type`. Then swap `lib/core/crypto/` call sites to the bridge,

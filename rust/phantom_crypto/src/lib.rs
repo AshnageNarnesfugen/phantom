@@ -25,6 +25,7 @@
 
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
@@ -104,6 +105,74 @@ pub fn x3dh_kdf(
     hkdf_sha512(&ikm, b"", b"phantom-x3dh-v1", &mut out);
     ikm.zeroize(); // wipe the concatenated DH material
     Secret32(out)
+}
+
+// ── Ed25519 (SPK / IK signatures) ─────────────────────────────────────────────
+
+/// Ed25519 public key from a 32-byte seed (RFC 8032).
+pub fn ed25519_public(seed: &[u8; 32]) -> [u8; 32] {
+    SigningKey::from_bytes(seed).verifying_key().to_bytes()
+}
+
+/// Deterministic Ed25519 signature (64 bytes) over `msg`.
+pub fn ed25519_sign(seed: &[u8; 32], msg: &[u8]) -> [u8; 64] {
+    SigningKey::from_bytes(seed).sign(msg).to_bytes()
+}
+
+/// Verify an Ed25519 signature. Never panics: a malformed key/sig → false.
+pub fn ed25519_verify(public: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
+    let Ok(vk) = VerifyingKey::from_bytes(public) else {
+        return false;
+    };
+    vk.verify(msg, &ed25519_dalek::Signature::from_bytes(sig)).is_ok()
+}
+
+// ── X3DH shared-secret composition ────────────────────────────────────────────
+//
+// Ports X3DHHandshake.initiate / respond (the DH ordering + KDF). The SPK
+// signature check the caller must do with ed25519_verify before initiating;
+// this computes the secret. DH outputs are Secret32 so they zeroize after the
+// KDF consumes them.
+
+/// Alice: DH(IK_A,SPK_B) · DH(EK_A,IK_B) · DH(EK_A,SPK_B) · [DH(EK_A,OPK_B)].
+pub fn x3dh_initiate(
+    our_ik_seed: &[u8; 32],
+    eph_seed: &[u8; 32],
+    their_ik_pub: &[u8; 32],
+    their_spk_pub: &[u8; 32],
+    their_opk_pub: Option<&[u8; 32]>,
+) -> Secret32 {
+    let dh1 = x25519_shared(our_ik_seed, their_spk_pub);
+    let dh2 = x25519_shared(eph_seed, their_ik_pub);
+    let dh3 = x25519_shared(eph_seed, their_spk_pub);
+    let dh4 = their_opk_pub.map(|opk| x25519_shared(eph_seed, opk));
+    x3dh_kdf(
+        dh1.as_bytes(),
+        dh2.as_bytes(),
+        dh3.as_bytes(),
+        dh4.as_ref().map(|s| s.as_bytes()),
+    )
+}
+
+/// Bob: DH(SPK_B,IK_A) · DH(IK_B,EK_A) · DH(SPK_B,EK_A) · [DH(OPK_B,EK_A)].
+/// Produces the same secret as [`x3dh_initiate`] for the matching keys.
+pub fn x3dh_respond(
+    our_ik_seed: &[u8; 32],
+    our_spk_seed: &[u8; 32],
+    our_opk_seed: Option<&[u8; 32]>,
+    their_ik_pub: &[u8; 32],
+    their_eph_pub: &[u8; 32],
+) -> Secret32 {
+    let dh1 = x25519_shared(our_spk_seed, their_ik_pub);
+    let dh2 = x25519_shared(our_ik_seed, their_eph_pub);
+    let dh3 = x25519_shared(our_spk_seed, their_eph_pub);
+    let dh4 = our_opk_seed.map(|opk| x25519_shared(opk, their_eph_pub));
+    x3dh_kdf(
+        dh1.as_bytes(),
+        dh2.as_bytes(),
+        dh3.as_bytes(),
+        dh4.as_ref().map(|s| s.as_bytes()),
+    )
 }
 
 // ── Double-ratchet KDFs ───────────────────────────────────────────────────────
@@ -246,6 +315,13 @@ mod tests {
         "06f418973c2a4600b3a9b9ccff8d8367c066ba3cfcfd0f90ff99e7608ab5c17e";
     const RATCHET_CK_HDRKEY: &str =
         "7e399762fb0e51881c84c51c55de20ec89c9897cb56ab1f256c886d76f6593d6";
+    const ED25519_PUB: &str =
+        "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48";
+    const ED25519_SIG: &str =
+        "ad8c9b32bd78ee19874d1558ceb7aa466676206600dfb44495254bf2a8f89c44\
+         488cd004d0f9b612960536b3b568ba37ae00680341b41f1a51c096e754058b02";
+    const X3DH_SHARED: &str =
+        "ab788a0bd88999772b4421ec165a18541b42641c845a78358a8e484386168971";
 
     #[test]
     fn x25519_public_matches_dart() {
@@ -316,6 +392,85 @@ mod tests {
         assert_eq!(hex(new_ck.as_bytes()), RATCHET_CK_NEWCK);
         assert_eq!(hex(enc_key.as_bytes()), RATCHET_CK_ENCKEY);
         assert_eq!(hex(&header_key), RATCHET_CK_HDRKEY);
+    }
+
+    #[test]
+    fn ed25519_matches_dart_and_verifies() {
+        let seed = seed(0x44);
+        let msg = b"phantom ed25519 test";
+        assert_eq!(hex(&ed25519_public(&seed)), ED25519_PUB);
+        let sig = ed25519_sign(&seed, msg);
+        assert_eq!(hex(&sig), ED25519_SIG);
+
+        let pub_ = ed25519_public(&seed);
+        assert!(ed25519_verify(&pub_, msg, &sig));
+        // Wrong message / tampered sig → rejected, no panic.
+        assert!(!ed25519_verify(&pub_, b"other", &sig));
+        let mut bad = sig;
+        bad[0] ^= 1;
+        assert!(!ed25519_verify(&pub_, msg, &bad));
+    }
+
+    #[test]
+    fn x3dh_initiate_matches_dart() {
+        let alice_ik = seed(0x31);
+        let alice_eph = seed(0x32);
+        let bob_ik_pub = x25519_public(&seed(0x33));
+        let bob_spk_pub = x25519_public(&seed(0x34));
+        let bob_opk_pub = x25519_public(&seed(0x35));
+        let s = x3dh_initiate(
+            &alice_ik,
+            &alice_eph,
+            &bob_ik_pub,
+            &bob_spk_pub,
+            Some(&bob_opk_pub),
+        );
+        assert_eq!(hex(s.as_bytes()), X3DH_SHARED);
+    }
+
+    #[test]
+    fn x3dh_initiate_equals_respond() {
+        // The fundamental X3DH property: both sides derive the same secret.
+        let alice_ik = seed(0x31);
+        let alice_eph = seed(0x32);
+        let bob_ik = seed(0x33);
+        let bob_spk = seed(0x34);
+        let bob_opk = seed(0x35);
+
+        let init = x3dh_initiate(
+            &alice_ik,
+            &alice_eph,
+            &x25519_public(&bob_ik),
+            &x25519_public(&bob_spk),
+            Some(&x25519_public(&bob_opk)),
+        );
+        let resp = x3dh_respond(
+            &bob_ik,
+            &bob_spk,
+            Some(&bob_opk),
+            &x25519_public(&alice_ik),
+            &x25519_public(&alice_eph),
+        );
+        assert!(init.ct_eq(&resp), "initiate and respond must agree");
+        assert_eq!(hex(resp.as_bytes()), X3DH_SHARED);
+
+        // Without the one-time prekey the secret is different but still shared.
+        let init_no_opk = x3dh_initiate(
+            &alice_ik,
+            &alice_eph,
+            &x25519_public(&bob_ik),
+            &x25519_public(&bob_spk),
+            None,
+        );
+        let resp_no_opk = x3dh_respond(
+            &bob_ik,
+            &bob_spk,
+            None,
+            &x25519_public(&alice_ik),
+            &x25519_public(&alice_eph),
+        );
+        assert!(init_no_opk.ct_eq(&resp_no_opk));
+        assert!(!init.ct_eq(&init_no_opk));
     }
 
     #[test]

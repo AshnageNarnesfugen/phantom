@@ -99,6 +99,46 @@ Future<void> main() async {
   print('ratchet_ck_enckey = ${hex(mkb.sublist(0, 32))}');
   print('ratchet_ck_hdrkey = ${hex(mkb.sublist(32, 64))}');
 
+  // ── Ed25519 sign/verify (SPK + IK signatures) ───────────────────────────────
+  final ed = Ed25519();
+  final edKp = await ed.newKeyPairFromSeed(fill(32, 0x44));
+  final edPub = await edKp.extractPublicKey();
+  final edMsg = Uint8List.fromList(utf8.encode('phantom ed25519 test'));
+  final edSig = await ed.sign(edMsg, keyPair: edKp);
+  print('ed25519_pub       = ${hex(edPub.bytes)}');
+  print('ed25519_sig       = ${hex(edSig.bytes)}');
+
+  // ── X3DH shared secret (initiate == respond) ────────────────────────────────
+  // Fixed X25519 seeds for every key so the composed secret is deterministic.
+  Future<Uint8List> dh(Uint8List seed, List<int> peerPub) async {
+    final kp = await x.newKeyPairFromSeed(seed);
+    final ss = await x.sharedSecretKey(
+      keyPair: kp,
+      remotePublicKey: SimplePublicKey(peerPub, type: KeyPairType.x25519),
+    );
+    return Uint8List.fromList(await ss.extractBytes());
+  }
+
+  Future<Uint8List> pub(Uint8List seed) async =>
+      Uint8List.fromList((await (await x.newKeyPairFromSeed(seed)).extractPublicKey()).bytes);
+
+  final aliceIk = fill(32, 0x31), aliceEph = fill(32, 0x32);
+  final bobIk = fill(32, 0x33), bobSpk = fill(32, 0x34), bobOpk = fill(32, 0x35);
+  final bobIkPub = await pub(bobIk), bobSpkPub = await pub(bobSpk), bobOpkPub = await pub(bobOpk);
+
+  // Alice initiate: DH(IK_A,SPK_B) DH(EK_A,IK_B) DH(EK_A,SPK_B) DH(EK_A,OPK_B)
+  final aDh1 = await dh(aliceIk, bobSpkPub);
+  final aDh2 = await dh(aliceEph, bobIkPub);
+  final aDh3 = await dh(aliceEph, bobSpkPub);
+  final aDh4 = await dh(aliceEph, bobOpkPub);
+  final aInput = Uint8List.fromList([...f, ...aDh1, ...aDh2, ...aDh3, ...aDh4]);
+  final aShared = await Hkdf(hmac: Hmac(Sha512()), outputLength: 32).deriveKey(
+    secretKey: SecretKey(aInput),
+    nonce: Uint8List(0),
+    info: Uint8List.fromList(utf8.encode('phantom-x3dh-v1')),
+  );
+  print('x3dh_shared       = ${hex(await aShared.extractBytes())}');
+
   // ── ChaCha20-Poly1305 AEAD ──────────────────────────────────────────────────
   final key = fill(32, 0x01);
   final nonce = fill(12, 0x02);
