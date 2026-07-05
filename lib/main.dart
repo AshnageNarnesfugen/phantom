@@ -12,7 +12,6 @@ import 'core/waku_daemon.dart';
 import 'core/yggdrasil_daemon.dart';
 import 'core/yggdrasil_peers.dart';
 import 'core/notification_service.dart';
-import 'core/transport_debugger.dart';
 import 'core/crypto/native/phantom_crypto_native.dart';
 import 'core_provider.dart';
 import 'ui/theme/phantom_theme.dart';
@@ -214,18 +213,12 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
       try { await I2pdDaemon.instance.ensure(); } catch (e) { debugPrint('I2pd error: $e'); }
       try { await _prepareYggdrasilAndEnsure(); } catch (e) { debugPrint('Ygg error: $e'); }
     }
-    // Load the Rust crypto core and verify it agrees with the Dart crypto on
-    // this device (parity oracle). It does NOT yet handle any real message —
-    // this is the runtime gate before a hot-path cutover. Result shows in the
-    // in-app Transport Debugger as "NATIVE: …".
-    unawaited(() async {
-      final native = PhantomCryptoNative.tryLoad();
-      if (native == null) {
-        TransportDebugger.instance.log('NATIVE: Rust core not available on this build');
-      } else {
-        await native.runParityOracle();
-      }
-    }());
+    // Load + parity-verify the Rust crypto core, THEN restore the account.
+    // Awaited before _tryRestoreAccount so the gate's verdict is settled
+    // before any handshake runs the crypto hot path — routed ops (Ed25519
+    // verify, hybrid combine) use Rust only if the on-device oracle passed,
+    // else Dart. Shows as "NATIVE: …" in the Transport Debugger.
+    await NativeCryptoGate.instance.init();
     await _tryRestoreAccount();
   }
 

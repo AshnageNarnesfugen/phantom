@@ -11,6 +11,7 @@ import 'package:meta/meta.dart';
 import 'identity/identity.dart';
 import 'crypto/double_ratchet.dart';
 import 'crypto/hybrid_kem.dart';
+import 'crypto/native/phantom_crypto_native.dart';
 import 'crypto/safety_number.dart';
 import 'crypto/x3dh.dart';
 import 'protocol/message.dart';
@@ -1154,12 +1155,10 @@ class PhantomCore {
         try {
           final sigBytes = base64Url.decode(
               endpointSig.padRight((endpointSig.length + 3) & ~3, '='));
-          sigOk = await Ed25519().verify(
-            utf8.encode(signedBase),
-            signature: Signature(sigBytes,
-                publicKey: SimplePublicKey(ca.ed25519SigningKey,
-                    type: KeyPairType.ed25519)),
-          );
+          sigOk = await NativeCryptoGate.instance.ed25519Verify(
+              ca.ed25519SigningKey,
+              Uint8List.fromList(utf8.encode(signedBase)),
+              sigBytes);
         } catch (_) { sigOk = false; }
       }
       if (!sigOk) {
@@ -2600,15 +2599,7 @@ class PhantomCore {
     final ikBytes  = Uint8List.fromList(caBytes.sublist(1,    33));
     final skBytes  = Uint8List.fromList(caBytes.sublist(33,   65));
     final ikSigBytes = Uint8List.fromList(caBytes.sublist(1349, 1413));
-    try {
-      final pub = SimplePublicKey(skBytes, type: KeyPairType.ed25519);
-      return await Ed25519().verify(
-        ikBytes,
-        signature: Signature(ikSigBytes, publicKey: pub),
-      );
-    } catch (_) {
-      return false;
-    }
+    return NativeCryptoGate.instance.ed25519Verify(skBytes, ikBytes, ikSigBytes);
   }
 
   /// Handle a regular MSG frame: try each active session until one decrypts.

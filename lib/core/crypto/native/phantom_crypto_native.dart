@@ -14,11 +14,72 @@ import '../../transport_debugger.dart';
 /// X3DH shared-secret composition, Ed25519 verification, and the hybrid combine
 /// — each proven byte-identical to the Dart implementation.
 ///
-/// The app does NOT yet route its crypto through here. This binding exists so
-/// the native core is loaded and RUNTIME-VERIFIED on device ([runParityOracle])
-/// before any hot-path cutover: it recomputes each operation both ways (Dart +
-/// Rust) with random inputs and asserts they agree, so we catch any
-/// platform/ABI drift on real hardware before trusting Rust with a message.
+/// The app routes its stateless crypto through [NativeCryptoGate] below, which
+/// uses this binding ONLY after [runParityOracle] confirms the native core is
+/// byte-identical on the actual device (recomputing each op both ways with
+/// random inputs), else it falls back to Dart. That gate catches any
+/// platform/ABI drift on real hardware before trusting Rust with a signature.
+
+/// App-facing gate over the native core. Every method falls back to the Dart
+/// implementation, and only routes through Rust once the on-device parity
+/// oracle has CONFIRMED they agree ([_verified]). So the cutover is safe by
+/// construction: on a device where the native lib is missing or disagrees, the
+/// app transparently uses Dart — a message can never be mis-encrypted by an
+/// untrusted native path. Callers use [NativeCryptoGate.instance].
+class NativeCryptoGate {
+  static final NativeCryptoGate instance = NativeCryptoGate._();
+  NativeCryptoGate._();
+
+  PhantomCryptoNative? _native;
+  bool _verified = false;
+
+  /// True when the native core is loaded AND ran the parity oracle clean, so
+  /// hot-path calls route through Rust.
+  bool get usingNative => _verified && _native != null;
+
+  /// Load + verify. Call once at startup, BEFORE the crypto hot path runs.
+  Future<void> init() async {
+    _native = PhantomCryptoNative.tryLoad();
+    if (_native == null) {
+      TransportDebugger.instance.log('NATIVE: Rust core not available — using Dart');
+      return;
+    }
+    _verified = await _native!.runParityOracle();
+    if (!_verified) {
+      TransportDebugger.instance
+          .log('NATIVE: oracle did not pass — staying on Dart crypto');
+    }
+  }
+
+  /// Ed25519 verify — native when trusted, Dart otherwise. Never throws.
+  Future<bool> ed25519Verify(
+      Uint8List publicKey, Uint8List message, Uint8List signature) async {
+    if (usingNative) {
+      try {
+        return _native!.ed25519Verify(publicKey, message, signature);
+      } catch (_) {/* fall through to Dart */}
+    }
+    try {
+      return await Ed25519().verify(
+        message,
+        signature: Signature(signature,
+            publicKey: SimplePublicKey(publicKey, type: KeyPairType.ed25519)),
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Hybrid combine — native when trusted, Dart otherwise.
+  Future<Uint8List> hybridCombine(Uint8List x3dh, Uint8List kyber) async {
+    if (usingNative) {
+      try {
+        return _native!.hybridCombine(x3dh, kyber);
+      } catch (_) {/* fall through */}
+    }
+    return HybridKEM.combineSecrets(x3dh, kyber);
+  }
+}
 
 // ── C signatures ──────────────────────────────────────────────────────────────
 typedef _SharedC = Int32 Function(Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>);

@@ -4,6 +4,7 @@ import 'package:bs58check/bs58check.dart' as bs58check;
 import 'package:cryptography/cryptography.dart';
 import 'package:meta/meta.dart';
 import 'hybrid_kem.dart';
+import 'native/phantom_crypto_native.dart';
 
 /// Extended Triple Diffie-Hellman (X3DH) — Signal Protocol.
 ///
@@ -250,15 +251,8 @@ class ContactAddress {
   /// existing contacts continue to work.
   Future<bool> verifyIdentityBinding() async {
     if (identityKeySignature == null) return true;
-    try {
-      final pub = SimplePublicKey(ed25519SigningKey, type: KeyPairType.ed25519);
-      return await Ed25519().verify(
-        x25519IdentityKey,
-        signature: Signature(identityKeySignature!, publicKey: pub),
-      );
-    } catch (_) {
-      return false;
-    }
+    return NativeCryptoGate.instance
+        .ed25519Verify(ed25519SigningKey, x25519IdentityKey, identityKeySignature!);
   }
 
   static void _setBytes(ByteData buf, int offset, Uint8List src, int len) {
@@ -335,7 +329,8 @@ class X3DHHandshake {
       final (cipher, kyberShared) =
           HybridKEM.encapsulate(theirBundle.kyber768PublicKeyBytes!);
       kyberCipher   = cipher;
-      hybridSecret  = await HybridKEM.combineSecrets(sharedSecret, kyberShared);
+      hybridSecret  =
+          await NativeCryptoGate.instance.hybridCombine(sharedSecret, kyberShared);
     }
 
     return X3DHInitResult(
@@ -455,16 +450,9 @@ class X3DHHandshake {
     required Uint8List signingKeyBytes,
     required Uint8List signedPreKeyBytes,
     required Uint8List signature,
-  }) async {
-    try {
-      final pub = SimplePublicKey(signingKeyBytes, type: KeyPairType.ed25519);
-      return await Ed25519().verify(
-        signedPreKeyBytes,
-        signature: Signature(signature, publicKey: pub),
-      );
-    } catch (_) {
-      return false;
-    }
+  }) {
+    return NativeCryptoGate.instance
+        .ed25519Verify(signingKeyBytes, signedPreKeyBytes, signature);
   }
 }
 
