@@ -1,0 +1,28 @@
+[package]
+name = "phantom_crypto"
+version = "0.1.0"
+edition = "2021"
+description = "Memory-safe crypto core for Phantom — vetted primitives with secret zeroization, byte-for-byte parity with the Dart implementation it replaces."
+license = "MIT"
+
+[lib]
+# rlib for `cargo test` now; cdylib/staticlib get added when the FFI slice
+# (flutter_rust_bridge) lands so this links into the Flutter app.
+crate-type = ["rlib"]
+
+[dependencies]
+# Vetted, audited primitives (the same families libsignal uses).
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+# Memory hygiene: wipe secrets from RAM deterministically (the gap Dart's GC
+# can't close), and constant-time comparison to avoid timing side channels.
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+
+[profile.release]
+# Keep debug asserts off but do not let the optimizer elide zeroization —
+# `zeroize` uses volatile writes + fences so this is safe.
+opt-level = 3
