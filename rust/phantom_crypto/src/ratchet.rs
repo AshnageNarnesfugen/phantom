@@ -73,6 +73,7 @@ pub struct EncryptedMessage {
     pub nonce: [u8; 12],
 }
 
+#[derive(Clone)]
 pub struct RatchetSession {
     root_key: [u8; 32],
     sending_chain_key: Option<[u8; 32]>,
@@ -366,20 +367,28 @@ fn hex32(v: Option<&serde_json::Value>) -> Option<[u8; 32]> {
     Some(out)
 }
 
+// Vector captured from tool/gen_ratchet_vector.dart: Bob's fresh receiver
+// session + two messages Alice encrypted in Dart. Shared by the ratchet tests
+// and the FFI tests (which drive the same vector through the C-ABI). The Rust
+// ratchet must load Bob and decrypt both — proving wire-identical decryption.
+#[cfg(test)]
+pub(crate) const BOB_JSON: &str = r#"{"rk":"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a","sck":null,"rck":null,"dhsk_priv":"3033333333333333333333333333333333333333333333333333333333333373","dhsk_pub":"7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14","dhrpk":null,"sn":0,"rn":0,"psn":0,"shk":null,"rhk":null,"nshk":"ea5d4da81e706dc952f977e2ccee0c1ae06052493bdcdd66db7e9c3b97a902bb","nrhk":"52c60cbc3139c3dce7bef53be6f224d5300403950ef44420ec28a2bcd7b98870","x3dh_ek":null,"kyber_cipher":null,"opk_id":null,"epk":"5f0edaa1211451143fc590708fb0be4d98ae9e2eca43f4add4778b0e27ba1678","sk":{}}"#;
+#[cfg(test)]
+pub(crate) const M0_HDR: &str = "02e8a2835548478c6a0d3f3409229cb549e54e3d35f7d802d2a32fcc10f6ca4136de8193d24f3476925ffb861c6e1b9c90bb86624d162a8e8a75ea2b25b5ec80bda58cfd";
+#[cfg(test)]
+pub(crate) const M0_CT: &str = "529d3e2d51afa7cd714aa8dca3718e49f4bcb545977f0f7884cf0f2f4f3ad8499e";
+#[cfg(test)]
+pub(crate) const M0_NONCE: &str = "4ccb8439a47898fa27758534";
+#[cfg(test)]
+pub(crate) const M1_HDR: &str = "2e9445a983bca3b4b7a0533de0eff2a8006b0c3ceb52de0f7e04dcf5d822c91b12632fed978a3b7e1435b14ef25c11996bde604f66d8e6ef6449a84225701c6a7f600e26";
+#[cfg(test)]
+pub(crate) const M1_CT: &str = "37f2f9ed3147e6a9c30af20d8cd2d9a1fe8d66d01371dc7d41bd61e6fb1cfb0fb4";
+#[cfg(test)]
+pub(crate) const M1_NONCE: &str = "76e573c4b44c402a2a2475f1";
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Vector captured from tool/gen_ratchet_vector.dart: Bob's fresh receiver
-    // session + two messages Alice encrypted in Dart. The Rust ratchet must
-    // load Bob and decrypt both — proving wire-identical decryption.
-    const BOB_JSON: &str = r#"{"rk":"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a","sck":null,"rck":null,"dhsk_priv":"3033333333333333333333333333333333333333333333333333333333333373","dhsk_pub":"7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14","dhrpk":null,"sn":0,"rn":0,"psn":0,"shk":null,"rhk":null,"nshk":"ea5d4da81e706dc952f977e2ccee0c1ae06052493bdcdd66db7e9c3b97a902bb","nrhk":"52c60cbc3139c3dce7bef53be6f224d5300403950ef44420ec28a2bcd7b98870","x3dh_ek":null,"kyber_cipher":null,"opk_id":null,"epk":"5f0edaa1211451143fc590708fb0be4d98ae9e2eca43f4add4778b0e27ba1678","sk":{}}"#;
-    const M0_HDR: &str = "02e8a2835548478c6a0d3f3409229cb549e54e3d35f7d802d2a32fcc10f6ca4136de8193d24f3476925ffb861c6e1b9c90bb86624d162a8e8a75ea2b25b5ec80bda58cfd";
-    const M0_CT: &str = "529d3e2d51afa7cd714aa8dca3718e49f4bcb545977f0f7884cf0f2f4f3ad8499e";
-    const M0_NONCE: &str = "4ccb8439a47898fa27758534";
-    const M1_HDR: &str = "2e9445a983bca3b4b7a0533de0eff2a8006b0c3ceb52de0f7e04dcf5d822c91b12632fed978a3b7e1435b14ef25c11996bde604f66d8e6ef6449a84225701c6a7f600e26";
-    const M1_CT: &str = "37f2f9ed3147e6a9c30af20d8cd2d9a1fe8d66d01371dc7d41bd61e6fb1cfb0fb4";
-    const M1_NONCE: &str = "76e573c4b44c402a2a2475f1";
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len() / 2)

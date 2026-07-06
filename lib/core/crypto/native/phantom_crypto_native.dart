@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:math';
@@ -6,6 +7,7 @@ import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 import 'package:ffi/ffi.dart';
 
+import '../double_ratchet.dart';
 import '../hybrid_kem.dart';
 import '../../transport_debugger.dart';
 
@@ -32,10 +34,21 @@ class NativeCryptoGate {
 
   PhantomCryptoNative? _native;
   bool _verified = false;
+  bool _ratchetVerified = false;
 
-  /// True when the native core is loaded AND ran the parity oracle clean, so
-  /// hot-path calls route through Rust.
+  /// True when the native core is loaded AND ran the stateless parity oracle
+  /// clean, so hot-path stateless calls route through Rust.
   bool get usingNative => _verified && _native != null;
+
+  /// True when the native ratchet passed its on-device parity oracle
+  /// (encrypt/decrypt/DH-ratchet cross-verified against Dart). This is the gate
+  /// for the stateful cutover — the binding is wired and verified; the message
+  /// body path itself is routed once this is confirmed green on real devices.
+  bool get ratchetNative => _ratchetVerified && _native != null;
+
+  /// The verified native core, or null. Exposed so the ratchet cutover can
+  /// build [NativeRatchet] handles once [ratchetNative] is true.
+  PhantomCryptoNative? get native => _native;
 
   /// Load + verify. Call once at startup, BEFORE the crypto hot path runs.
   Future<void> init() async {
@@ -49,6 +62,76 @@ class NativeCryptoGate {
       TransportDebugger.instance
           .log('NATIVE: oracle did not pass — staying on Dart crypto');
     }
+    // Independent from the stateless verdict: the ratchet has its own on-device
+    // oracle. A drift here only withholds the (not-yet-live) ratchet cutover; it
+    // does not disable the already-live stateless path.
+    _ratchetVerified = await _verifyRatchet(_native!);
+  }
+
+  /// On-device ratchet parity oracle. Drives a full 3-step Alice↔Bob
+  /// conversation where the native ratchet plays one side and the Dart ratchet
+  /// the other, so a single run exercises native decrypt, the native DH-ratchet
+  /// (receiving + sending), and native encrypt — all cross-verified byte-for-
+  /// byte with Dart. Any ABI/platform drift shows here before a real message
+  /// ever touches the native ratchet.
+  Future<bool> _verifyRatchet(PhantomCryptoNative n) async {
+    final dbg = TransportDebugger.instance;
+    NativeRatchet? bob;
+    try {
+      final rng = Random.secure();
+      final sharedSecret =
+          Uint8List.fromList(List.generate(32, (_) => rng.nextInt(256)));
+      final bobKP = await (await X25519().newKeyPair()).extract();
+      final bobPub = Uint8List.fromList((await bobKP.extractPublicKey()).bytes);
+
+      // Dart Alice (initiator, has a sending chain immediately) ↔ native Bob
+      // (receiver, built from Bob's serialized session).
+      final alice = await RatchetSession.initAsSender(
+          sharedSecret: sharedSecret, remotePublicKey: bobPub);
+      final bobDart = await RatchetSession.initAsReceiver(
+          sharedSecret: sharedSecret, ourEncryptionKP: bobKP);
+      bob = NativeRatchet.fromJson(n, jsonEncode(await bobDart.toJson()));
+      if (bob == null) return _ratFail(dbg, 'from_json');
+
+      Uint8List pt(String s) => Uint8List.fromList(utf8.encode(s));
+
+      // 1. Dart Alice → native Bob (native receiving DH-ratchet + decrypt).
+      final m0 = await alice.encrypt(pt('oracle m0'));
+      final d0 = bob.decrypt(m0.encryptedHeader, m0.ciphertext, m0.nonce);
+      if (d0 == null || utf8.decode(d0) != 'oracle m0') {
+        return _ratFail(dbg, 'native-decrypt');
+      }
+
+      // 2. native Bob → Dart Alice (native sending after DH-ratchet; Alice
+      //    DH-ratchets on her side).
+      final r0 = bob.encrypt(pt('oracle r0'));
+      final dr0 = await alice.decrypt(EncryptedMessage(
+          encryptedHeader: r0.$1, ciphertext: r0.$2, nonce: r0.$3));
+      if (utf8.decode(dr0) != 'oracle r0') {
+        return _ratFail(dbg, 'native-encrypt');
+      }
+
+      // 3. Dart Alice → native Bob again (steady-state chain advance).
+      final m1 = await alice.encrypt(pt('oracle m1'));
+      final d1 = bob.decrypt(m1.encryptedHeader, m1.ciphertext, m1.nonce);
+      if (d1 == null || utf8.decode(d1) != 'oracle m1') {
+        return _ratFail(dbg, 'native-decrypt-2');
+      }
+
+      dbg.log('NATIVE: ✓ Rust ratchet parity OK '
+          '(decrypt, DH-ratchet, encrypt cross-verified with Dart)');
+      return true;
+    } catch (e) {
+      dbg.log('NATIVE: ✗ ratchet oracle error: $e');
+      return false;
+    } finally {
+      bob?.dispose();
+    }
+  }
+
+  bool _ratFail(TransportDebugger dbg, String which) {
+    dbg.log('NATIVE: ✗ RATCHET PARITY MISMATCH on $which — native ratchet NOT trusted');
+    return false;
   }
 
   /// Ed25519 verify — native when trusted, Dart otherwise. Never throws.
@@ -98,12 +181,43 @@ typedef _VerifyC = Int32 Function(
 typedef _VerifyD = int Function(
     Pointer<Uint8>, Pointer<Uint8>, int, Pointer<Uint8>);
 
+// Stateful ratchet: opaque handle + heap-buffer outputs.
+typedef _RatFromJsonC = Pointer<Void> Function(Pointer<Uint8>, IntPtr);
+typedef _RatFromJsonD = Pointer<Void> Function(Pointer<Uint8>, int);
+
+typedef _RatEncryptC = Int32 Function(
+    Pointer<Void>, Pointer<Uint8>, IntPtr,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Uint8>);
+typedef _RatEncryptD = int Function(
+    Pointer<Void>, Pointer<Uint8>, int,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Uint8>);
+
+typedef _RatDecryptC = Int32 Function(
+    Pointer<Void>, Pointer<Uint8>, IntPtr, Pointer<Uint8>, IntPtr,
+    Pointer<Uint8>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _RatDecryptD = int Function(
+    Pointer<Void>, Pointer<Uint8>, int, Pointer<Uint8>, int,
+    Pointer<Uint8>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+
+typedef _RatFreeC = Void Function(Pointer<Void>);
+typedef _RatFreeD = void Function(Pointer<Void>);
+
+typedef _BufFreeC = Void Function(Pointer<Uint8>, IntPtr);
+typedef _BufFreeD = void Function(Pointer<Uint8>, int);
+
 class PhantomCryptoNative {
   final DynamicLibrary _lib;
   late final _SharedD _x25519 = _lib.lookupFunction<_SharedC, _SharedD>('phantom_x25519_shared');
   late final _X3dhD _x3dh = _lib.lookupFunction<_X3dhC, _X3dhD>('phantom_x3dh_initiate');
   late final _CombineD _combine = _lib.lookupFunction<_CombineC, _CombineD>('phantom_hybrid_combine');
   late final _VerifyD _verify = _lib.lookupFunction<_VerifyC, _VerifyD>('phantom_ed25519_verify');
+  late final _RatFromJsonD _ratFromJson = _lib.lookupFunction<_RatFromJsonC, _RatFromJsonD>('phantom_ratchet_from_json');
+  late final _RatEncryptD _ratEncrypt = _lib.lookupFunction<_RatEncryptC, _RatEncryptD>('phantom_ratchet_encrypt');
+  late final _RatDecryptD _ratDecrypt = _lib.lookupFunction<_RatDecryptC, _RatDecryptD>('phantom_ratchet_decrypt');
+  late final _RatFreeD _ratFree = _lib.lookupFunction<_RatFreeC, _RatFreeD>('phantom_ratchet_free');
+  late final _BufFreeD _bufFree = _lib.lookupFunction<_BufFreeC, _BufFreeD>('phantom_buf_free');
 
   PhantomCryptoNative._(this._lib);
 
@@ -271,5 +385,130 @@ class PhantomCryptoNative {
       if (a[i] != b[i]) return false;
     }
     return true;
+  }
+}
+
+// ── Stateful ratchet handle ───────────────────────────────────────────────────
+
+/// Holds the raw `*mut RatchetSession` and the free function, kept separate from
+/// [NativeRatchet] so a [Finalizer] can reclaim it without a reference cycle
+/// pinning the owner alive.
+class _RatchetHandle {
+  final _RatFreeD _free;
+  final Pointer<Void> ptr;
+  bool _freed = false;
+  _RatchetHandle(this._free, this.ptr);
+  void dispose() {
+    if (_freed) return;
+    _freed = true;
+    _free(ptr);
+  }
+}
+
+/// A live double-ratchet session owned by the Rust core. The secret state
+/// (root/chain/message/header keys) lives in native memory and is zeroized when
+/// the handle is freed — either explicitly via [dispose] or, as a safety net,
+/// when this object is garbage-collected (via [Finalizer]).
+///
+/// Built from a Dart [RatchetSession]'s serialized form ([RatchetSession.toJson]
+/// / [RatchetSession.takeSnapshot]); Rust reads only the ratchet fields and
+/// ignores the handshake metadata Dart carries alongside.
+class NativeRatchet {
+  final PhantomCryptoNative _n;
+  final _RatchetHandle _h;
+
+  static final Finalizer<_RatchetHandle> _finalizer =
+      Finalizer((h) => h.dispose());
+
+  NativeRatchet._(this._n, this._h) {
+    _finalizer.attach(this, _h, detach: this);
+  }
+
+  /// Parse a serialized session into a native handle, or null on bad JSON.
+  static NativeRatchet? fromJson(PhantomCryptoNative n, String json) {
+    final bytes = utf8.encode(json);
+    final p = calloc<Uint8>(bytes.length);
+    p.asTypedList(bytes.length).setAll(0, bytes);
+    try {
+      final handle = n._ratFromJson(p, bytes.length);
+      if (handle == nullptr) return null;
+      return NativeRatchet._(n, _RatchetHandle(n._ratFree, handle));
+    } finally {
+      calloc.free(p);
+    }
+  }
+
+  /// Encrypt [plaintext], advancing the sending chain in native memory. Returns
+  /// (encryptedHeader, ciphertext, nonce). Throws if the session cannot send.
+  (Uint8List, Uint8List, Uint8List) encrypt(Uint8List plaintext) {
+    final pt = _alloc(plaintext);
+    final hdrOut = calloc<Pointer<Uint8>>();
+    final hdrLen = calloc<IntPtr>();
+    final ctOut = calloc<Pointer<Uint8>>();
+    final ctLen = calloc<IntPtr>();
+    final nonce = calloc<Uint8>(12);
+    try {
+      final rc = _n._ratEncrypt(
+          _h.ptr, pt, plaintext.length, hdrOut, hdrLen, ctOut, ctLen, nonce);
+      if (rc != 0) throw StateError('ratchet encrypt rc=$rc');
+      return (
+        _takeBuf(hdrOut.value, hdrLen.value),
+        _takeBuf(ctOut.value, ctLen.value),
+        Uint8List.fromList(nonce.asTypedList(12)),
+      );
+    } finally {
+      calloc.free(pt);
+      calloc.free(hdrOut);
+      calloc.free(hdrLen);
+      calloc.free(ctOut);
+      calloc.free(ctLen);
+      calloc.free(nonce);
+    }
+  }
+
+  /// Decrypt one message. Returns the plaintext, or null if undecryptable /
+  /// tampered — in which case the native state is left untouched (the Rust side
+  /// commits only on success), so a failed attempt never corrupts the ratchet.
+  Uint8List? decrypt(Uint8List header, Uint8List ciphertext, Uint8List nonce) {
+    final h = _alloc(header);
+    final c = _alloc(ciphertext);
+    final nn = _alloc(nonce);
+    final ptOut = calloc<Pointer<Uint8>>();
+    final ptLen = calloc<IntPtr>();
+    try {
+      final rc = _n._ratDecrypt(_h.ptr, h, header.length, c, ciphertext.length,
+          nn, ptOut, ptLen);
+      if (rc != 0) return null;
+      return _takeBuf(ptOut.value, ptLen.value);
+    } finally {
+      calloc.free(h);
+      calloc.free(c);
+      calloc.free(nn);
+      calloc.free(ptOut);
+      calloc.free(ptLen);
+    }
+  }
+
+  /// Free the native session now (idempotent). After this the handle must not
+  /// be used again.
+  void dispose() {
+    _finalizer.detach(this);
+    _h.dispose();
+  }
+
+  // Copy a Rust-allocated (ptr,len) buffer into a Dart list, then hand the
+  // native memory back for freeing. Never leaks across the boundary.
+  Uint8List _takeBuf(Pointer<Uint8> ptr, int len) {
+    final out = Uint8List.fromList(ptr.asTypedList(len));
+    _n._bufFree(ptr, len);
+    return out;
+  }
+
+  // Allocate a C buffer holding [b] (min 1 byte so length-0 inputs still yield a
+  // non-null pointer; the length passed separately tells Rust the true size).
+  static Pointer<Uint8> _alloc(Uint8List b) {
+    final p = calloc<Uint8>(b.isEmpty ? 1 : b.length);
+    if (b.isNotEmpty) p.asTypedList(b.length).setAll(0, b);
+    return p;
   }
 }
