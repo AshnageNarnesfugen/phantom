@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
@@ -49,6 +50,11 @@ void main() {
       final ok = await NativeCryptoGate.instance.enableForTest(soPath);
       expect(ok, isTrue,
           reason: 'host parity + ratchet oracles must pass to trust native');
+      // With a blob key set, every native session persists as a sealed blob —
+      // so the tests below (persistence round-trips, metadata) exercise the blob
+      // path end-to-end, not just plaintext.
+      NativeCryptoGate.instance.sessionBlobKey =
+          Uint8List.fromList(List.generate(32, (i) => (i * 7 + 3) & 0xff));
     });
 
     test('sessions become native-backed once the gate is enabled', () async {
@@ -141,6 +147,60 @@ void main() {
         alice = await RatchetSession.fromJson(await alice.toJson());
         bob = await RatchetSession.fromJson(await bob.toJson());
       }
+    });
+
+    test('toJson yields an opaque sealed blob, not plaintext hex', () async {
+      if (!soExists) return markTestSkipped('host .so not built');
+      final p = await pair();
+      final j = await p.alice.toJson();
+      // Sealed shape: a blob, and none of the plaintext ratchet keys.
+      expect(j.containsKey('blob'), isTrue);
+      expect(j.containsKey('rk'), isFalse);
+      expect(j.containsKey('dhsk_priv'), isFalse);
+      // The blob's bytes must not embed the plaintext hex of any secret. Decode
+      // it and confirm it doesn't decode as JSON with a root key.
+      final blob = base64Decode(j['blob'] as String);
+      expect(blob.length, greaterThan(28)); // nonce + tag + payload
+      expect(() => jsonDecode(String.fromCharCodes(blob)),
+          throwsA(anything)); // ciphertext isn't JSON
+    });
+
+    test('sealed blob opens in pure Dart when native is unavailable', () async {
+      if (!soExists) return markTestSkipped('host .so not built');
+      // Seal a live conversation state via native, then simulate the .so being
+      // gone: the blob must still open (in Dart) and keep decrypting — no
+      // orphaned session.
+      final p = await pair();
+      final c0 = await p.alice.encrypt(m('before'));
+      expect(s(await p.bob.decrypt(c0)), 'before');
+      final bobBlob = await p.bob.toJson();
+      final aliceNext = await p.alice.encrypt(m('after'));
+
+      NativeCryptoGate.instance.disableForTest();
+      addTearDown(() async {
+        await NativeCryptoGate.instance.enableForTest(soPath);
+      });
+
+      final bobDart = await RatchetSession.fromJson(bobBlob);
+      expect(bobDart.isNativeBacked, isFalse); // fell back to pure Dart
+      expect(s(await bobDart.decrypt(aliceNext)), 'after');
+    });
+
+    test('legacy plaintext sessions still load (no blob key path)', () async {
+      if (!soExists) return markTestSkipped('host .so not built');
+      // A session serialized the OLD way (plaintext map, no 'blob' key) must
+      // still load. Build one by serializing with the blob key temporarily
+      // cleared so toJson emits the legacy plaintext shape.
+      final saved = NativeCryptoGate.instance.sessionBlobKey;
+      NativeCryptoGate.instance.sessionBlobKey = null;
+      addTearDown(() => NativeCryptoGate.instance.sessionBlobKey = saved);
+
+      final p = await pair();
+      final c0 = await p.alice.encrypt(m('legacy'));
+      final bobPlain = await p.bob.toJson();
+      expect(bobPlain.containsKey('rk'), isTrue); // legacy plaintext shape
+      final bob2 = await RatchetSession.fromJson(bobPlain);
+      expect(s(await bob2.decrypt(c0)), 'legacy');
     });
   });
 }

@@ -692,7 +692,17 @@ class RatchetSession {
   // ── Serialization ──────────────────────────────────────────────────────────
 
   Future<Map<String, dynamic>> toJson() async {
-    if (_native != null) return _withMetadata(_native!.toJson());
+    if (_native != null) {
+      final blobKey = NativeCryptoGate.instance.sessionBlobKey;
+      if (blobKey != null) {
+        // Seal the ratchet state in native: root/chain/header keys go straight
+        // to ciphertext, never appearing as plaintext hex in Dart. Metadata
+        // stays plaintext — it's Dart-owned live state anyway.
+        return _withMetadata({'blob': base64Encode(_native!.seal(blobKey))});
+      }
+      // No blob key configured (e.g. pre-storage-init) → plaintext native json.
+      return _withMetadata(_native!.toJson());
+    }
     final dhPub = await _dhSendingKP.extractPublicKey();
     return {
       'rk':   _hexOf(_rootKey),
@@ -720,6 +730,14 @@ class RatchetSession {
   }
 
   static Future<RatchetSession> fromJson(Map<String, dynamic> j) async {
+    // Two on-disk shapes: an opaque sealed blob (native-backed, memory-hygienic)
+    // or the legacy plaintext hex map. Old sessions load via the plaintext path
+    // and get re-sealed as a blob on their next save (transparent migration).
+    if (j.containsKey('blob')) return _fromBlob(j);
+    return _fromPlaintextMap(j);
+  }
+
+  static Future<RatchetSession> _fromPlaintextMap(Map<String, dynamic> j) async {
     final privBytes = Uint8List.fromList(_unhexOf(j['dhsk_priv'] as String));
     final pubBytes  = Uint8List.fromList(_unhexOf(j['dhsk_pub']  as String));
     final pub = SimplePublicKey(List<int>.from(pubBytes), type: KeyPairType.x25519);
@@ -760,6 +778,86 @@ class RatchetSession {
 
     await session._goNativeIfEnabled();
     return session;
+  }
+
+  /// Load a session stored as a sealed blob (`{'blob': base64, …metadata}`).
+  /// Prefers native (opens straight into a handle, root/chain never in Dart);
+  /// falls back to a Dart decrypt if the native core is unavailable — so a lost
+  /// `.so` degrades gracefully to pure Dart instead of orphaning the session.
+  static Future<RatchetSession> _fromBlob(Map<String, dynamic> j) async {
+    final gate = NativeCryptoGate.instance;
+    final blobKey = gate.sessionBlobKey;
+    if (blobKey == null) {
+      throw const RatchetException(
+          'Session stored as a sealed blob but no blob key is configured.');
+    }
+    final blob = base64Decode(j['blob'] as String);
+
+    final native = gate.native;
+    if (gate.ratchetNative && native != null) {
+      final handle = NativeRatchet.openBlob(native, blob, blobKey);
+      if (handle != null) {
+        final session = _nativeShell(handle);
+        _applyMetadataFromMap(session, j);
+        return session;
+      }
+    }
+
+    // Fallback: decrypt the blob in Dart and run pure-Dart. Secrets surface in
+    // Dart here, but only on the degraded (no-native) path — never when native
+    // is doing the work.
+    final ratchetMap = await _openBlobDart(blob, blobKey);
+    ratchetMap['x3dh_ek']      = j['x3dh_ek'];
+    ratchetMap['kyber_cipher'] = j['kyber_cipher'];
+    ratchetMap['opk_id']       = j['opk_id'];
+    ratchetMap['epk']          = j['epk'];
+    return _fromPlaintextMap(ratchetMap);
+  }
+
+  /// A native-backed session whose ratchet state lives entirely in [handle].
+  /// The Dart `_…` fields are unused placeholders (never read once native).
+  static RatchetSession _nativeShell(NativeRatchet handle) {
+    final pub = SimplePublicKey(List<int>.filled(32, 0), type: KeyPairType.x25519);
+    final kp = SimpleKeyPairData(List<int>.filled(32, 0),
+        publicKey: pub, type: KeyPairType.x25519);
+    return RatchetSession._(rootKey: Uint8List(32), dhSendingKP: kp)
+      .._native = handle;
+  }
+
+  static void _applyMetadataFromMap(RatchetSession s, Map<String, dynamic> j) {
+    s.pendingX3dhEphemeralKey = j['x3dh_ek'] != null
+        ? Uint8List.fromList(_unhexOf(j['x3dh_ek'] as String))
+        : null;
+    s.pendingKyberCipherBytes = j['kyber_cipher'] != null
+        ? Uint8List.fromList(_unhexOf(j['kyber_cipher'] as String))
+        : null;
+    s.pendingOpkId = j['opk_id'] as int?;
+    s.endpointKey = j['epk'] != null
+        ? Uint8List.fromList(_unhexOf(j['epk'] as String))
+        : null;
+  }
+
+  /// Dart-side blob open — mirrors native's `[nonce12][ct][tag16]`
+  /// ChaCha20-Poly1305 (no AAD). Returns the ratchet-state map.
+  static Future<Map<String, dynamic>> _openBlobDart(
+      Uint8List blob, Uint8List key) async {
+    if (blob.length < 28) {
+      throw const RatchetException('Sealed session blob too short.');
+    }
+    final nonce = blob.sublist(0, 12);
+    final ct = blob.sublist(12, blob.length - 16);
+    final mac = blob.sublist(blob.length - 16);
+    try {
+      final pt = await Chacha20.poly1305Aead().decrypt(
+        SecretBox(ct, nonce: nonce, mac: Mac(mac)),
+        secretKey: SecretKey(key),
+      );
+      return Map<String, dynamic>.from(
+          jsonDecode(String.fromCharCodes(pt)) as Map);
+    } catch (_) {
+      throw const RatchetException(
+          'Could not open sealed session blob (wrong key or corrupt).');
+    }
   }
 
   static String _hexOf(Uint8List b) =>

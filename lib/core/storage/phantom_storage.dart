@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'dart:convert';
 import 'package:hive/hive.dart';
 import 'package:cryptography/cryptography.dart';
+import '../crypto/native/phantom_crypto_native.dart';
 import '../protocol/message.dart';
 
 /// Per-key async lock. Serializes read-modify-write sequences that the storage
@@ -88,6 +89,11 @@ class PhantomStorage {
     _boxPrefix   = boxNamespace.isEmpty ? '' : '${boxNamespace}_';
     final aesKey = await _deriveStorageKey(seedPhrase);
     _cipher = HiveAesCipher(aesKey);
+    // Derive the key that seals ratchet session state as an opaque blob, so the
+    // native ratchet can persist root/chain keys without them ever appearing as
+    // plaintext hex in Dart memory. Distinct label from the Hive key.
+    NativeCryptoGate.instance.sessionBlobKey =
+        await _deriveSessionBlobKey(seedPhrase);
     _initialized = true;
   }
 
@@ -600,6 +606,16 @@ class PhantomStorage {
       secretKey: SecretKey(utf8.encode(seedPhrase)),
       nonce: Uint8List.fromList(utf8.encode('phantom-storage-v1')),
       info: Uint8List.fromList(utf8.encode('phantom-hive-encryption-key')),
+    );
+    return Uint8List.fromList(await out.extractBytes());
+  }
+
+  static Future<Uint8List> _deriveSessionBlobKey(String seedPhrase) async {
+    final hkdf = Hkdf(hmac: Hmac(Sha512()), outputLength: 32);
+    final out  = await hkdf.deriveKey(
+      secretKey: SecretKey(utf8.encode(seedPhrase)),
+      nonce: Uint8List.fromList(utf8.encode('phantom-storage-v1')),
+      info: Uint8List.fromList(utf8.encode('phantom-ratchet-blob-v1')),
     );
     return Uint8List.fromList(await out.extractBytes());
   }

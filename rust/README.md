@@ -63,8 +63,9 @@ Covered so far (byte-identical, 9/9 parity tests):
   `cargo build --release` emits `libphantom_crypto.so` (Android/Linux) + `.a`
   (iOS).
 
-`cargo test` → 22/22 (parity + ratchet cross-compat + FFI null-safety +
-stateful-handle round-trip, atomicity, status + to_json persistence).
+`cargo test` → 23/23 (parity + ratchet cross-compat + FFI null-safety +
+stateful-handle round-trip, atomicity, status + to_json persistence, sealed-blob
+round-trip & wrong-key rejection).
 
 ## Kyber-768: why it stays in Dart for now
 
@@ -170,13 +171,35 @@ Best-effort — a failed `mlock` (e.g. `RLIMIT_MEMLOCK`) is non-fatal, the ratch
 just runs unpinned. The skipped-key map allocates separately, so its bounded,
 transient keys aren't pinned; the crown secrets (inline in the struct) are.
 
+### Opaque-blob persistence: DONE (closes the last hex gap)
+
+A native-backed session no longer persists as a hex map. `toJson` calls
+`phantom_ratchet_seal`, which ChaCha20-Poly1305's the state *inside native* under
+a key HKDF'd from the seed (`phantom-ratchet-blob-v1`, set by
+`PhantomStorage.initialize`) and returns only ciphertext — so the root / chain /
+header keys never appear as plaintext hex in Dart memory, even at persist. Stored
+as `{'blob': base64, …metadata}`; the handshake metadata stays plaintext (it's
+Dart-owned live state anyway).
+
+`fromJson` detects the `blob` key and calls `phantom_ratchet_open` → a native
+handle (state stays in the Rust core). **No hard native dependency**: the blob is
+a standard ChaCha20-Poly1305 payload, so if the `.so` is ever unavailable, Dart
+opens it itself (`_openBlobDart`) and runs pure-Dart — a lost `.so` degrades
+gracefully instead of orphaning sessions. Legacy plaintext sessions still load
+and get re-sealed on their next save (transparent migration). Verified by
+`test/native_ratchet_cutover_test.dart` (opaque-blob shape, native↔native
+round-trip, Dart-open fallback, legacy load).
+
 ### What remains
 
-1. **Opaque-blob persistence** (optional, closes the last hex gap) — have native
-   serialize/deserialize an *encrypted* blob so root/chain keys never appear as
-   hex even at persist. Bigger change (storage-format migration).
-2. **Kyber** per the note above (round-3 vs FIPS-203 — migrate both sides at once
-   or leave in Dart).
+1. **Kyber stays in Dart** — decided. The Dart `post_quantum` package is round-3
+   Kyber (SHAKE256 final KDF); the Rust `ml-kem` crates are FIPS-203 ML-KEM, a
+   different final KDF, so they don't cross-decapsulate. Migrating means either a
+   round-3 Rust crate (`pqc_kyber`, which carries the KyberSlash timing advisory)
+   or moving BOTH sides to ML-KEM at once (a coordinated on-wire change). Neither
+   is worth it: Kyber is a stateless KEM with no long-lived secret state, so the
+   memory-hygiene case that drove the ratchet port doesn't apply. It keeps
+   handing its 32-byte secret to `hybrid_combine` (which runs in Rust).
 
 Nothing changes the on-wire format — the parity vectors + the runtime oracle
 are the guardrails.

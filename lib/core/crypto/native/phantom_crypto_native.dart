@@ -37,6 +37,13 @@ class NativeCryptoGate {
   bool _verified = false;
   bool _ratchetVerified = false;
 
+  /// 32-byte key that seals ratchet session state into an opaque blob at persist
+  /// (HKDF from the seed, set by `PhantomStorage.initialize`). When set, a
+  /// native-backed session's `toJson` returns the sealed blob instead of hex, so
+  /// root/chain keys never touch Dart memory as plaintext. Null before storage
+  /// init (or in tests that don't need it) → sessions fall back to hex JSON.
+  Uint8List? sessionBlobKey;
+
   /// True when the native core is loaded AND ran the stateless parity oracle
   /// clean, so hot-path stateless calls route through Rust.
   bool get usingNative => _verified && _native != null;
@@ -78,6 +85,15 @@ class NativeCryptoGate {
     _verified = await _native!.runParityOracle();
     _ratchetVerified = await _verifyRatchet(_native!);
     return ratchetNative;
+  }
+
+  /// Test-only: turn the native path off (as if the `.so` were unavailable),
+  /// so tests can exercise the pure-Dart fallbacks — including opening a sealed
+  /// blob in Dart. Keeps [sessionBlobKey] so the fallback can still decrypt.
+  @visibleForTesting
+  void disableForTest() {
+    _verified = false;
+    _ratchetVerified = false;
   }
 
   /// On-device ratchet parity oracle. Drives a full 3-step Alice↔Bob
@@ -225,6 +241,14 @@ typedef _RatStatusD = int Function(Pointer<Void>, Pointer<Uint32>,
     Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint8>, Pointer<Uint8>,
     Pointer<Uint8>);
 
+typedef _RatSealC = Int32 Function(
+    Pointer<Void>, Pointer<Uint8>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _RatSealD = int Function(
+    Pointer<Void>, Pointer<Uint8>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+
+typedef _RatOpenC = Pointer<Void> Function(Pointer<Uint8>, IntPtr, Pointer<Uint8>);
+typedef _RatOpenD = Pointer<Void> Function(Pointer<Uint8>, int, Pointer<Uint8>);
+
 typedef _RatFreeC = Void Function(Pointer<Void>);
 typedef _RatFreeD = void Function(Pointer<Void>);
 
@@ -242,6 +266,8 @@ class PhantomCryptoNative {
   late final _RatDecryptD _ratDecrypt = _lib.lookupFunction<_RatDecryptC, _RatDecryptD>('phantom_ratchet_decrypt');
   late final _RatToJsonD _ratToJson = _lib.lookupFunction<_RatToJsonC, _RatToJsonD>('phantom_ratchet_to_json');
   late final _RatStatusD _ratStatus = _lib.lookupFunction<_RatStatusC, _RatStatusD>('phantom_ratchet_status');
+  late final _RatSealD _ratSeal = _lib.lookupFunction<_RatSealC, _RatSealD>('phantom_ratchet_seal');
+  late final _RatOpenD _ratOpen = _lib.lookupFunction<_RatOpenC, _RatOpenD>('phantom_ratchet_open');
   late final _RatFreeD _ratFree = _lib.lookupFunction<_RatFreeC, _RatFreeD>('phantom_ratchet_free');
   late final _BufFreeD _bufFree = _lib.lookupFunction<_BufFreeC, _BufFreeD>('phantom_buf_free');
 
@@ -568,6 +594,40 @@ class NativeRatchet {
       calloc.free(hasSend);
       calloc.free(hasRemote);
       calloc.free(remote);
+    }
+  }
+
+  /// Seal the session into an encrypted blob (`[nonce12][ct][tag16]`,
+  /// ChaCha20-Poly1305 under [key]). The plaintext state never crosses to Dart —
+  /// only the ciphertext. Openable by [openBlob] or, as a fallback, in pure Dart.
+  Uint8List seal(Uint8List key) {
+    final k = _alloc(key);
+    final out = calloc<Pointer<Uint8>>();
+    final len = calloc<IntPtr>();
+    try {
+      final rc = _n._ratSeal(_h.ptr, k, out, len);
+      if (rc != 0) throw StateError('ratchet seal rc=$rc');
+      return _takeBuf(out.value, len.value);
+    } finally {
+      calloc.free(k);
+      calloc.free(out);
+      calloc.free(len);
+    }
+  }
+
+  /// Open a blob from [seal] back into a native handle, or null on a bad
+  /// key/tag or bad payload. Keeps the state in native (never hex in Dart).
+  static NativeRatchet? openBlob(
+      PhantomCryptoNative n, Uint8List blob, Uint8List key) {
+    final b = _alloc(blob);
+    final k = _alloc(key);
+    try {
+      final handle = n._ratOpen(b, blob.length, k);
+      if (handle == nullptr) return null;
+      return NativeRatchet._(n, _RatchetHandle(n._ratFree, handle));
+    } finally {
+      calloc.free(b);
+      calloc.free(k);
     }
   }
 

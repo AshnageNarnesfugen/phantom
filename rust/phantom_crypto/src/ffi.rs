@@ -21,7 +21,12 @@
 //! boundary; secret state zeroizes on drop (including the discarded clone).
 
 use crate::ratchet::{EncryptedMessage, RatchetSession};
-use crate::{ed25519_verify, hybrid_combine, x25519_shared, x3dh_initiate};
+use crate::{
+    chacha20poly1305_decrypt, chacha20poly1305_encrypt, ed25519_verify, hybrid_combine,
+    x25519_shared, x3dh_initiate,
+};
+use rand_core::{OsRng, RngCore};
+use zeroize::Zeroize;
 
 /// # Safety: `p` must be null or point to at least 32 readable bytes.
 unsafe fn arr32(p: *const u8) -> Option<[u8; 32]> {
@@ -377,6 +382,82 @@ pub unsafe extern "C" fn phantom_ratchet_status(
     0
 }
 
+/// Seal the session into an ENCRYPTED blob: `to_json` is ChaCha20-Poly1305'd
+/// with `key` (32 bytes), so the root/chain/header keys never cross to the
+/// caller as plaintext hex — only ciphertext. Layout `[nonce12][ct][tag16]`,
+/// freed with `phantom_buf_free`. This is the memory-hygiene persist path; the
+/// caller (Dart) stores the blob instead of the hex map. Returns 0 on success.
+///
+/// # Safety: `sess` is a live handle; `key` is 32 bytes; `out_ptr`/`out_len`
+/// are writable.
+#[no_mangle]
+pub unsafe extern "C" fn phantom_ratchet_seal(
+    sess: *mut RatchetSession,
+    key: *const u8,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if sess.is_null() || key.is_null() || out_ptr.is_null() || out_len.is_null() {
+        return 1;
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(std::slice::from_raw_parts(key, 32));
+    let mut json_bytes = (*sess).to_json().into_bytes();
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let (ct, tag) = chacha20poly1305_encrypt(&k, &nonce, b"", &json_bytes);
+    k.zeroize();
+    json_bytes.zeroize(); // plaintext json held secret hex — wipe our copy
+    let mut blob = Vec::with_capacity(12 + ct.len() + 16);
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ct);
+    blob.extend_from_slice(&tag);
+    slice_into_out(blob, out_ptr, out_len);
+    0
+}
+
+/// Open a blob produced by `phantom_ratchet_seal` (or the Dart equivalent) into
+/// a session handle. Same `[nonce12][ct][tag16]` layout + 32-byte `key`. Returns
+/// null on a bad key/tag or bad JSON. The handle is `mlock`ed like `from_json`.
+///
+/// # Safety: `blob` points to `blob_len` bytes; `key` is 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn phantom_ratchet_open(
+    blob: *const u8,
+    blob_len: usize,
+    key: *const u8,
+) -> *mut RatchetSession {
+    if blob.is_null() || key.is_null() || blob_len < 28 {
+        return std::ptr::null_mut();
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(std::slice::from_raw_parts(key, 32));
+    let b = std::slice::from_raw_parts(blob, blob_len);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&b[0..12]);
+    let ct = &b[12..blob_len - 16];
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&b[blob_len - 16..]);
+    let pt = chacha20poly1305_decrypt(&k, &nonce, b"", ct, &tag);
+    k.zeroize();
+    let Some(mut pt) = pt else {
+        return std::ptr::null_mut();
+    };
+    let result = match std::str::from_utf8(&pt) {
+        Ok(json) => match RatchetSession::from_json(json) {
+            Ok(sess) => {
+                let ptr = Box::into_raw(Box::new(sess));
+                lock_session(ptr);
+                ptr
+            }
+            Err(_) => std::ptr::null_mut(),
+        },
+        Err(_) => std::ptr::null_mut(),
+    };
+    pt.zeroize(); // decrypted json held secret hex
+    result
+}
+
 /// Release a session handle (zeroizes its secret state).
 ///
 /// # Safety: `sess` must be a handle from `phantom_ratchet_from_json` not yet
@@ -535,6 +616,37 @@ mod tests {
             let p1 = ffi_decrypt(reloaded, M1_HDR, M1_CT, M1_NONCE).unwrap();
             assert_eq!(String::from_utf8(p1).unwrap(), "hola desde dart 1");
             phantom_ratchet_free(reloaded);
+        }
+    }
+
+    #[test]
+    fn ffi_ratchet_seal_open_round_trips_and_rejects_wrong_key() {
+        unsafe {
+            let key = [0x5cu8; 32];
+            let sess = phantom_ratchet_from_json(BOB_JSON.as_ptr(), BOB_JSON.len());
+            // Advance state, then seal → the blob is opaque (not the plaintext json).
+            ffi_decrypt(sess, M0_HDR, M0_CT, M0_NONCE).unwrap();
+            let mut bp: *mut u8 = std::ptr::null_mut();
+            let mut bl: usize = 0;
+            assert_eq!(phantom_ratchet_seal(sess, key.as_ptr(), &mut bp, &mut bl), 0);
+            let blob = std::slice::from_raw_parts(bp, bl).to_vec();
+            phantom_buf_free(bp, bl);
+            phantom_ratchet_free(sess);
+            // The ciphertext must not contain the plaintext rk hex.
+            assert!(!blob
+                .windows(4)
+                .any(|w| w == b"5a5a"));
+
+            // Wrong key → null (auth fail), not a panic.
+            let bad = [0u8; 32];
+            assert!(phantom_ratchet_open(blob.as_ptr(), blob.len(), bad.as_ptr()).is_null());
+
+            // Right key → a working session that continues decrypting M1.
+            let opened = phantom_ratchet_open(blob.as_ptr(), blob.len(), key.as_ptr());
+            assert!(!opened.is_null());
+            let p1 = ffi_decrypt(opened, M1_HDR, M1_CT, M1_NONCE).unwrap();
+            assert_eq!(String::from_utf8(p1).unwrap(), "hola desde dart 1");
+            phantom_ratchet_free(opened);
         }
     }
 }
