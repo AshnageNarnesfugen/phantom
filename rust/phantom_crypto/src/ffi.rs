@@ -288,6 +288,72 @@ pub unsafe extern "C" fn phantom_ratchet_decrypt(
     }
 }
 
+/// Serialize the session to Dart's `toJson` format (a freshly-allocated UTF-8
+/// buffer, free with `phantom_buf_free`). This is the PERSIST path — the only
+/// place secret state crosses back to the caller as hex, exactly as the pure-
+/// Dart ratchet already does when saving to storage. Returns 0 on success.
+///
+/// # Safety: `sess` is a live handle; `out_ptr`/`out_len` are writable.
+#[no_mangle]
+pub unsafe extern "C" fn phantom_ratchet_to_json(
+    sess: *mut RatchetSession,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if sess.is_null() || out_ptr.is_null() || out_len.is_null() {
+        return 1;
+    }
+    let s = &*sess;
+    slice_into_out(s.to_json().into_bytes(), out_ptr, out_len);
+    0
+}
+
+/// Read NON-SECRET status: the message counters, whether a sending chain exists,
+/// and the remote party's ratchet public key. The Dart wrapper uses these on the
+/// hot path (INIT-resend cutoff via `sn`; DH-ratchet detection via the remote
+/// pub before/after a decrypt) WITHOUT pulling any secret to hex. Returns 0 on
+/// success. `remote_pub` is zeroed and `has_remote` is 0 when no remote key yet.
+///
+/// # Safety: `sess` is a live handle; all out-pointers are writable
+/// (`remote_pub` has room for 32 bytes).
+#[no_mangle]
+pub unsafe extern "C" fn phantom_ratchet_status(
+    sess: *mut RatchetSession,
+    out_sn: *mut u32,
+    out_rn: *mut u32,
+    out_psn: *mut u32,
+    out_has_send: *mut u8,
+    out_remote_pub: *mut u8,
+    out_has_remote: *mut u8,
+) -> i32 {
+    if sess.is_null()
+        || out_sn.is_null()
+        || out_rn.is_null()
+        || out_psn.is_null()
+        || out_has_send.is_null()
+        || out_remote_pub.is_null()
+        || out_has_remote.is_null()
+    {
+        return 1;
+    }
+    let s = &*sess;
+    *out_sn = s.sending_n();
+    *out_rn = s.receiving_n();
+    *out_psn = s.previous_sending_n();
+    *out_has_send = s.has_sending_chain() as u8;
+    match s.dh_remote_pub() {
+        Some(p) => {
+            std::ptr::copy_nonoverlapping(p.as_ptr(), out_remote_pub, 32);
+            *out_has_remote = 1;
+        }
+        None => {
+            std::ptr::write_bytes(out_remote_pub, 0, 32);
+            *out_has_remote = 0;
+        }
+    }
+    0
+}
+
 /// Release a session handle (zeroizes its secret state).
 ///
 /// # Safety: `sess` must be a handle from `phantom_ratchet_from_json` not yet
@@ -399,6 +465,52 @@ mod tests {
             // Freeing null is a no-op, not UB.
             phantom_ratchet_free(std::ptr::null_mut());
             phantom_buf_free(std::ptr::null_mut(), 0);
+        }
+    }
+
+    #[test]
+    fn ffi_ratchet_status_and_to_json_track_state() {
+        unsafe {
+            let sess = phantom_ratchet_from_json(BOB_JSON.as_ptr(), BOB_JSON.len());
+            assert!(!sess.is_null());
+
+            // Fresh Bob: no remote pub, no sending chain, counters zero.
+            let (mut sn, mut rn, mut psn) = (0u32, 0u32, 0u32);
+            let (mut has_send, mut has_remote) = (9u8, 9u8);
+            let mut remote = [0u8; 32];
+            assert_eq!(
+                phantom_ratchet_status(
+                    sess, &mut sn, &mut rn, &mut psn, &mut has_send,
+                    remote.as_mut_ptr(), &mut has_remote,
+                ),
+                0
+            );
+            assert_eq!((sn, rn, psn, has_send, has_remote), (0, 0, 0, 0, 0));
+
+            // After decrypting M0, Bob DH-ratcheted: a remote pub appears and a
+            // sending chain exists.
+            ffi_decrypt(sess, M0_HDR, M0_CT, M0_NONCE).unwrap();
+            phantom_ratchet_status(
+                sess, &mut sn, &mut rn, &mut psn, &mut has_send,
+                remote.as_mut_ptr(), &mut has_remote,
+            );
+            assert_eq!(has_remote, 1);
+            assert_eq!(has_send, 1);
+            assert!(remote.iter().any(|&b| b != 0));
+
+            // to_json round-trips through the C-ABI: reload and decrypt M1.
+            let mut jp: *mut u8 = std::ptr::null_mut();
+            let mut jl: usize = 0;
+            assert_eq!(phantom_ratchet_to_json(sess, &mut jp, &mut jl), 0);
+            let json = String::from_utf8(std::slice::from_raw_parts(jp, jl).to_vec()).unwrap();
+            phantom_buf_free(jp, jl);
+            phantom_ratchet_free(sess);
+
+            let reloaded = phantom_ratchet_from_json(json.as_ptr(), json.len());
+            assert!(!reloaded.is_null());
+            let p1 = ffi_decrypt(reloaded, M1_HDR, M1_CT, M1_NONCE).unwrap();
+            assert_eq!(String::from_utf8(p1).unwrap(), "hola desde dart 1");
+            phantom_ratchet_free(reloaded);
         }
     }
 }

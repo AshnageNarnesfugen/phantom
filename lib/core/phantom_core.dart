@@ -2615,7 +2615,13 @@ class PhantomCore {
       {String? i2pSourceDest, bool fromStore = false}) async {
     final dbg = TransportDebugger.instance;
     for (final entry in List.of(_sessions.entries)) {
-      final snapshot = entry.value.takeSnapshot();
+      // A wrong-session attempt can partially mutate a Dart-backed ratchet
+      // before the body MAC fails, so snapshot it and restore on failure. A
+      // native-backed session decrypts atomically (the Rust core commits only
+      // on success), so it needs neither — and skipping the snapshot keeps its
+      // secret state from being serialized to hex on every probe.
+      final nativeBacked = entry.value.isNativeBacked;
+      final snapshot = nativeBacked ? null : entry.value.takeSnapshot();
       try {
         final protocol = PhantomProtocol(entry.value);
         final message  = await protocol.decode(frame.payload);
@@ -2635,7 +2641,11 @@ class PhantomCore {
         }
         return true;
       } catch (e) {
-        _sessions[entry.key] = await RatchetSession.fromJson(snapshot);
+        // Native-backed sessions weren't mutated (atomic decrypt) and have no
+        // snapshot to restore; Dart-backed ones roll back to the pre-attempt state.
+        if (snapshot != null) {
+          _sessions[entry.key] = await RatchetSession.fromJson(snapshot);
+        }
         continue;
       }
     }

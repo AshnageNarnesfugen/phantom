@@ -311,6 +311,75 @@ impl RatchetSession {
         self.sending_n = 0;
     }
 
+    // ── Non-secret status (for the hot path) ──────────────────────────────────
+    //
+    // The Dart wrapper drives its handshake-metadata logic from these
+    // (sending_n for the INIT-resend cutoff, dh_remote_pub before/after a decrypt
+    // to detect a DH-ratchet). Deliberately exposes NO secret material — the
+    // root/chain/message keys never leave native except at persist (to_json).
+    pub fn sending_n(&self) -> u32 {
+        self.sending_n
+    }
+    pub fn receiving_n(&self) -> u32 {
+        self.receiving_n
+    }
+    pub fn previous_sending_n(&self) -> u32 {
+        self.previous_sending_n
+    }
+    pub fn has_sending_chain(&self) -> bool {
+        self.sending_chain_key.is_some()
+    }
+    /// The remote party's current ratchet public key (not secret), or None.
+    pub fn dh_remote_pub(&self) -> Option<[u8; 32]> {
+        self.dh_remote_pub
+    }
+
+    // ── Serialization (Dart toJson format) ────────────────────────────────────
+    //
+    // Emits exactly the keys Dart's `RatchetSession.toJson` uses, with the same
+    // lowercase-hex encoding, so the Dart wrapper can persist native state to
+    // Hive byte-for-byte as before. The handshake-metadata keys (x3dh_ek,
+    // kyber_cipher, opk_id, epk) are emitted null — Dart owns those and overlays
+    // its own values; Rust neither tracks nor needs them.
+    pub fn to_json(&self) -> String {
+        use serde_json::{json, Map, Value};
+        let hx = |b: &[u8; 32]| -> String { b.iter().map(|x| format!("{:02x}", x)).collect() };
+        let opt = |o: &Option<[u8; 32]>| -> Value {
+            match o {
+                Some(b) => Value::String(hx(b)),
+                None => Value::Null,
+            }
+        };
+        let mut sk = Map::new();
+        for (id, mk) in &self.skipped {
+            sk.insert(
+                id.clone(),
+                json!({ "ek": hx(&mk.enc_key), "hk": hx(&mk.header_key) }),
+            );
+        }
+        json!({
+            "rk": hx(&self.root_key),
+            "sck": opt(&self.sending_chain_key),
+            "rck": opt(&self.receiving_chain_key),
+            "dhsk_priv": hx(&self.dh_sending_priv),
+            "dhsk_pub": hx(&self.dh_sending_pub),
+            "dhrpk": opt(&self.dh_remote_pub),
+            "sn": self.sending_n,
+            "rn": self.receiving_n,
+            "psn": self.previous_sending_n,
+            "shk": opt(&self.sending_header_key),
+            "rhk": opt(&self.receiving_header_key),
+            "nshk": opt(&self.next_sending_header_key),
+            "nrhk": opt(&self.next_receiving_header_key),
+            "x3dh_ek": Value::Null,
+            "kyber_cipher": Value::Null,
+            "opk_id": Value::Null,
+            "epk": Value::Null,
+            "sk": Value::Object(sk),
+        })
+        .to_string()
+    }
+
     // ── Deserialization (Dart toJson format) ──────────────────────────────────
     pub fn from_json(s: &str) -> Result<RatchetSession, RatchetError> {
         let v: serde_json::Value =
@@ -432,5 +501,19 @@ mod tests {
         let mut m = msg(M0_HDR, M0_CT, M0_NONCE);
         m.ciphertext[0] ^= 1;
         assert!(bob.decrypt(&m).is_err());
+    }
+
+    #[test]
+    fn to_json_round_trips_and_still_decrypts() {
+        // Decrypt M0 (advances Bob's state), serialize, reload, and decrypt M1:
+        // proves to_json captures the mutated state exactly (the persist path).
+        let mut bob = RatchetSession::from_json(BOB_JSON).unwrap();
+        let p0 = bob.decrypt(&msg(M0_HDR, M0_CT, M0_NONCE)).unwrap();
+        assert_eq!(String::from_utf8(p0).unwrap(), "hola desde dart 0");
+
+        let serialized = bob.to_json();
+        let mut reloaded = RatchetSession::from_json(&serialized).unwrap();
+        let p1 = reloaded.decrypt(&msg(M1_HDR, M1_CT, M1_NONCE)).unwrap();
+        assert_eq!(String::from_utf8(p1).unwrap(), "hola desde dart 1");
     }
 }

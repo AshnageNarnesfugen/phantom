@@ -6,6 +6,7 @@ import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
 import 'package:ffi/ffi.dart';
+import 'package:meta/meta.dart';
 
 import '../double_ratchet.dart';
 import '../hybrid_kem.dart';
@@ -66,6 +67,17 @@ class NativeCryptoGate {
     // oracle. A drift here only withholds the (not-yet-live) ratchet cutover; it
     // does not disable the already-live stateless path.
     _ratchetVerified = await _verifyRatchet(_native!);
+  }
+
+  /// Test-only: load the host `libphantom_crypto.so` from [soPath] and run both
+  /// on-device oracles, so tests can exercise the real native-backed ratchet
+  /// path off-device (the Android build uses [init]). Returns [ratchetNative].
+  @visibleForTesting
+  Future<bool> enableForTest(String soPath) async {
+    _native = PhantomCryptoNative.openPath(soPath);
+    _verified = await _native!.runParityOracle();
+    _ratchetVerified = await _verifyRatchet(_native!);
+    return ratchetNative;
   }
 
   /// On-device ratchet parity oracle. Drives a full 3-step Alice↔Bob
@@ -201,6 +213,18 @@ typedef _RatDecryptD = int Function(
     Pointer<Void>, Pointer<Uint8>, int, Pointer<Uint8>, int,
     Pointer<Uint8>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 
+typedef _RatToJsonC =
+    Int32 Function(Pointer<Void>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _RatToJsonD =
+    int Function(Pointer<Void>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+
+typedef _RatStatusC = Int32 Function(Pointer<Void>, Pointer<Uint32>,
+    Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint8>, Pointer<Uint8>,
+    Pointer<Uint8>);
+typedef _RatStatusD = int Function(Pointer<Void>, Pointer<Uint32>,
+    Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint8>, Pointer<Uint8>,
+    Pointer<Uint8>);
+
 typedef _RatFreeC = Void Function(Pointer<Void>);
 typedef _RatFreeD = void Function(Pointer<Void>);
 
@@ -216,6 +240,8 @@ class PhantomCryptoNative {
   late final _RatFromJsonD _ratFromJson = _lib.lookupFunction<_RatFromJsonC, _RatFromJsonD>('phantom_ratchet_from_json');
   late final _RatEncryptD _ratEncrypt = _lib.lookupFunction<_RatEncryptC, _RatEncryptD>('phantom_ratchet_encrypt');
   late final _RatDecryptD _ratDecrypt = _lib.lookupFunction<_RatDecryptC, _RatDecryptD>('phantom_ratchet_decrypt');
+  late final _RatToJsonD _ratToJson = _lib.lookupFunction<_RatToJsonC, _RatToJsonD>('phantom_ratchet_to_json');
+  late final _RatStatusD _ratStatus = _lib.lookupFunction<_RatStatusC, _RatStatusD>('phantom_ratchet_status');
   late final _RatFreeD _ratFree = _lib.lookupFunction<_RatFreeC, _RatFreeD>('phantom_ratchet_free');
   late final _BufFreeD _bufFree = _lib.lookupFunction<_BufFreeC, _BufFreeD>('phantom_buf_free');
 
@@ -231,6 +257,11 @@ class PhantomCryptoNative {
       return null;
     }
   }
+
+  /// Load from an explicit path — desktop/test only (Android uses [tryLoad]).
+  @visibleForTesting
+  static PhantomCryptoNative openPath(String path) =>
+      PhantomCryptoNative._(DynamicLibrary.open(path));
 
   // ── Wrappers ────────────────────────────────────────────────────────────────
 
@@ -489,6 +520,57 @@ class NativeRatchet {
     }
   }
 
+  /// Serialize the full session (Dart `toJson` format). This is the PERSIST
+  /// path — the only call that brings secret state back to Dart as hex, exactly
+  /// as the pure-Dart ratchet does when saving. The handshake-metadata keys come
+  /// back null; the Dart wrapper overlays its own.
+  Map<String, dynamic> toJson() {
+    final out = calloc<Pointer<Uint8>>();
+    final len = calloc<IntPtr>();
+    try {
+      final rc = _n._ratToJson(_h.ptr, out, len);
+      if (rc != 0) throw StateError('ratchet to_json rc=$rc');
+      return jsonDecode(utf8.decode(_takeBuf(out.value, len.value)))
+          as Map<String, dynamic>;
+    } finally {
+      calloc.free(out);
+      calloc.free(len);
+    }
+  }
+
+  /// Read non-secret status (counters, sending-chain presence, remote ratchet
+  /// public key) without pulling any secret to Dart. Drives the wrapper's
+  /// handshake-metadata logic on the hot path.
+  RatchetStatus status() {
+    final sn = calloc<Uint32>();
+    final rn = calloc<Uint32>();
+    final psn = calloc<Uint32>();
+    final hasSend = calloc<Uint8>();
+    final hasRemote = calloc<Uint8>();
+    final remote = calloc<Uint8>(32);
+    try {
+      final rc =
+          _n._ratStatus(_h.ptr, sn, rn, psn, hasSend, remote, hasRemote);
+      if (rc != 0) throw StateError('ratchet status rc=$rc');
+      return RatchetStatus(
+        sendingN: sn.value,
+        receivingN: rn.value,
+        previousSendingN: psn.value,
+        hasSendingChain: hasSend.value == 1,
+        remotePub: hasRemote.value == 1
+            ? Uint8List.fromList(remote.asTypedList(32))
+            : null,
+      );
+    } finally {
+      calloc.free(sn);
+      calloc.free(rn);
+      calloc.free(psn);
+      calloc.free(hasSend);
+      calloc.free(hasRemote);
+      calloc.free(remote);
+    }
+  }
+
   /// Free the native session now (idempotent). After this the handle must not
   /// be used again.
   void dispose() {
@@ -511,4 +593,23 @@ class NativeRatchet {
     if (b.isNotEmpty) p.asTypedList(b.length).setAll(0, b);
     return p;
   }
+}
+
+/// Non-secret snapshot of a [NativeRatchet]'s state, read via
+/// `phantom_ratchet_status`. Carries counters and the remote ratchet public key
+/// (public, not secret) — enough for the Dart wrapper to drive its
+/// handshake-metadata logic without any secret leaving native memory.
+class RatchetStatus {
+  final int sendingN;
+  final int receivingN;
+  final int previousSendingN;
+  final bool hasSendingChain;
+  final Uint8List? remotePub;
+  const RatchetStatus({
+    required this.sendingN,
+    required this.receivingN,
+    required this.previousSendingN,
+    required this.hasSendingChain,
+    required this.remotePub,
+  });
 }

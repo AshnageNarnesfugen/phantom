@@ -62,8 +62,8 @@ Covered so far (byte-identical, 9/9 parity tests):
   `cargo build --release` emits `libphantom_crypto.so` (Android/Linux) + `.a`
   (iOS).
 
-`cargo test` → 20/20 (parity + ratchet cross-compat + FFI null-safety +
-stateful-handle round-trip & atomicity).
+`cargo test` → 22/22 (parity + ratchet cross-compat + FFI null-safety +
+stateful-handle round-trip, atomicity, status + to_json persistence).
 
 ## Kyber-768: why it stays in Dart for now
 
@@ -123,38 +123,56 @@ signature can never be mis-verified nor a secret mis-combined by an untrusted
 native path. The verdict shows as `NATIVE: ✓ … parity OK` / `staying on Dart
 crypto` in the Transport Debugger.
 
-### Stateful ratchet FFI: BUILT + on-device oracle (cutover staged)
+### Stateful ratchet cutover: DONE (native is the source of truth)
 
-The hand-written opaque-handle FFI (above) is wired into Dart as `NativeRatchet`
-in `phantom_crypto_native.dart` — a handle with a `Finalizer` safety-net free,
-marshalling the variable-length header/ciphertext/plaintext buffers and copying
-them out before handing the native memory back to `phantom_buf_free`.
+The hand-written opaque-handle FFI is wired into Dart as `NativeRatchet` in
+`phantom_crypto_native.dart` — a handle with a `Finalizer` safety-net free,
+marshalling the variable-length header/ciphertext/plaintext buffers.
 
-At startup `NativeCryptoGate.init()` now also runs a **ratchet parity oracle**
-(`_verifyRatchet`): it drives a full 3-step Alice↔Bob conversation where the
-native ratchet plays one side and the Dart ratchet the other, so one run
-exercises native decrypt, the native DH-ratchet (receiving + sending), and
-native encrypt — each cross-verified byte-for-byte with Dart. The verdict logs
-as `NATIVE: ✓ Rust ratchet parity OK` (sets `ratchetNative`) or a mismatch to
-the Transport Debugger. This is the same discipline used for the stateless ops:
-prove the mechanism + on-device parity FIRST, then route real messages.
+At startup `NativeCryptoGate.init()` runs a **ratchet parity oracle**
+(`_verifyRatchet`): a full 3-step Alice↔Bob conversation with the native ratchet
+on one side and Dart on the other, exercising native decrypt, the native
+DH-ratchet (recv + send), and native encrypt — each cross-verified byte-for-byte.
+It sets `ratchetNative` and logs `NATIVE: ✓ Rust ratchet parity OK`.
 
-Routing the message body (`RatchetSession.encrypt`/`decrypt` in
-`protocol/message.dart`) through `NativeRatchet` is the last step, staged behind
-`ratchetNative` being confirmed green on real devices — because unlike the
-stateless ops, it moves the ratchet state's ownership, so it warrants the
-on-device confirmation first. The Dart `RatchetSession` keeps the handshake
-metadata (`pendingX3dhEphemeralKey`, `endpointKey`, …) the transport reads.
+Once green on both devices, the cutover went live. When `ratchetNative`, a
+`RatchetSession` becomes **native-backed**: the ratchet crypto state (root /
+chain / message / header keys) lives in the Rust core (`_native` handle), not the
+Dart `_…` fields. `encrypt`/`decrypt` delegate to it; the ephemeral message keys
+and DH outputs are computed and **zeroized in native**, never touching Dart's GC
+heap. The design keeps memory hygiene honest:
+
+- **Secrets cross to Dart as hex only at persist** (`toJson` → `phantom_ratchet_to_json`),
+  exactly as the pure-Dart ratchet already did when saving to Hive — no new
+  exposure. Between messages the live state stays in native.
+- **The hot path uses a non-secret status accessor** (`phantom_ratchet_status`:
+  counters + the remote *public* key), so the wrapper drives its handshake-
+  metadata logic (INIT-resend cutoff, DH-ratchet detection) without pulling any
+  secret. `_tryDecryptAsMsg` skips its snapshot/restore for native sessions
+  (native `decrypt` is atomic), so a decrypt probe never serializes secrets.
+- **The Dart `RatchetSession` keeps the handshake metadata** (`pendingX3dhEphemeralKey`,
+  `kyberCipher`, `opkId`, `endpointKey`, `isNewSession`) in both modes; Rust
+  neither tracks nor needs it. `toJson` overlays it onto the native ratchet JSON.
+
+Fully fallback-safe: where `ratchetNative` is false (no `.so`, oracle red,
+non-Android), sessions stay pure-Dart and byte-identical. Verified end-to-end by
+`test/native_ratchet_cutover_test.dart`, which loads the host `.so` and runs
+native-backed sessions through ping-pong + DH ratchet + out-of-order + tamper +
+persistence round-trips.
 
 ### What remains
 
-1. **Route the message body through `NativeRatchet`** once `ratchetNative` is
-   confirmed green on both devices (needs a native `to_json` to persist the
-   mutated state back for Hive, preserving Dart's metadata fields).
-2. **iOS** — a **macOS builder** for the `.a`/xcframework (cross-compile from
+1. **`mlock`** the native ratchet's secret pages — now that the live state lives
+   in the Rust core, pin it so it can't be swapped to disk. This is the natural
+   next step the source-of-truth cutover unlocked.
+2. **Opaque-blob persistence** (optional, closes the last hex gap) — have native
+   serialize/deserialize an *encrypted* blob so root/chain keys never appear as
+   hex even at persist. Bigger change (storage-format migration).
+3. **iOS** — a **macOS builder** for the `.a`/xcframework (cross-compile from
    Linux isn't possible for the iOS targets); Linux desktop can load the
    host `.so` directly.
-3. **`mlock`** the ratchet's secret pages, and **Kyber** per the note above.
+4. **Kyber** per the note above (round-3 vs FIPS-203 — migrate both sides at once
+   or leave in Dart).
 
 Nothing changes the on-wire format — the parity vectors + the runtime oracle
 are the guardrails.

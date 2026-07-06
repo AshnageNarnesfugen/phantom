@@ -1,6 +1,9 @@
+import 'dart:convert';
 import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 import 'package:meta/meta.dart';
+
+import 'native/phantom_crypto_native.dart';
 
 /// Double Ratchet Algorithm (Signal Protocol).
 ///
@@ -107,7 +110,9 @@ class RatchetSession {
   Uint8List? _sendingChainKey;
   Uint8List? _receivingChainKey;
 
-  bool get hasSendingChain => _sendingChainKey != null;
+  bool get hasSendingChain => _native != null
+      ? _native!.status().hasSendingChain
+      : _sendingChainKey != null;
 
   SimpleKeyPairData _dhSendingKP;
   Uint8List? _dhRemotePublicKey;
@@ -148,6 +153,20 @@ class RatchetSession {
   /// Derived from the *initial* shared secret (not the ratcheted root key)
   /// so both sides produce the same key without needing per-message state.
   Uint8List? endpointKey;
+
+  /// When non-null, the double-ratchet CRYPTO STATE lives in the Rust core (this
+  /// handle) instead of the `_…` fields above, which then go stale and unused.
+  /// Set at construction ([_goNativeIfEnabled]) only when the on-device ratchet
+  /// oracle passed ([NativeCryptoGate.ratchetNative]). The secret state stays in
+  /// native memory (zeroized on drop) between operations; it only crosses back
+  /// to Dart as hex at persist time ([toJson]), exactly as the pure-Dart ratchet
+  /// already does. The handshake-metadata fields (pending…, endpointKey,
+  /// isNewSession) remain Dart-owned in BOTH modes — Rust neither tracks nor
+  /// needs them.
+  NativeRatchet? _native;
+
+  /// True when this session's ratchet runs in the Rust core (see [_native]).
+  bool get isNativeBacked => _native != null;
 
   RatchetSession._({
     required Uint8List rootKey,
@@ -201,6 +220,7 @@ class RatchetSession {
       ..endpointKey              = endpointK
       ..isNewSession = true;
 
+    await session._goNativeIfEnabled();
     return session;
   }
 
@@ -213,7 +233,7 @@ class RatchetSession {
     final hkBtoA = await _kdfInitialHeaderKey(sharedSecret, _kdfHkBtoA);
     final endpointK = await _kdfInitialHeaderKey(sharedSecret, _kdfEndpoint);
 
-    return RatchetSession._(
+    final session = RatchetSession._(
       rootKey: sharedSecret,
       dhSendingKP: ourEncryptionKP,
       dhRemotePublicKey: null,
@@ -223,11 +243,15 @@ class RatchetSession {
       .._nextReceivingHeaderKey = hkAtoB   // decrypt Alice's first messages
       .._nextSendingHeaderKey   = hkBtoA   // used as Bob's first sending HK after DH ratchet
       ..endpointKey             = endpointK;
+
+    await session._goNativeIfEnabled();
+    return session;
   }
 
   // ── Encrypt ────────────────────────────────────────────────────────────────
 
   Future<EncryptedMessage> encrypt(Uint8List plaintext) async {
+    if (_native != null) return _encryptNative(plaintext);
     if (_sendingChainKey == null) {
       throw const RatchetException(
         'Cannot send yet: waiting for the first incoming message to initialize the sending chain.',
@@ -269,6 +293,7 @@ class RatchetSession {
   // ── Decrypt ────────────────────────────────────────────────────────────────
 
   Future<Uint8List> decrypt(EncryptedMessage msg) async {
+    if (_native != null) return _decryptNative(msg);
     RatchetHeader? header;
     bool isSkipped = false;
 
@@ -318,6 +343,83 @@ class RatchetSession {
     }
 
     throw const RatchetException('Inconsistent decryption state.');
+  }
+
+  // ── Native ratchet path ────────────────────────────────────────────────────
+
+  /// If the on-device ratchet oracle passed, move this session's crypto state
+  /// into the Rust core. Seeds the handle from the current Dart-field state
+  /// (serialized while [_native] is still null, so [toJson] takes the Dart
+  /// branch). After this the `_…` fields are unused; native is the source of
+  /// truth. A no-op (stays pure-Dart) when the oracle didn't pass or the handle
+  /// can't be built.
+  Future<void> _goNativeIfEnabled() async {
+    final gate = NativeCryptoGate.instance;
+    final native = gate.native;
+    if (!gate.ratchetNative || native == null) return;
+    _native = NativeRatchet.fromJson(native, jsonEncode(await toJson()));
+  }
+
+  Future<EncryptedMessage> _encryptNative(Uint8List plaintext) async {
+    if (!_native!.status().hasSendingChain) {
+      throw const RatchetException(
+        'Cannot send yet: waiting for the first incoming message to initialize the sending chain.',
+      );
+    }
+    final (encHeader, ciphertext, nonce) = _native!.encrypt(plaintext);
+    // Mirror Dart's INIT-resend cutoff using the native sending counter: once
+    // we've resent the handshake keys enough times, stop padding frames.
+    if (_native!.status().sendingN > _maxInitResends) {
+      pendingX3dhEphemeralKey = null;
+      pendingKyberCipherBytes = null;
+      pendingOpkId = null;
+      isNewSession = false;
+    }
+    return EncryptedMessage(
+      encryptedHeader: encHeader,
+      ciphertext: ciphertext,
+      nonce: nonce,
+    );
+  }
+
+  Future<Uint8List> _decryptNative(EncryptedMessage msg) async {
+    // The native decrypt is atomic (it commits only on success), so a failed
+    // attempt leaves state untouched — no snapshot/restore needed here.
+    final remoteBefore = _native!.status().remotePub;
+    final plain =
+        _native!.decrypt(msg.encryptedHeader, msg.ciphertext, msg.nonce);
+    if (plain == null) {
+      throw const RatchetException(
+          'Undecipherable header — unknown session or corrupt message.');
+    }
+    // A change in the remote ratchet public key means a DH ratchet happened
+    // inside native — mirror Dart's _dhRatchet metadata clearing.
+    final remoteAfter = _native!.status().remotePub;
+    if (!_sameRemote(remoteBefore, remoteAfter)) {
+      pendingX3dhEphemeralKey = null;
+      pendingKyberCipherBytes = null;
+      pendingOpkId = null;
+      isNewSession = false;
+    }
+    return plain;
+  }
+
+  static bool _sameRemote(Uint8List? a, Uint8List? b) {
+    if (a == null && b == null) return true;
+    if (a == null || b == null) return false;
+    return _bytesEqual(a, b);
+  }
+
+  /// Overlay the Dart-owned handshake metadata onto a ratchet-state map that
+  /// came from native `to_json` (which leaves those keys null).
+  Map<String, dynamic> _withMetadata(Map<String, dynamic> m) {
+    m['x3dh_ek'] =
+        pendingX3dhEphemeralKey != null ? _hexOf(pendingX3dhEphemeralKey!) : null;
+    m['kyber_cipher'] =
+        pendingKyberCipherBytes != null ? _hexOf(pendingKyberCipherBytes!) : null;
+    m['opk_id'] = pendingOpkId;
+    m['epk'] = endpointKey != null ? _hexOf(endpointKey!) : null;
+    return m;
   }
 
   // ── DH Ratchet ─────────────────────────────────────────────────────────────
@@ -560,6 +662,7 @@ class RatchetSession {
   /// Used by [PhantomCore._handleMsgFrame] to restore state if decryption fails
   /// on the wrong session, preventing ratchet state corruption.
   Map<String, dynamic> takeSnapshot() {
+    if (_native != null) return _withMetadata(_native!.toJson());
     final dhPub = Uint8List.fromList(List<int>.from(_dhSendingKP.publicKey.bytes));
     return {
       'rk':        _hexOf(Uint8List.fromList(_rootKey)),
@@ -589,6 +692,7 @@ class RatchetSession {
   // ── Serialization ──────────────────────────────────────────────────────────
 
   Future<Map<String, dynamic>> toJson() async {
+    if (_native != null) return _withMetadata(_native!.toJson());
     final dhPub = await _dhSendingKP.extractPublicKey();
     return {
       'rk':   _hexOf(_rootKey),
@@ -654,6 +758,7 @@ class RatchetSession {
     }
     session._evictOldestSkipped(); // enforce the cap on sessions saved pre-fix
 
+    await session._goNativeIfEnabled();
     return session;
   }
 
