@@ -158,6 +158,25 @@ pub unsafe extern "C" fn phantom_buf_free(ptr: *mut u8, len: usize) {
     drop(Box::from_raw(s as *mut [u8]));
 }
 
+// Pin/unpin the session's page(s) so the root/chain/message/header keys living
+// inline in the boxed struct can't be paged out to swap/disk. Best-effort:
+// mlock can fail (e.g. RLIMIT_MEMLOCK) and we ignore that — the ratchet still
+// works, just unpinned. NOTE: the skipped-key map allocates separately on the
+// heap, so its (bounded, transient) keys are not covered by this; the crown
+// secrets (root/chain/header keys) are inline in the struct and thus pinned.
+#[cfg(unix)]
+unsafe fn lock_session(ptr: *mut RatchetSession) {
+    libc::mlock(ptr as *const libc::c_void, std::mem::size_of::<RatchetSession>());
+}
+#[cfg(unix)]
+unsafe fn unlock_session(ptr: *mut RatchetSession) {
+    libc::munlock(ptr as *const libc::c_void, std::mem::size_of::<RatchetSession>());
+}
+#[cfg(not(unix))]
+unsafe fn lock_session(_ptr: *mut RatchetSession) {}
+#[cfg(not(unix))]
+unsafe fn unlock_session(_ptr: *mut RatchetSession) {}
+
 /// Parse a Dart-serialized `RatchetSession` (its `toJson`/`takeSnapshot` format)
 /// into an opaque handle. Returns null on bad UTF-8 or bad JSON. The handle owns
 /// the secret state (zeroized when freed) and must be released with
@@ -181,7 +200,11 @@ pub unsafe extern "C" fn phantom_ratchet_from_json(
         return std::ptr::null_mut();
     };
     match RatchetSession::from_json(s) {
-        Ok(sess) => Box::into_raw(Box::new(sess)),
+        Ok(sess) => {
+            let ptr = Box::into_raw(Box::new(sess));
+            lock_session(ptr); // pin secret pages against swap (best-effort)
+            ptr
+        }
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -363,6 +386,7 @@ pub unsafe extern "C" fn phantom_ratchet_free(sess: *mut RatchetSession) {
     if sess.is_null() {
         return;
     }
+    unlock_session(sess); // unpin before the Drop zeroizes + frees
     drop(Box::from_raw(sess));
 }
 

@@ -12,7 +12,8 @@ libsignal is built on.
 - **Deterministic zeroization** (`zeroize`): every secret (`Secret32`) is wiped
   on drop — the key material's lifetime in RAM shrinks to its actual use.
 - **Constant-time comparison** (`subtle`): no secret-dependent branches.
-- **`mlock` (next slice)**: pin secret pages so they never hit swap/disk.
+- **`mlock`**: the live ratchet session's secret pages are pinned (best-effort)
+  so the root/chain/header keys can't be paged out to swap/disk.
 - **Audited primitives**: `x25519-dalek`, `chacha20poly1305`, `hkdf`, `sha2`.
 
 ## Proven byte-for-byte identical to Dart
@@ -160,22 +161,34 @@ non-Android), sessions stay pure-Dart and byte-identical. Verified end-to-end by
 native-backed sessions through ping-pong + DH ratchet + out-of-order + tamper +
 persistence round-trips.
 
+### `mlock`: DONE
+
+`phantom_ratchet_from_json` `mlock`s the boxed session's page(s) so the
+inline root / chain / message / header keys can't be swapped to disk;
+`phantom_ratchet_free` `munlock`s before the `Drop` zeroizes and frees.
+Best-effort — a failed `mlock` (e.g. `RLIMIT_MEMLOCK`) is non-fatal, the ratchet
+just runs unpinned. The skipped-key map allocates separately, so its bounded,
+transient keys aren't pinned; the crown secrets (inline in the struct) are.
+
 ### What remains
 
-1. **`mlock`** the native ratchet's secret pages — now that the live state lives
-   in the Rust core, pin it so it can't be swapped to disk. This is the natural
-   next step the source-of-truth cutover unlocked.
-2. **Opaque-blob persistence** (optional, closes the last hex gap) — have native
+1. **Opaque-blob persistence** (optional, closes the last hex gap) — have native
    serialize/deserialize an *encrypted* blob so root/chain keys never appear as
    hex even at persist. Bigger change (storage-format migration).
-3. **iOS** — a **macOS builder** for the `.a`/xcframework (cross-compile from
-   Linux isn't possible for the iOS targets); Linux desktop can load the
-   host `.so` directly.
-4. **Kyber** per the note above (round-3 vs FIPS-203 — migrate both sides at once
+2. **Kyber** per the note above (round-3 vs FIPS-203 — migrate both sides at once
    or leave in Dart).
 
 Nothing changes the on-wire format — the parity vectors + the runtime oracle
 are the guardrails.
+
+### Platform scope: Android-first, iOS not a priority
+
+The target is **Android**, and it stays that way. Flutter is kept for the
+*option* of other platforms later (desktop labs already load the host `.so`),
+not because iOS is on the roadmap — iOS is deliberately deprioritized (a more
+restrictive sandbox, and it would need a macOS builder for the `.a`/xcframework
+since the iOS targets can't cross-compile from Linux). If iOS ever happens, the
+crate already emits a `staticlib`; until then no effort goes there.
 
 ## Threat-model honesty
 

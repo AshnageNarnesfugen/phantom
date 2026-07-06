@@ -27,6 +27,9 @@ subtle = "2"
 # new ratchet DH keys.
 serde_json = "1"
 rand_core = { version = "0.6", features = ["getrandom"] }
+# mlock/munlock the live ratchet session so its secret pages can't be swapped to
+# disk (Unix/Android). Best-effort; failure is non-fatal.
+libc = "0.2"
 
 [profile.release]
 # Keep debug asserts off but do not let the optimizer elide zeroization —
