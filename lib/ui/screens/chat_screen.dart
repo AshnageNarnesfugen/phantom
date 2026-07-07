@@ -587,16 +587,26 @@ class _ChatScreenState extends State<ChatScreen> {
       Positioned.fill(
         child: RepaintBoundary(
           child: bgPath != null
-              ? _glassBgBlur
-                  ? ImageFiltered(
-                      imageFilter: ui.ImageFilter.blur(
-                        sigmaX: _glassBlur,
-                        sigmaY: _glassBlur,
-                        tileMode: TileMode.clamp,
-                      ),
-                      child: Image.file(File(bgPath), fit: _bgFit, alignment: _bgAlignment),
-                    )
-                  : Image.file(File(bgPath), fit: _bgFit, alignment: _bgAlignment)
+              ? Builder(builder: (context) {
+                  // Decode at screen size — blur cost scales with the bitmap.
+                  final cacheW = (MediaQuery.sizeOf(context).width *
+                          MediaQuery.of(context).devicePixelRatio)
+                      .round();
+                  final img = Image.file(File(bgPath),
+                      fit: _bgFit,
+                      alignment: _bgAlignment,
+                      cacheWidth: cacheW);
+                  return _glassBgBlur
+                      ? ImageFiltered(
+                          imageFilter: ui.ImageFilter.blur(
+                            sigmaX: _glassBlur,
+                            sigmaY: _glassBlur,
+                            tileMode: TileMode.clamp,
+                          ),
+                          child: img,
+                        )
+                      : img;
+                })
               : _GlassFallback(accent: t.accentLight),
         ),
       ),
@@ -692,10 +702,15 @@ class _ChatScreenState extends State<ChatScreen> {
     );
 
     if (!_glassEnabled && _wallpaperPath != null) {
+      final cacheW = (MediaQuery.sizeOf(context).width *
+              MediaQuery.of(context).devicePixelRatio)
+          .round();
       list = Container(
         decoration: BoxDecoration(
           image: DecorationImage(
-            image: FileImage(File(_wallpaperPath!)),
+            // Decode the wallpaper at screen size, not photo size.
+            image: ResizeImage(FileImage(File(_wallpaperPath!)),
+                width: cacheW),
             fit: _bgFit,
             alignment: _bgAlignment,
             opacity: 0.25,
@@ -1167,6 +1182,9 @@ class _WallpaperPositionSheetState extends State<_WallpaperPositionSheet> {
                 File(widget.wallpaperPath),
                 fit:       _fit,
                 alignment: _alignment,
+                // 140px preview — don't decode the wallpaper at full res.
+                cacheHeight:
+                    (140 * MediaQuery.of(context).devicePixelRatio).round(),
               ),
             ),
           ),

@@ -38,6 +38,37 @@ class MainActivity : FlutterActivity() {
             "phantom/system",
         ).setMethodCallHandler { call, result ->
             when (call.method) {
+                // First frame of a video as a JPEG (scaled to maxWidth). Used
+                // as the chat-bubble poster so the list never holds live
+                // MediaCodec instances (hard limits on low-end devices).
+                // MediaMetadataRetriever must not run on the UI thread.
+                "getVideoThumbnail" -> {
+                    val args = call.arguments as Map<*, *>
+                    val path = args["path"] as String
+                    val maxW = (args["maxWidth"] as? Int) ?: 512
+                    Thread {
+                        var reply: ByteArray? = null
+                        try {
+                            val mmr = android.media.MediaMetadataRetriever()
+                            mmr.setDataSource(path)
+                            var bmp = mmr.frameAtTime
+                            mmr.release()
+                            if (bmp != null) {
+                                if (bmp.width > maxW) {
+                                    val h = (bmp.height.toLong() * maxW / bmp.width)
+                                        .toInt().coerceAtLeast(1)
+                                    bmp = Bitmap.createScaledBitmap(bmp, maxW, h, true)
+                                }
+                                val out = ByteArrayOutputStream()
+                                bmp.compress(Bitmap.CompressFormat.JPEG, 82, out)
+                                reply = out.toByteArray()
+                            }
+                        } catch (_: Exception) {
+                            reply = null
+                        }
+                        runOnUiThread { result.success(reply) }
+                    }.start()
+                }
                 "getDeviceWallpaper" -> {
                     try {
                         val wm  = WallpaperManager.getInstance(applicationContext)

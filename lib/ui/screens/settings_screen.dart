@@ -708,15 +708,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
       Positioned.fill(
         child: RepaintBoundary(
           child: bgPath != null
-              ? _glassBgBlur
-                  ? ImageFiltered(
-                      imageFilter: ui.ImageFilter.blur(
-                        sigmaX: _glassBlur,
-                        sigmaY: _glassBlur,
-                        tileMode: TileMode.clamp,
-                      ),
-                      child: Image.file(File(bgPath), fit: BoxFit.cover))
-                  : Image.file(File(bgPath), fit: BoxFit.cover)
+              ? Builder(builder: (context) {
+                  // Decode at screen size — blur cost scales with the bitmap.
+                  final cacheW = (MediaQuery.sizeOf(context).width *
+                          MediaQuery.of(context).devicePixelRatio)
+                      .round();
+                  final img = Image.file(File(bgPath),
+                      fit: BoxFit.cover, cacheWidth: cacheW);
+                  return _glassBgBlur
+                      ? ImageFiltered(
+                          imageFilter: ui.ImageFilter.blur(
+                            sigmaX: _glassBlur,
+                            sigmaY: _glassBlur,
+                            tileMode: TileMode.clamp,
+                          ),
+                          child: img)
+                      : img;
+                })
               : Container(color: t.bgBase),
         ),
       ),

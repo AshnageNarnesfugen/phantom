@@ -288,11 +288,18 @@ class ChatBubble extends StatelessWidget {
         if (mediaContent != null) {
           return ClipRRect(
             borderRadius: BorderRadius.circular(10),
-            child: Image.memory(
-              mediaContent!,
-              fit: BoxFit.cover,
-              errorBuilder: (_, __, ___) => _fallbackText(textColor),
-            ),
+            child: Builder(builder: (context) {
+              // Decode at bubble size, not sender resolution: a 4000px photo
+              // decoded full-res costs ~48MB of bitmap + jank on low-end
+              // devices; capped at the bubble's real pixel width it's ~1MB.
+              final dpr = MediaQuery.of(context).devicePixelRatio;
+              return Image.memory(
+                mediaContent!,
+                fit: BoxFit.cover,
+                cacheWidth: (260 * dpr).round(),
+                errorBuilder: (_, __, ___) => _fallbackText(textColor),
+              );
+            }),
           );
         }
         return _fallbackText(textColor);
@@ -311,7 +318,11 @@ class ChatBubble extends StatelessWidget {
               lower.endsWith('.webm') || lower.endsWith('.mkv') ||
               lower.endsWith('.3gp') || lower.endsWith('.avi') ||
               lower.endsWith('.m4v');
-          final bytes = nullIdx >= 0 ? mediaContent!.sublist(nullIdx + 1) : null;
+          // View, not copy: sublist() would duplicate the whole payload
+          // (megabytes for a video) on every rebuild of this bubble.
+          final bytes = nullIdx >= 0
+              ? Uint8List.sublistView(mediaContent!, nullIdx + 1)
+              : null;
           if (isAudio && bytes != null) {
             return _AudioPlayerBubble(bytes: bytes, textColor: textColor);
           }
@@ -461,7 +472,11 @@ class _AudioPlayerBubble extends StatefulWidget {
 }
 
 class _AudioPlayerBubbleState extends State<_AudioPlayerBubble> {
-  final _player = AudioPlayer();
+  // Lazy: each AudioPlayer is a native MediaPlayer instance. Creating it
+  // eagerly meant every voice note scrolled into view allocated one even if
+  // never played — real pressure on low-end devices. Now it exists only from
+  // the first tap until the bubble is disposed.
+  AudioPlayer? _player;
   PlayerState _playerState = PlayerState.stopped;
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
@@ -469,39 +484,43 @@ class _AudioPlayerBubbleState extends State<_AudioPlayerBubble> {
 
   bool get _playing => _playerState == PlayerState.playing;
 
-  @override
-  void initState() {
-    super.initState();
-    _subs.add(_player.onPlayerStateChanged.listen((s) {
+  AudioPlayer _ensurePlayer() {
+    final existing = _player;
+    if (existing != null) return existing;
+    final p = AudioPlayer();
+    _subs.add(p.onPlayerStateChanged.listen((s) {
       if (mounted) setState(() => _playerState = s);
     }));
-    _subs.add(_player.onPositionChanged.listen((p) {
-      if (mounted) setState(() => _position = p);
+    _subs.add(p.onPositionChanged.listen((pos) {
+      if (mounted) setState(() => _position = pos);
     }));
-    _subs.add(_player.onDurationChanged.listen((d) {
+    _subs.add(p.onDurationChanged.listen((d) {
       if (mounted) setState(() => _duration = d);
     }));
     // Reset position to zero when playback finishes so next tap starts fresh.
-    _subs.add(_player.onPlayerComplete.listen((_) {
+    _subs.add(p.onPlayerComplete.listen((_) {
       if (mounted) setState(() => _position = Duration.zero);
     }));
+    _player = p;
+    return p;
   }
 
   @override
   void dispose() {
     for (final s in _subs) { s.cancel(); }
-    _player.dispose();
+    _player?.dispose();
     super.dispose();
   }
 
   Future<void> _toggle() async {
+    final player = _ensurePlayer();
     if (_playerState == PlayerState.playing) {
-      await _player.pause();
+      await player.pause();
     } else if (_playerState == PlayerState.paused) {
-      await _player.resume();
+      await player.resume();
     } else {
       // stopped or completed — play from beginning
-      await _player.play(BytesSource(widget.bytes));
+      await player.play(BytesSource(widget.bytes));
     }
   }
 
@@ -671,8 +690,11 @@ class _VideoTile extends StatefulWidget {
 }
 
 class _VideoTileState extends State<_VideoTile> {
-  VideoPlayerController? _ctrl;
+  static const _systemChannel = MethodChannel('phantom/system');
+
+  VideoPlayerController? _ctrl; // fallback path only (no native thumbnailer)
   File? _file;
+  File? _poster;
   bool _failed = false;
 
   @override
@@ -689,6 +711,27 @@ class _VideoTileState extends State<_VideoTile> {
           '${widget.bytes.take(8).join()}_${widget.bytes.reversed.take(8).join()}';
       final file = File('${dir.path}/ph_vid_${key.hashCode}.mp4');
       if (!await file.exists()) await file.writeAsBytes(widget.bytes);
+
+      // Poster-first: extract the first frame ONCE as a JPEG (native
+      // MediaMetadataRetriever, cached on disk) and render a plain image.
+      // The old approach kept a live VideoPlayerController per bubble just to
+      // show frame 0 — each one is a hardware MediaCodec + SurfaceTexture, and
+      // low-end devices cap out at a handful of concurrent codecs. Now the
+      // only live codec is the fullscreen player while it's open.
+      final poster = File('${dir.path}/ph_vid_${key.hashCode}.jpg');
+      if (!await poster.exists()) {
+        try {
+          final jpeg = await _systemChannel.invokeMethod<Uint8List>(
+              'getVideoThumbnail', {'path': file.path, 'maxWidth': 640});
+          if (jpeg != null && jpeg.isNotEmpty) await poster.writeAsBytes(jpeg);
+        } catch (_) {/* channel unavailable (desktop) → controller fallback */}
+      }
+      if (await poster.exists()) {
+        if (mounted) setState(() { _file = file; _poster = poster; });
+        return;
+      }
+
+      // Fallback (no thumbnailer): the previous live-controller poster.
       final ctrl = VideoPlayerController.file(file);
       await ctrl.initialize();
       await ctrl.seekTo(Duration.zero); // ensure the first frame is shown
@@ -718,8 +761,43 @@ class _VideoTileState extends State<_VideoTile> {
     super.dispose();
   }
 
+  Widget _playOverlay() => Center(
+        child: Container(
+          width: 54, height: 54,
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.45),
+            shape: BoxShape.circle,
+          ),
+          child: const Icon(Icons.play_arrow_rounded,
+              color: Colors.white, size: 36),
+        ),
+      );
+
   @override
   Widget build(BuildContext context) {
+    // Poster path (normal on Android): a plain JPEG — no codec, no texture.
+    final poster = _poster;
+    if (poster != null) {
+      final dpr = MediaQuery.of(context).devicePixelRatio;
+      return GestureDetector(
+        onTap: _openFullscreen,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 260, maxHeight: 320),
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                Image.file(poster, cacheWidth: (260 * dpr).round()),
+                _playOverlay(),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    // Fallback path: live controller poster (desktop / thumbnailer failed).
     final ctrl = _ctrl;
     final ready = ctrl != null && ctrl.value.isInitialized;
     final aspect = ready ? ctrl.value.aspectRatio : 16 / 9;
@@ -750,18 +828,7 @@ class _VideoTileState extends State<_VideoTile> {
                                   strokeWidth: 2, color: Colors.white70)),
                     ),
                   ),
-                if (ready)
-                  Center(
-                    child: Container(
-                      width: 54, height: 54,
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.45),
-                        shape: BoxShape.circle,
-                      ),
-                      child: const Icon(Icons.play_arrow_rounded,
-                          color: Colors.white, size: 36),
-                    ),
-                  ),
+                if (ready) _playOverlay(),
               ],
             ),
           ),
@@ -1823,7 +1890,11 @@ class _Avatar extends StatelessWidget {
             ),
             image: avatarBytes != null
                 ? DecorationImage(
-                    image: MemoryImage(avatarBytes!),
+                    // 44px tile — decode small, not at the stored 512px.
+                    image: ResizeImage(MemoryImage(avatarBytes!),
+                        width:
+                            (44 * MediaQuery.of(context).devicePixelRatio)
+                                .round()),
                     fit: BoxFit.cover,
                   )
                 : null,
