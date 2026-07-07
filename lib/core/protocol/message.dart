@@ -26,6 +26,15 @@ enum MessageType {
   text(0x01),
   image(0x02),
   file(0x03),
+  // Text with a SENDER-generated link preview (Signal-style): the sender
+  // fetched the page and embedded {url,title,desc,img} as JSON, so the
+  // receiver renders a card without ever contacting the site (no IP leak on
+  // receipt). Only created when the opt-in setting is enabled.
+  linkPreview(0x04),
+  // Group chat (pairwise fanout): an envelope carrying an inner message for a
+  // group conversation, and the membership-control channel.
+  groupEnvelope(0x40),
+  groupControl(0x41),
   typingIndicator(0x10),
   readReceipt(0x11),
   keyExchange(0x20),
@@ -344,13 +353,18 @@ enum MessageDirection { outgoing, incoming }
 @immutable
 class StoredMessage {
   final String id;
-  final String conversationId; // phantomId of the contact
+  final String conversationId; // phantomId of the contact, or grp_<gid>
   final MessageType type;
   final Uint8List content;
   final int timestampUs;
   final MessageDirection direction;
   final MessageStatus status;
   final String? replyToId;
+
+  /// Actual author of the message — only set in GROUP conversations, where
+  /// [conversationId] is the group and can't identify the sender. Null in 1:1
+  /// chats (the conversationId IS the sender for incoming).
+  final String? senderId;
 
   const StoredMessage({
     required this.id,
@@ -361,6 +375,7 @@ class StoredMessage {
     required this.direction,
     required this.status,
     this.replyToId,
+    this.senderId,
   });
 
   /// Message text (only valid when type == text).
@@ -379,6 +394,7 @@ class StoredMessage {
       direction: direction,
       status: status ?? this.status,
       replyToId: replyToId,
+      senderId: senderId,
     );
   }
 
@@ -387,6 +403,7 @@ class StoredMessage {
     required String conversationId,
     required MessageDirection direction,
     MessageStatus status = MessageStatus.sending,
+    String? senderId,
   }) {
     return StoredMessage(
       id: msg.id,
@@ -399,6 +416,7 @@ class StoredMessage {
       direction: direction,
       status: status,
       replyToId: msg.replyToId,
+      senderId: senderId,
     );
   }
 }

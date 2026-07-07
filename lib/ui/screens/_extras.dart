@@ -776,3 +776,284 @@ class _OnionNode extends StatelessWidget {
     );
   }
 }
+
+// ── QR: show my contact address / scan a contact's ───────────────────────────
+// The CA (v3 ≈ 1.4 KB → ~1.9 K base64url chars) fits in a dense-but-scannable
+// QR. Rendering forces a white card so the code has contrast in both themes.
+
+class _MyQrScreen extends StatelessWidget {
+  final String contactAddress;
+  const _MyQrScreen({required this.contactAddress});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = PhantomTheme.tokensOf(context);
+    return Scaffold(
+      backgroundColor: t.bgBase,
+      appBar: AppBar(
+        backgroundColor: t.bgSurface,
+        elevation: 0,
+        leading: IconButton(
+          icon: Icon(Icons.close, color: t.textSecondary, size: 20),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Text('my contact address',
+            style: TextStyle(
+                color: t.textPrimary, fontFamily: 'monospace', fontSize: 16)),
+      ),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: QrImageView(
+                  data: contactAddress,
+                  version: QrVersions.auto,
+                  size: 300,
+                  gapless: true,
+                  backgroundColor: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                'have your contact scan this from\n"add contact → scan QR"',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                    color: t.textSecondary,
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    height: 1.5),
+              ),
+              const SizedBox(height: 12),
+              TextButton.icon(
+                onPressed: () =>
+                    Clipboard.setData(ClipboardData(text: contactAddress)),
+                icon: Icon(Icons.copy_outlined, size: 14, color: t.accentLight),
+                label: Text('copy as text',
+                    style: TextStyle(
+                        color: t.accentLight,
+                        fontFamily: 'monospace',
+                        fontSize: 12)),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _QrScanScreen extends StatefulWidget {
+  const _QrScanScreen();
+
+  @override
+  State<_QrScanScreen> createState() => _QrScanScreenState();
+}
+
+class _QrScanScreenState extends State<_QrScanScreen> {
+  bool _done = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.close, color: Colors.white70, size: 20),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: const Text('scan contact QR',
+            style: TextStyle(
+                color: Colors.white, fontFamily: 'monospace', fontSize: 16)),
+      ),
+      body: Stack(children: [
+        ReaderWidget(
+          showFlashlight: true,
+          showGallery: false,
+          tryInverted: true,
+          onScan: (Code code) async {
+            final text = code.text;
+            if (_done || text == null || text.isEmpty) return;
+            _done = true; // ReaderWidget keeps scanning; pop exactly once
+            Navigator.of(context).pop(text);
+          },
+        ),
+        Positioned(
+          left: 0, right: 0, bottom: 32,
+          child: Text(
+            'point at your contact\'s QR',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.8),
+                fontFamily: 'monospace',
+                fontSize: 12,
+                shadows: const [Shadow(color: Colors.black, blurRadius: 6)]),
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// ── Create Group ──────────────────────────────────────────────────────────────
+
+class CreateGroupScreen extends StatefulWidget {
+  const CreateGroupScreen({super.key});
+
+  @override
+  State<CreateGroupScreen> createState() => _CreateGroupScreenState();
+}
+
+class _CreateGroupScreenState extends State<CreateGroupScreen> {
+  final _nameCtrl = TextEditingController();
+  final Set<String> _selected = {};
+  List<ContactRecord>? _contacts;
+  String? _error;
+  bool _creating = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_contacts == null) {
+      final core = CoreProvider.of(context).core;
+      core?.getContacts().then((cs) {
+        if (mounted) {
+          setState(() =>
+              _contacts = cs.where((c) => !c.isArchived).toList());
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _nameCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _create() async {
+    final name = _nameCtrl.text.trim();
+    if (name.isEmpty) {
+      setState(() => _error = 'give the group a name');
+      return;
+    }
+    if (_selected.isEmpty) {
+      setState(() => _error = 'pick at least one member');
+      return;
+    }
+    final core = CoreProvider.of(context).core;
+    if (core == null) return;
+    setState(() { _creating = true; _error = null; });
+    try {
+      final g = await core.createGroup(
+          name: name, memberIds: _selected.toList());
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(_AppRoute(
+          builder: (_) => ChatScreen(
+              contactName: g.name,
+              contactId: groupConversationId(g.gid),
+              isGroup: true)));
+    } catch (_) {
+      if (mounted) {
+        setState(() { _creating = false; _error = 'could not create group'; });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = PhantomTheme.tokensOf(context);
+    return Scaffold(
+      backgroundColor: t.bgBase,
+      appBar: AppBar(
+        backgroundColor: t.bgSurface,
+        elevation: 0,
+        leading: IconButton(
+          icon: Icon(Icons.close, color: t.textSecondary, size: 20),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Text('new group',
+            style: TextStyle(
+                color: t.textPrimary, fontFamily: 'monospace', fontSize: 16)),
+      ),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(24, 16, 24, 0),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('group name',
+                style: TextStyle(
+                    color: t.textSecondary,
+                    fontFamily: 'monospace',
+                    fontSize: 12)),
+            const SizedBox(height: 8),
+            _PhantomField(
+              controller: _nameCtrl,
+              hint: 'the crew',
+              error: _error,
+              onChanged: (_) => setState(() => _error = null),
+            ),
+            const SizedBox(height: 16),
+            Text('members (${_selected.length} selected)',
+                style: TextStyle(
+                    color: t.textSecondary,
+                    fontFamily: 'monospace',
+                    fontSize: 12)),
+          ]),
+        ),
+        Expanded(
+          child: _contacts == null
+              ? Center(
+                  child: CircularProgressIndicator(
+                      color: t.accentLight, strokeWidth: 1))
+              : _contacts!.isEmpty
+                  ? Center(
+                      child: Text('add contacts first',
+                          style: TextStyle(
+                              color: t.textDisabled,
+                              fontFamily: 'monospace',
+                              fontSize: 13)))
+                  : ListView.builder(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      itemCount: _contacts!.length,
+                      itemBuilder: (ctx, i) {
+                        final c = _contacts![i];
+                        final on = _selected.contains(c.phantomId);
+                        return CheckboxListTile(
+                          value: on,
+                          activeColor: t.accentLight,
+                          checkColor: t.bgBase,
+                          title: Text(c.displayName,
+                              style: TextStyle(
+                                  color: t.textPrimary,
+                                  fontFamily: 'monospace',
+                                  fontSize: 14)),
+                          onChanged: (v) => setState(() => v == true
+                              ? _selected.add(c.phantomId)
+                              : _selected.remove(c.phantomId)),
+                        );
+                      },
+                    ),
+        ),
+        SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: _creating
+                ? Center(
+                    child: CircularProgressIndicator(
+                        color: t.accentLight, strokeWidth: 1))
+                : _PhantomButton(label: 'create group', onTap: _create),
+          ),
+        ),
+      ]),
+    );
+  }
+}

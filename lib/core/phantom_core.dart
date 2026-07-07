@@ -14,6 +14,9 @@ import 'crypto/hybrid_kem.dart';
 import 'crypto/native/phantom_crypto_native.dart';
 import 'crypto/safety_number.dart';
 import 'crypto/x3dh.dart';
+import 'package:uuid/uuid.dart';
+import 'groups.dart';
+import 'link_preview_service.dart';
 import 'protocol/message.dart';
 import 'protocol/frame.dart';
 import 'storage/phantom_storage.dart';
@@ -573,6 +576,24 @@ class PhantomCore {
     required String text,
     String? replyToId,
   }) async {
+    // Opt-in sender-generated link preview: only when the setting is on AND
+    // the text carries a URL. The fetch happens HERE (the sender already
+    // reveals themselves to the site by having visited it); the receiver
+    // renders the embedded card with zero network activity.
+    if (((await storage.getSetting<bool>('link_previews_enabled')) ?? false) &&
+        LinkPreviewService.firstUrl(text) != null) {
+      final content = await LinkPreviewService.buildContent(text);
+      if (content != null) {
+        return _sendPhantomMessage(
+          recipientId: recipientId,
+          message: PhantomMessage(
+            type: MessageType.linkPreview,
+            content: content,
+            replyToId: replyToId,
+          ),
+        );
+      }
+    }
     return _sendPhantomMessage(
       recipientId: recipientId,
       message: PhantomMessage.text(text, replyToId: replyToId),
@@ -596,6 +617,40 @@ class PhantomCore {
     required Uint8List bytes,
     required String fileName,
   }) async {
+    final built = await _buildOutgoingFileContent(bytes, fileName);
+
+    final stored = await _sendPhantomMessage(
+      recipientId: recipientId,
+      message: PhantomMessage(type: built.type, content: built.wire),
+    );
+
+    // Inline path: the wire IS the display form — nothing to rewrite.
+    if (identical(built.wire, built.display)) return stored;
+
+    // CID path: the wire payload (name+CID) is what got persisted by
+    // _sendPhantomMessage, but the UI renders messages straight from storage —
+    // images expect raw bytes and files expect `name\0bytes`. We already hold
+    // the original bytes, so persist the displayable form locally instead of
+    // forcing our own chat to download the CID.
+    final display = stored.copyWith(content: built.display);
+    await storage.saveMessage(display);
+
+    // NOTE: no idle shutdown here. The IPFS daemon also carries presence
+    // heartbeats and the pubsub fallback channel; killing it 5 minutes after
+    // a file send silently disabled both for the rest of the session (and a
+    // later restart binds a NEW dynamic API port that the already-constructed
+    // transports would never learn about).
+
+    return display;
+  }
+
+  /// Wire + local-display content for an outgoing media message. Small media
+  /// (≤ [inlineMediaMax]) travels inline — the wire IS the display form (same
+  /// object identity). Large media uploads to IPFS and the wire is the
+  /// `[name_len][name][size(4 BE)][CID]` pointer. Shared by the 1:1 and group
+  /// send paths so groups get the exact same media semantics.
+  Future<({MessageType type, Uint8List wire, Uint8List display})>
+      _buildOutgoingFileContent(Uint8List bytes, String fileName) async {
     // The wire format reserves a single byte for the name length, so the
     // name must fit in 255 UTF-8 bytes. Trim from the front to preserve the
     // extension (the receiver uses it to pick image/audio rendering).
@@ -609,36 +664,23 @@ class PhantomCore {
         lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp');
 
     final type = isImage ? MessageType.image : MessageType.file;
+    final display =
+        isImage ? bytes : encodeFileDisplayContent(safeName, bytes);
 
-    // ── Inline path: small media needs no IPFS at all ─────────────────────
-    // The content sent IS the display form (raw bytes for images,
-    // name\0bytes for files/audio), which the receiver renders directly:
-    // tryParseFileWireContent returns null for it, so no resolution step,
-    // no dependency on anyone's IPFS daemon, store-and-forward included.
+    // Inline: the receiver renders the content directly (no resolution step,
+    // no dependency on anyone's IPFS daemon, store-and-forward included).
     if (bytes.length <= inlineMediaMax) {
-      return _sendPhantomMessage(
-        recipientId: recipientId,
-        message: PhantomMessage(
-          type: type,
-          content:
-              isImage ? bytes : encodeFileDisplayContent(safeName, bytes),
-        ),
-      );
+      return (type: type, wire: display, display: display);
     }
 
-    // ── CID path: large media via IPFS ────────────────────────────────────
-    // 1. IPFS On-Demand: Ensure the daemon is running only when needed
+    // CID: upload + pin, ship the pointer.
     await IpfsDaemon.instance.ensure();
-
-    // 2. Upload file to IPFS and pin it locally
     final cid = await IpfsDaemon.instance.uploadFile(bytes, safeName);
 
-    // 3. Wire format for files: [name_len(1)][fileName][size(4 BE)][CID].
-    // The size lets the receiver show "Download · N MB" before fetching.
     final nameBytes = utf8.encode(safeName);
     final cidBytes = utf8.encode(cid);
     final sz = bytes.length;
-    final content = Uint8List(1 + nameBytes.length + 4 + cidBytes.length)
+    final wire = Uint8List(1 + nameBytes.length + 4 + cidBytes.length)
       ..[0] = nameBytes.length
       ..setAll(1, nameBytes)
       ..[1 + nameBytes.length] = (sz >> 24) & 0xff
@@ -646,30 +688,354 @@ class PhantomCore {
       ..[3 + nameBytes.length] = (sz >> 8) & 0xff
       ..[4 + nameBytes.length] = sz & 0xff
       ..setAll(5 + nameBytes.length, cidBytes);
+    return (type: type, wire: wire, display: display);
+  }
 
-    // 4. Send CID via Waku (WakuTransport will handle this in _sendPhantomMessage)
-    final stored = await _sendPhantomMessage(
-      recipientId: recipientId,
-      message: PhantomMessage(type: type, content: content),
+  // ── Groups (serverless, pairwise fanout — see core/groups.dart) ─────────────
+
+  /// Creates a group, persists it and broadcasts the membership snapshot to
+  /// every member (each copy E2E-encrypted through the 1:1 session).
+  Future<GroupRecord> createGroup({
+    required String name,
+    required List<String> memberIds,
+  }) async {
+    final now = DateTime.now().microsecondsSinceEpoch;
+    final group = GroupRecord(
+      gid: GroupRecord.newGid(),
+      name: name,
+      creatorId: myId,
+      memberIds: {myId, ...memberIds}.toList(),
+      createdAtUs: now,
+      updatedAtUs: now,
     );
+    await storage.saveGroup(group);
+    await _broadcastGroupControl(group);
+    return group;
+  }
 
-    // 5. The wire payload (name+CID) is what got persisted by
-    //    _sendPhantomMessage, but the UI renders messages straight from
-    //    storage — images expect raw bytes and files expect `name\0bytes`.
-    //    We already hold the original bytes, so persist the displayable
-    //    form locally instead of forcing our own chat to download the CID.
-    final display = stored.copyWith(
-      content: isImage ? bytes : encodeFileDisplayContent(safeName, bytes),
+  Future<List<GroupRecord>> getGroups() => storage.getGroups();
+  Future<GroupRecord?> getGroup(String gid) => storage.getGroup(gid);
+
+  Future<void> addGroupMembers(String gid, List<String> newMemberIds) async {
+    final g = await storage.getGroup(gid);
+    if (g == null) return;
+    final updated = g.copyWith(
+      memberIds: {...g.memberIds, ...newMemberIds}.toList(),
+      updatedAtUs: DateTime.now().microsecondsSinceEpoch,
     );
-    await storage.saveMessage(display);
+    await storage.saveGroup(updated);
+    await _broadcastGroupControl(updated);
+    _emitGroupEvent(updated.gid);
+  }
 
-    // NOTE: no idle shutdown here. The IPFS daemon also carries presence
-    // heartbeats and the pubsub fallback channel; killing it 5 minutes after
-    // a file send silently disabled both for the rest of the session (and a
-    // later restart binds a NEW dynamic API port that the already-constructed
-    // transports would never learn about).
+  Future<void> renameGroup(String gid, String name) async {
+    final g = await storage.getGroup(gid);
+    if (g == null) return;
+    final updated = g.copyWith(
+        name: name, updatedAtUs: DateTime.now().microsecondsSinceEpoch);
+    await storage.saveGroup(updated);
+    await _broadcastGroupControl(updated);
+    _emitGroupEvent(updated.gid);
+  }
 
-    return display;
+  /// Announce our departure to the members, then remove the group locally.
+  Future<void> leaveGroup(String gid) async {
+    final g = await storage.getGroup(gid);
+    if (g == null) return;
+    await _broadcastGroupControl(g, action: 'leave');
+    await storage.deleteGroup(gid);
+    await storage.clearMessages(groupConversationId(gid));
+    _emitGroupEvent(gid);
+  }
+
+  Future<StoredMessage> sendGroupMessage({
+    required String gid,
+    required String text,
+  }) async {
+    return _sendToGroup(
+      gid: gid,
+      innerType: MessageType.text,
+      content: Uint8List.fromList(utf8.encode(text)),
+    );
+  }
+
+  Future<StoredMessage> sendGroupFile({
+    required String gid,
+    required Uint8List bytes,
+    required String fileName,
+  }) async {
+    final built = await _buildOutgoingFileContent(bytes, fileName);
+    return _sendToGroup(
+      gid: gid,
+      innerType: built.type,
+      content: built.wire,
+      displayContent:
+          identical(built.wire, built.display) ? null : built.display,
+    );
+  }
+
+  /// Fanout: ONE local StoredMessage under the group conversation, one
+  /// encrypted copy per member through the normal 1:1 machinery (which
+  /// auto-handshakes members we've never messaged). Per-member failures are
+  /// logged, not fatal — store-and-forward picks up offline members.
+  Future<StoredMessage> _sendToGroup({
+    required String gid,
+    required MessageType innerType,
+    required Uint8List content,
+    Uint8List? displayContent,
+  }) async {
+    final g = await storage.getGroup(gid);
+    if (g == null) {
+      throw const PhantomCoreException('Unknown group.');
+    }
+    final envelope = packGroupEnvelope(gid, innerType, content);
+    final message =
+        PhantomMessage(type: MessageType.groupEnvelope, content: envelope);
+
+    final stored = StoredMessage(
+      id: message.id,
+      conversationId: groupConversationId(gid),
+      type: innerType,
+      content: displayContent ?? content,
+      timestampUs: DateTime.now().microsecondsSinceEpoch,
+      direction: MessageDirection.outgoing,
+      status: MessageStatus.sent,
+      senderId: myId,
+    );
+    await storage.saveMessage(stored);
+
+    final dbg = TransportDebugger.instance;
+    await Future.wait(g.memberIds.where((m) => m != myId).map((m) async {
+      try {
+        // Same PhantomMessage id for every copy — it's one logical message.
+        await _sendPhantomMessage(
+          recipientId: m,
+          message: PhantomMessage(
+            id: message.id,
+            type: MessageType.groupEnvelope,
+            content: envelope,
+          ),
+        );
+      } catch (e) {
+        dbg.log('GROUP: ✗ fanout to ${m.substring(0, 8)} failed: $e');
+      }
+    }));
+    return stored;
+  }
+
+  /// Sends the group snapshot (or our departure) to every member. Each
+  /// member's ContactAddress rides along when we can rebuild it, so receivers
+  /// can auto-add members they don't know yet.
+  Future<void> _broadcastGroupControl(GroupRecord g,
+      {String action = 'sync'}) async {
+    final members = <String, String?>{};
+    for (final id in g.memberIds) {
+      if (id == myId) {
+        members[id] = await getMyContactAddress();
+      } else {
+        members[id] = await _caOfContact(id);
+      }
+    }
+    final control = GroupControl(
+      gid: g.gid,
+      action: action,
+      name: g.name,
+      creatorId: g.creatorId,
+      members: members,
+      tsUs: g.updatedAtUs,
+    );
+    final content = control.encode();
+
+    final dbg = TransportDebugger.instance;
+    await Future.wait(g.memberIds.where((m) => m != myId).map((m) async {
+      try {
+        await _sendPhantomMessage(
+          recipientId: m,
+          message: PhantomMessage(
+              type: MessageType.groupControl, content: content),
+        );
+      } catch (e) {
+        dbg.log('GROUP: ✗ control to ${m.substring(0, 8)} failed: $e');
+      }
+    }));
+  }
+
+  /// Rebuilds a shareable ContactAddress for a stored contact, or null when
+  /// the record lacks real key material (e.g. a placeholder auto-saved from a
+  /// pre-v3 INIT). Those members resolve lazily: their first group message
+  /// carries their own INIT CA, which auto-saves the contact.
+  Future<String?> _caOfContact(String contactId) async {
+    final c = await storage.getContact(contactId);
+    if (c == null) return null;
+    final zeros = Uint8List(32);
+    if (_bytesEq(c.signingPublicKeyBytes, zeros) ||
+        _bytesEq(c.signedPreKeyBytes, zeros)) {
+      return null; // placeholder record — no valid CA can be built
+    }
+    try {
+      return ContactAddress(
+        x25519IdentityKey: c.encryptionPublicKeyBytes,
+        ed25519SigningKey: c.signingPublicKeyBytes,
+        signedPreKeyBytes: c.signedPreKeyBytes,
+        signedPreKeyId: c.signedPreKeyId,
+        signature: c.signedPreKeySignature,
+        kyber768PublicKeyBytes: c.kyber768PublicKeyBytes,
+        identityKeySignature: c.identityKeySignature,
+      ).encode();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static bool _bytesEq(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  /// Membership snapshot (or departure) from another member. Controls are
+  /// idempotent full snapshots, so ordering/duplication never corrupts state.
+  Future<void> _handleGroupControl(String senderId, PhantomMessage msg) async {
+    final dbg = TransportDebugger.instance;
+    final ctrl = GroupControl.decode(msg.content);
+    if (ctrl == null) {
+      dbg.log('GROUP: ✗ malformed control from ${senderId.substring(0, 8)}');
+      return;
+    }
+    // The (authenticated) sender must be part of the group it's describing.
+    if (!ctrl.members.containsKey(senderId) && ctrl.action != 'leave') {
+      dbg.log('GROUP: ✗ control from non-member ${senderId.substring(0, 8)}');
+      return;
+    }
+
+    final existing = await storage.getGroup(ctrl.gid);
+
+    if (ctrl.action == 'leave') {
+      if (existing == null) return;
+      final updated = existing.copyWith(
+        memberIds: existing.memberIds.where((m) => m != senderId).toList(),
+        updatedAtUs: DateTime.now().microsecondsSinceEpoch,
+      );
+      await storage.saveGroup(updated);
+      dbg.log('GROUP: ${senderId.substring(0, 8)} left ${ctrl.name}');
+      _emitGroupEvent(ctrl.gid);
+      return;
+    }
+
+    // 'sync': upsert the snapshot unless ours is strictly newer.
+    if (existing != null && existing.updatedAtUs > ctrl.tsUs) return;
+    final wasKnown = existing != null;
+    await storage.saveGroup(GroupRecord(
+      gid: ctrl.gid,
+      name: ctrl.name,
+      creatorId: ctrl.creatorId,
+      memberIds: ctrl.members.keys.toList(),
+      createdAtUs: existing?.createdAtUs ?? ctrl.tsUs,
+      updatedAtUs: ctrl.tsUs,
+    ));
+    dbg.log('GROUP: ✓ sync "${ctrl.name}" (${ctrl.members.length} members) '
+        'from ${senderId.substring(0, 8)}');
+
+    // Auto-add members we don't know yet (their CA rides in the control), so
+    // our fanout can reach them. Failures are non-fatal: a member without a
+    // usable CA resolves lazily when their first message's INIT CA auto-saves.
+    for (final e in ctrl.members.entries) {
+      if (e.key == myId || e.value == null) continue;
+      if (await storage.getContact(e.key) != null) continue;
+      try {
+        await addContact(contactAddress: e.value!);
+        dbg.log('GROUP: auto-added member ${e.key.substring(0, 8)}');
+      } catch (err) {
+        dbg.log('GROUP: could not auto-add ${e.key.substring(0, 8)}: $err');
+      }
+    }
+
+    _emitGroupEvent(ctrl.gid);
+    if (!wasKnown) {
+      final contact = await storage.getContact(senderId);
+      NotificationService.showMessage(
+        contactName: ctrl.name,
+        preview: 'added to group by '
+            '${contact?.displayName ?? senderId.substring(0, 6)}',
+        contactId: groupConversationId(ctrl.gid),
+      );
+    }
+  }
+
+  /// A chat message for a group we're in: re-home it from the 1:1 session to
+  /// the group conversation, keeping the real author for attribution.
+  Future<void> _handleGroupEnvelope(String senderId, PhantomMessage msg) async {
+    final dbg = TransportDebugger.instance;
+    final env = unpackGroupEnvelope(msg.content);
+    if (env == null) {
+      dbg.log('GROUP: ✗ malformed envelope from ${senderId.substring(0, 8)}');
+      return;
+    }
+    final g = await storage.getGroup(env.gid);
+    if (g == null) {
+      // Control not arrived yet (out-of-order store replay). The message is
+      // lost for v1 — acceptable: the sender's snapshot will re-sync us.
+      dbg.log('GROUP: envelope for unknown group ${env.gid.substring(0, 8)}');
+      return;
+    }
+    if (!g.memberIds.contains(senderId)) {
+      dbg.log('GROUP: ✗ envelope from non-member ${senderId.substring(0, 8)}');
+      return;
+    }
+
+    final stored = StoredMessage(
+      id: msg.id,
+      conversationId: groupConversationId(env.gid),
+      type: env.innerType,
+      content: env.content,
+      timestampUs: DateTime.now().microsecondsSinceEpoch,
+      direction: MessageDirection.incoming,
+      status: MessageStatus.delivered,
+      senderId: senderId,
+    );
+    await storage.saveMessage(stored);
+    _incomingController.add(stored);
+
+    // Media pointers resolve exactly like 1:1 — the machinery is keyed by
+    // conversationId, which is the group here.
+    if (stored.type == MessageType.image || stored.type == MessageType.file) {
+      final parsed = tryParseFileWireContent(stored.content);
+      if (parsed != null && await _shouldAutoDownloadMedia()) {
+        unawaited(_resolveMediaMessage(stored, parsed));
+      }
+    }
+
+    if (_activeChatId != stored.conversationId) {
+      final contact = await storage.getContact(senderId);
+      final who = contact?.displayName ?? senderId.substring(0, 6);
+      final preview = switch (stored.type) {
+        MessageType.text => '$who: ${utf8.decode(stored.content)}',
+        MessageType.linkPreview =>
+          '$who: ${LinkPreviewService.parse(stored.content)?.text ?? '[link]'}',
+        _ => '$who: [file]',
+      };
+      NotificationService.showMessage(
+        contactName: g.name,
+        preview: preview,
+        contactId: stored.conversationId,
+      );
+    }
+  }
+
+  /// Nudges the UI (conversations + open chat) to reload group state. The
+  /// synthetic message is NOT persisted — it only rides the incoming stream.
+  void _emitGroupEvent(String gid) {
+    _incomingController.add(StoredMessage(
+      id: const Uuid().v4(),
+      conversationId: groupConversationId(gid),
+      type: MessageType.groupControl,
+      content: Uint8List(0),
+      timestampUs: DateTime.now().microsecondsSinceEpoch,
+      direction: MessageDirection.incoming,
+      status: MessageStatus.delivered,
+    ));
   }
 
   /// Local display format for file/audio messages: `name\0bytes`.
@@ -917,7 +1283,10 @@ class PhantomCore {
       direction:      MessageDirection.outgoing,
       status:         MessageStatus.sending,
     );
-    // System/protocol messages are not part of the chat history.
+    // System/protocol messages are not part of the chat history. Group
+    // envelopes/control are excluded too: the group send path persists ONE
+    // message under the grp_ conversation — the per-member encrypted copies
+    // must not appear in the 1:1 chats.
     const systemTypes = {
       MessageType.avatarData,
       MessageType.aliasData,
@@ -925,6 +1294,8 @@ class PhantomCore {
       MessageType.connectivityInfo,
       MessageType.preKeyShare,
       MessageType.handshakeAck,
+      MessageType.groupEnvelope,
+      MessageType.groupControl,
     };
     if (!systemTypes.contains(message.type)) {
       await storage.saveMessage(stored);
@@ -2784,6 +3155,16 @@ class PhantomCore {
       return;
     }
 
+    if (message.type == MessageType.groupControl) {
+      await _handleGroupControl(senderId, message);
+      return;
+    }
+
+    if (message.type == MessageType.groupEnvelope) {
+      await _handleGroupEnvelope(senderId, message);
+      return;
+    }
+
     if (message.type == MessageType.handshakeAck) {
       // Receipt is implicit — the message arriving on incomingMessages is the
       // confirmation. Don't surface in chat history; just emit so resendHandshake
@@ -2835,9 +3216,12 @@ class PhantomCore {
     if (_activeChatId != senderId) {
       final contact = await storage.getContact(senderId);
       final name    = contact?.displayName ?? senderId.substring(0, 6);
-      final preview = message.type == MessageType.text
-          ? message.textContent
-          : '[file]';
+      final preview = switch (message.type) {
+        MessageType.text => message.textContent,
+        MessageType.linkPreview =>
+          LinkPreviewService.parse(message.content)?.text ?? '[link]',
+        _ => '[file]',
+      };
       NotificationService.showMessage(
         contactName: name,
         preview:     preview,

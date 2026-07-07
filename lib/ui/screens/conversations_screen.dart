@@ -14,6 +14,7 @@ class ConversationsScreen extends StatefulWidget {
 class _ConversationsScreenState extends State<ConversationsScreen> {
   List<ContactRecord>? _contacts;
   final Map<String, StoredMessage?> _lastMessages = {};
+  List<GroupRecord> _groups = const [];
   final Map<String, Uint8List?> _avatars = {};
   StreamSubscription<StoredMessage>? _msgSub;
   StreamSubscription<String>? _presenceSub;
@@ -75,15 +76,21 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
 
   Future<void> _loadData(PhantomCore core) async {
     final contacts = await core.getContacts();
+    final groups   = await core.getGroups();
     final lastMsgs = <String, StoredMessage?>{};
     final avatars  = <String, Uint8List?>{};
     for (final c in contacts) {
       lastMsgs[c.phantomId] = await core.getLastMessage(c.phantomId);
       avatars[c.phantomId]  = await core.getContactAvatar(c.phantomId);
     }
+    for (final g in groups) {
+      final conv = groupConversationId(g.gid);
+      lastMsgs[conv] = await core.getLastMessage(conv);
+    }
     if (mounted) {
       setState(() {
         _contacts = contacts;
+        _groups   = groups;
         _lastMessages.addAll(lastMsgs);
         _avatars.addAll(avatars);
       });
@@ -172,17 +179,55 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
         Expanded(
           child: _contacts == null
               ? Center(child: CircularProgressIndicator(color: t.accentLight, strokeWidth: 1))
-              : visible.isEmpty
+              : (visible.isEmpty && (_showArchived || _groups.isEmpty))
                   ? _EmptyContacts(tokens: t, archived: _showArchived)
                   : ListView.builder(
-                      itemCount: visible.length,
+                      itemCount: visible.length +
+                          (_showArchived ? 0 : _groups.length),
                       itemBuilder: (context, i) {
-                        final c    = visible[i];
+                        // Groups first, then contacts.
+                        if (!_showArchived && i < _groups.length) {
+                          final grp  = _groups[i];
+                          final conv = groupConversationId(grp.gid);
+                          final last = _lastMessages[conv];
+                          return ConversationTile(
+                            displayName: grp.name,
+                            phantomId:   conv,
+                            isGroup:     true,
+                            lastMessage: switch (last?.type) {
+                              MessageType.text => last?.textContent,
+                              MessageType.linkPreview =>
+                                LinkPreviewService.parse(last!.content)?.text ??
+                                    '[link]',
+                              null => '${grp.memberIds.length} members',
+                              _ => '[file]',
+                            },
+                            timeLabel: last != null
+                                ? _formatTime(last.timestamp)
+                                : null,
+                            unreadCount: 0,
+                            isOnline: false,
+                            onTap: () => Navigator.push(context,
+                              _AppRoute(builder: (_) => ChatScreen(
+                                contactName: grp.name,
+                                contactId:   conv,
+                                isGroup:     true)))
+                              .then((_) => _loadData(core)),
+                          );
+                        }
+                        final c = visible[
+                            i - (_showArchived ? 0 : _groups.length)];
                         final last = _lastMessages[c.phantomId];
                         return ConversationTile(
                           displayName: c.displayName,
                           phantomId:   c.phantomId,
-                          lastMessage: last?.type == MessageType.text ? last?.textContent : null,
+                          lastMessage: switch (last?.type) {
+                            MessageType.text => last?.textContent,
+                            MessageType.linkPreview =>
+                              LinkPreviewService.parse(last!.content)?.text ??
+                                  '[link]',
+                            _ => null,
+                          },
                           timeLabel:   last != null ? _formatTime(last.timestamp) : null,
                           unreadCount: 0,
                           isOnline:    core.isContactOnline(c.phantomId),
@@ -259,9 +304,39 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
           side: BorderSide(color: t.inputBorder, width: 0.5),
         ),
         child: Icon(Icons.edit_outlined, color: t.accentLight, size: 20),
-        onPressed: () => Navigator.push(context,
-            _AppRoute(builder: (_) => const AddContactScreen()))
-            .then((_) => _loadData(core)),
+        onPressed: () => showModalBottomSheet(
+          context: context,
+          backgroundColor: t.bgSurface,
+          shape: RoundedRectangleBorder(
+              borderRadius:
+                  BorderRadius.vertical(top: Radius.circular(t.radiusCard))),
+          builder: (ctx) => SafeArea(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              const SizedBox(height: 12),
+              _MenuItem(
+                  icon: Icons.person_add_outlined,
+                  label: 'add contact',
+                  tokens: t,
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    Navigator.push(context,
+                        _AppRoute(builder: (_) => const AddContactScreen()))
+                        .then((_) => _loadData(core));
+                  }),
+              _MenuItem(
+                  icon: Icons.group_add_outlined,
+                  label: 'new group',
+                  tokens: t,
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    Navigator.push(context,
+                        _AppRoute(builder: (_) => const CreateGroupScreen()))
+                        .then((_) => _loadData(core));
+                  }),
+              const SizedBox(height: 12),
+            ]),
+          ),
+        ),
       ),
     );
 

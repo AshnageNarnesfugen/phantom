@@ -6,9 +6,16 @@ part of 'screens.dart';
 
 class ChatScreen extends StatefulWidget {
   final String contactName;
+  /// Conversation key: a contact's phantomId, or `grp_<gid>` for groups.
   final String contactId;
+  final bool isGroup;
 
-  const ChatScreen({super.key, required this.contactName, required this.contactId});
+  const ChatScreen({
+    super.key,
+    required this.contactName,
+    required this.contactId,
+    this.isGroup = false,
+  });
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -27,6 +34,11 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _displayName;
   bool _isVerified = false;
   StoredMessage? _replyTo;
+
+  /// Group mode: phantomId → displayName for sender attribution, and the
+  /// member count for the AppBar subtitle.
+  Map<String, String> _memberNames = const {};
+  int _memberCount = 0;
 
   /// The already-read receipt re-fire (see _loadMessages) may run only once
   /// per screen lifetime. _loadMessages re-runs on EVERY incoming event —
@@ -114,14 +126,16 @@ class _ChatScreenState extends State<ChatScreen> {
       _sub = core.incomingMessages.listen((msg) {
         if (msg.conversationId == widget.contactId) _loadMessages(core);
       });
-      _presenceSub = core.presenceChanges.listen((id) {
-        if (id == widget.contactId && mounted) setState(() {});
-      });
-      // Re-render when the handshake-ack state flips so the "waiting for
-      // first response" banner appears / disappears in real time.
-      _handshakeSub = core.handshakeStateChanges.listen((id) {
-        if (id == widget.contactId && mounted) setState(() {});
-      });
+      if (!widget.isGroup) {
+        _presenceSub = core.presenceChanges.listen((id) {
+          if (id == widget.contactId && mounted) setState(() {});
+        });
+        // Re-render when the handshake-ack state flips so the "waiting for
+        // first response" banner appears / disappears in real time.
+        _handshakeSub = core.handshakeStateChanges.listen((id) {
+          if (id == widget.contactId && mounted) setState(() {});
+        });
+      }
       // Reload contact-derived display name when nickname/alias change so
       // the AppBar updates without a screen pop/push. The same stream fires
       // when a media message finishes downloading from IPFS, so reload the
@@ -141,6 +155,17 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _refreshDisplayName(PhantomCore core) async {
+    if (widget.isGroup) {
+      final g = await core.getGroup(gidOfConversation(widget.contactId));
+      final contacts = await core.storage.getAllContacts();
+      if (!mounted) return;
+      setState(() {
+        _displayName = g?.name ?? widget.contactName;
+        _memberNames = {for (final c in contacts) c.phantomId: c.displayName};
+        _memberCount = g?.memberIds.length ?? 0;
+      });
+      return;
+    }
     final c = await core.storage.getContact(widget.contactId);
     if (!mounted) return;
     final newName = c?.displayName ?? widget.contactName;
@@ -307,7 +332,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _receiptsRefired = true;
 
     final toAck = <String>{...unread, ...recentRead}.toList();
-    if (toAck.isNotEmpty) {
+    if (toAck.isNotEmpty && !widget.isGroup) {
       core.sendReadReceipts(widget.contactId, toAck); // fire-and-forget
     }
   }
@@ -330,11 +355,16 @@ class _ChatScreenState extends State<ChatScreen> {
     if (core == null) return;
     final replyId = _replyTo?.id;
     if (mounted) setState(() => _replyTo = null);
-    await core.sendMessage(
-      recipientId: widget.contactId,
-      text: text,
-      replyToId: replyId,
-    );
+    if (widget.isGroup) {
+      await core.sendGroupMessage(
+          gid: gidOfConversation(widget.contactId), text: text);
+    } else {
+      await core.sendMessage(
+        recipientId: widget.contactId,
+        text: text,
+        replyToId: replyId,
+      );
+    }
     // Reload from storage so messages are always shown in timestamp order,
     // even when multiple sends complete out of order (e.g. large file + text).
     if (mounted) _loadMessages(core, jumpToBottom: true);
@@ -344,11 +374,19 @@ class _ChatScreenState extends State<ChatScreen> {
     final core = CoreProvider.of(context).core;
     if (core == null) return;
     try {
-      await core.sendFile(
-        recipientId: widget.contactId,
-        bytes: bytes,
-        fileName: fileName,
-      );
+      if (widget.isGroup) {
+        await core.sendGroupFile(
+          gid: gidOfConversation(widget.contactId),
+          bytes: bytes,
+          fileName: fileName,
+        );
+      } else {
+        await core.sendFile(
+          recipientId: widget.contactId,
+          bytes: bytes,
+          fileName: fileName,
+        );
+      }
     } on PhantomCoreException catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -515,10 +553,17 @@ class _ChatScreenState extends State<ChatScreen> {
                 // The raw phantom id is backend addressing, not user-facing —
                 // the contact's name (nickname, alias, or a short fingerprint
                 // fallback) already identifies them here.
+                if (widget.isGroup && _memberCount > 0)
+                  Text('$_memberCount members',
+                      style: TextStyle(
+                          color: t.textSecondary,
+                          fontFamily: 'monospace',
+                          fontSize: 10.5)),
               ],
             ),
           ),
-          if (core?.isContactOnline(widget.contactId) == true)
+          if (!widget.isGroup &&
+              core?.isContactOnline(widget.contactId) == true)
             Container(
               width: 9, height: 9,
               margin: const EdgeInsets.only(right: 4),
@@ -533,7 +578,9 @@ class _ChatScreenState extends State<ChatScreen> {
       actions: [
         IconButton(
           icon: Icon(Icons.more_vert, color: t.iconDefault, size: 20),
-          onPressed: () => _showContactMenu(context, t, core),
+          onPressed: () => widget.isGroup
+              ? _showGroupMenu(context, t, core)
+              : _showContactMenu(context, t, core),
         ),
       ],
       bottom: g
@@ -562,8 +609,8 @@ class _ChatScreenState extends State<ChatScreen> {
           : null,
     );
 
-    final awaitingAck =
-        core?.isAwaitingHandshakeAck(widget.contactId) ?? false;
+    final awaitingAck = !widget.isGroup &&
+        (core?.isAwaitingHandshakeAck(widget.contactId) ?? false);
     final retryAttempt = core?.handshakeRetryAttempt(widget.contactId) ?? 0;
     final handshakeBanner = awaitingAck
         ? _HandshakeWaitingBanner(tokens: t, retryAttempt: retryAttempt)
@@ -671,6 +718,8 @@ class _ChatScreenState extends State<ChatScreen> {
               text:         msg.type == MessageType.text
                   ? msg.textContent
                   : '[${msg.type.name}]',
+              linkPreviewContent:
+                  msg.type == MessageType.linkPreview ? msg.content : null,
               isOutgoing:   isOut,
               timeLabel:    _formatTime(msg.timestamp),
               showTail:     !nextSame,
@@ -687,6 +736,12 @@ class _ChatScreenState extends State<ChatScreen> {
               onDownload: () => _downloadMedia(core, msg),
               onForwardVideo: () => _forwardVideo(core, msg),
               messageType:  msg.type,
+              senderLabel: (widget.isGroup &&
+                      msg.direction == MessageDirection.incoming &&
+                      msg.senderId != null)
+                  ? (_memberNames[msg.senderId!] ??
+                      msg.senderId!.substring(0, 6))
+                  : null,
               glassEnabled:    _glassEnabled,
               glassOpacity:    _glassOpacity,
               glassBlur:       _glassBlur,
@@ -720,6 +775,212 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
     return list;
+  }
+
+  void _showGroupMenu(BuildContext context, PhantomTokens t, PhantomCore? core) {
+    final gid = gidOfConversation(widget.contactId);
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: t.bgSurface,
+      isScrollControlled: true,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(t.radiusCard)),
+      ),
+      builder: (ctx) => SafeArea(
+        top: false,
+        child: FutureBuilder(
+          future: core?.getGroup(gid),
+          builder: (ctx, snap) {
+            final g = snap.data;
+            if (g == null) {
+              return const SizedBox(
+                  height: 120,
+                  child: Center(child: CircularProgressIndicator(strokeWidth: 1)));
+            }
+            final isCreator = core?.myId == g.creatorId;
+            return SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 18, 20, 4),
+                    child: Text(g.name,
+                        style: TextStyle(
+                            color: t.textPrimary,
+                            fontFamily: 'monospace',
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600)),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
+                    child: Text('${g.memberIds.length} members',
+                        style: TextStyle(
+                            color: t.textSecondary,
+                            fontFamily: 'monospace',
+                            fontSize: 12)),
+                  ),
+                  for (final m in g.memberIds)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 20, vertical: 4),
+                      child: Row(children: [
+                        Icon(
+                            m == g.creatorId
+                                ? Icons.star_outline
+                                : Icons.person_outline,
+                            size: 15,
+                            color: t.textSecondary),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            m == core?.myId
+                                ? 'you'
+                                : (_memberNames[m] ?? m.substring(0, 12)),
+                            style: TextStyle(
+                                color: t.textPrimary,
+                                fontFamily: 'monospace',
+                                fontSize: 13),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ]),
+                    ),
+                  Divider(height: 20, color: t.divider),
+                  if (isCreator)
+                    _MenuItem(
+                        icon: Icons.person_add_outlined,
+                        label: 'add members',
+                        tokens: t,
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          _addGroupMembers(core, g);
+                        }),
+                  if (isCreator)
+                    _MenuItem(
+                        icon: Icons.edit_outlined,
+                        label: 'rename group',
+                        tokens: t,
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          _renameGroup(core, g);
+                        }),
+                  _MenuItem(
+                      icon: Icons.logout_outlined,
+                      label: 'leave group',
+                      tokens: t,
+                      onTap: () async {
+                        Navigator.pop(ctx);
+                        await core?.leaveGroup(gid);
+                        if (mounted) Navigator.of(this.context).pop();
+                      }),
+                  const SizedBox(height: 16),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Future<void> _addGroupMembers(PhantomCore? core, GroupRecord g) async {
+    if (core == null) return;
+    final contacts = await core.storage.getAllContacts();
+    final candidates =
+        contacts.where((c) => !g.memberIds.contains(c.phantomId)).toList();
+    if (!mounted) return;
+    final t = PhantomTheme.tokensOf(context);
+    if (candidates.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('all your contacts are already in this group')));
+      return;
+    }
+    final selected = <String>{};
+    await showModalBottomSheet(
+      context: context,
+      backgroundColor: t.bgSurface,
+      isScrollControlled: true,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(t.radiusCard)),
+      ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) => SafeArea(
+          top: false,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text('add members',
+                    style: TextStyle(
+                        color: t.textPrimary,
+                        fontFamily: 'monospace',
+                        fontSize: 15)),
+              ),
+              for (final c in candidates)
+                CheckboxListTile(
+                  value: selected.contains(c.phantomId),
+                  activeColor: t.accentLight,
+                  title: Text(c.displayName,
+                      style: TextStyle(
+                          color: t.textPrimary,
+                          fontFamily: 'monospace',
+                          fontSize: 13)),
+                  onChanged: (v) => setSheet(() => v == true
+                      ? selected.add(c.phantomId)
+                      : selected.remove(c.phantomId)),
+                ),
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: _PhantomButton(
+                    label: 'add',
+                    onTap: () => Navigator.pop(ctx)),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (selected.isNotEmpty) {
+      await core.addGroupMembers(g.gid, selected.toList());
+      if (mounted) _refreshDisplayName(core);
+    }
+  }
+
+  Future<void> _renameGroup(PhantomCore? core, GroupRecord g) async {
+    if (core == null || !mounted) return;
+    final t = PhantomTheme.tokensOf(context);
+    final ctrl = TextEditingController(text: g.name);
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: t.bgSurface,
+        title: Text('rename group',
+            style: TextStyle(
+                color: t.textPrimary, fontFamily: 'monospace', fontSize: 15)),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          style: TextStyle(
+              color: t.textPrimary, fontFamily: 'monospace', fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('cancel',
+                  style: TextStyle(fontFamily: 'monospace'))),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+              child: const Text('save',
+                  style: TextStyle(fontFamily: 'monospace'))),
+        ],
+      ),
+    );
+    if (newName != null && newName.isNotEmpty && newName != g.name) {
+      await core.renameGroup(g.gid, newName);
+      if (mounted) _refreshDisplayName(core);
+    }
   }
 
   void _showContactMenu(BuildContext context, PhantomTokens t, PhantomCore? core) {

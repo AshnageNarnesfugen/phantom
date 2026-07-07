@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'package:hive/hive.dart';
 import 'package:cryptography/cryptography.dart';
 import '../crypto/native/phantom_crypto_native.dart';
+import '../groups.dart';
 import '../protocol/message.dart';
 
 /// Per-key async lock. Serializes read-modify-write sequences that the storage
@@ -40,6 +41,7 @@ class _AsyncLock {
 
 class PhantomStorage {
   static const _boxContacts   = 'contacts';
+  static const _boxGroups     = 'groups';
   static const _boxSessions   = 'sessions';
   static const _boxPrekeys    = 'prekeys';
   static const _boxOwnBundle  = 'own_bundle';
@@ -219,6 +221,37 @@ class PhantomStorage {
     _assertInitialized();
     final box = await _openBox(_boxSessions);
     await box.delete(phantomId);
+  }
+
+  // ── Groups (serverless, pairwise fanout — see core/groups.dart) ────────────
+
+  Future<void> saveGroup(GroupRecord group) async {
+    _assertInitialized();
+    final box = await _openBox(_boxGroups);
+    await box.put(group.gid, group.toJson());
+  }
+
+  Future<GroupRecord?> getGroup(String gid) async {
+    _assertInitialized();
+    final box  = await _openBox(_boxGroups);
+    final data = box.get(gid);
+    if (data == null) return null;
+    return GroupRecord.fromJson(Map<String, dynamic>.from(data as Map));
+  }
+
+  Future<List<GroupRecord>> getGroups() async {
+    _assertInitialized();
+    final box = await _openBox(_boxGroups);
+    return box.values
+        .map((v) => GroupRecord.fromJson(Map<String, dynamic>.from(v as Map)))
+        .toList()
+      ..sort((a, b) => b.updatedAtUs.compareTo(a.updatedAtUs));
+  }
+
+  Future<void> deleteGroup(String gid) async {
+    _assertInitialized();
+    final box = await _openBox(_boxGroups);
+    await box.delete(gid);
   }
 
   // ── PreKeys ─────────────────────────────────────────────────────────────────
@@ -871,6 +904,7 @@ extension StoredMessageJson on StoredMessage {
         'dir':     direction.index,
         'status':  status.index,
         'reply':   replyToId,
+        if (senderId != null) 'sender': senderId,
       };
 
   static StoredMessage fromJson(Map<String, dynamic> j) => StoredMessage(
@@ -882,6 +916,7 @@ extension StoredMessageJson on StoredMessage {
         direction:      MessageDirection.values[j['dir']    as int],
         status:         MessageStatus.values[j['status'] as int],
         replyToId:      j['reply'] as String?,
+        senderId:       j['sender'] as String?,
       );
 }
 

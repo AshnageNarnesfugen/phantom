@@ -57,6 +57,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       core.storage.getSetting<String>('media_autodownload').then((m) {
         if (mounted && m != null) setState(() => _mediaMode = m);
       });
+      core.storage.getSetting<bool>('link_previews_enabled').then((v) {
+        if (mounted && v != null) setState(() => _linkPreviews = v);
+      });
       _loadGlass(core);
       _refreshStatus();
       _refreshTimer ??= Timer.periodic(const Duration(seconds: 2), (_) => _refreshStatus());
@@ -67,6 +70,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   /// Media auto-download policy: 'always' | 'wifi' | 'never' (default manual).
   String _mediaMode = 'never';
+
+  /// Sender-generated link previews (Signal-style). OFF by default: generating
+  /// one means the sender's device fetches the URL (IP visible to the site).
+  bool _linkPreviews = false;
 
   static const _mediaModeLabels = {
     'always': 'always',
@@ -343,6 +350,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                       ),
                     ),
+                    const SizedBox(height: 8),
+                    _PhantomButton(
+                      label: 'show QR',
+                      onTap: () => Navigator.of(context).push(_AppRoute(
+                          builder: (_) => _MyQrScreen(
+                              contactAddress: _contactAddress!))),
+                    ),
                   ],
                 ),
               ),
@@ -367,6 +381,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
             value: _mediaModeLabels[_mediaMode],
             tokens: t,
             onTap: () => _showMediaModeSheet(t, core),
+          ),
+          _SettingTile(
+            icon: Icons.link_outlined,
+            label: 'link previews',
+            value: _linkPreviews ? 'on' : 'off',
+            tokens: t,
+            onTap: () {
+              final next = !_linkPreviews;
+              setState(() => _linkPreviews = next);
+              core?.storage.setSetting('link_previews_enabled', next);
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                content: Text(
+                  next
+                      ? 'previews on — when YOU send a link, your device '
+                        'fetches the page and embeds the card (the site sees '
+                        'your IP, receivers fetch nothing)'
+                      : 'previews off — links send as plain text',
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                ),
+                duration: const Duration(seconds: 4),
+              ));
+            },
           ),
           // ── Appearance ───────────────────────────────────────
           _SectionHeader('appearance', t),

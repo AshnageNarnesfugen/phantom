@@ -12,9 +12,12 @@ import 'package:gal/gal.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:open_file/open_file.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:flutter/gestures.dart' show TapGestureRecognizer;
+import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 import 'package:record/record.dart';
 import '../theme/phantom_theme.dart';
+import '../../core/link_preview_service.dart';
 import '../../core/protocol/message.dart' show MessageStatus, MessageType;
 
 // ── ChatBubble ────────────────────────────────────────────────────────────────
@@ -44,6 +47,12 @@ class ChatBubble extends StatelessWidget {
   final bool noiseEnabled;
   final double noiseStrength;
   final ui.Image? noiseImage;
+  /// Raw linkPreview JSON content (sender-embedded card). Non-null only for
+  /// [MessageType.linkPreview] messages.
+  final Uint8List? linkPreviewContent;
+  /// Attribution line above the content (group chats: the sender's name on
+  /// incoming bubbles). Null in 1:1 chats.
+  final String? senderLabel;
 
   const ChatBubble({
     super.key,
@@ -67,6 +76,8 @@ class ChatBubble extends StatelessWidget {
     this.noiseEnabled = false,
     this.noiseStrength = 0.15,
     this.noiseImage,
+    this.linkPreviewContent,
+    this.senderLabel,
   });
 
   @override
@@ -202,6 +213,19 @@ class ChatBubble extends StatelessWidget {
           isOutgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
+        if (senderLabel != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 3),
+            child: Text(
+              senderLabel!,
+              style: TextStyle(
+                color: t.accentLight,
+                fontSize: 11.5,
+                fontFamily: 'monospace',
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
         if (replyPreview != null) ...[
           Container(
             padding: const EdgeInsets.fromLTRB(8, 5, 8, 5),
@@ -345,19 +369,47 @@ class ChatBubble extends StatelessWidget {
         }
         return _fallbackText(textColor);
 
-      default:
-        return Text(
-          text,
-          style: TextStyle(
-            color: textColor,
-            fontSize: 15,
-            height: 1.45,
-            fontFamily: 'monospace',
-            shadows: glassEnabled
-                ? [Shadow(color: Colors.black.withValues(alpha: 0.55), blurRadius: 4)]
-                : null,
-          ),
+      case MessageType.linkPreview:
+        final parsed = linkPreviewContent != null
+            ? LinkPreviewService.parse(linkPreviewContent!)
+            : null;
+        final style = TextStyle(
+          color: textColor,
+          fontSize: 15,
+          height: 1.45,
+          fontFamily: 'monospace',
+          shadows: glassEnabled
+              ? [Shadow(color: Colors.black.withValues(alpha: 0.55), blurRadius: 4)]
+              : null,
         );
+        if (parsed == null) return _LinkifiedText(text: text, style: style);
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _LinkPreviewCard(
+              url: parsed.url,
+              title: parsed.title,
+              desc: parsed.desc,
+              imgBytes: parsed.img,
+              textColor: textColor,
+            ),
+            const SizedBox(height: 6),
+            _LinkifiedText(text: parsed.text, style: style),
+          ],
+        );
+
+      default:
+        final style = TextStyle(
+          color: textColor,
+          fontSize: 15,
+          height: 1.45,
+          fontFamily: 'monospace',
+          shadows: glassEnabled
+              ? [Shadow(color: Colors.black.withValues(alpha: 0.55), blurRadius: 4)]
+              : null,
+        );
+        return _LinkifiedText(text: text, style: style);
     }
   }
 
@@ -1732,6 +1784,8 @@ class ConversationTile extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback? onLongPress;
   final Uint8List? avatarBytes;
+  /// Group conversations render a group glyph instead of the letter avatar.
+  final bool isGroup;
 
   const ConversationTile({
     super.key,
@@ -1744,6 +1798,7 @@ class ConversationTile extends StatelessWidget {
     required this.onTap,
     this.onLongPress,
     this.avatarBytes,
+    this.isGroup = false,
   });
 
   @override
@@ -1765,6 +1820,7 @@ class ConversationTile extends StatelessWidget {
             // Avatar — initial letter + accent ring + online dot
             _Avatar(
               name:        displayName,
+              isGroup:     isGroup,
               hasUnread:   unreadCount > 0,
               isOnline:    isOnline,
               tokens:      t,
@@ -1862,6 +1918,7 @@ class _Avatar extends StatelessWidget {
   final bool isOnline;
   final PhantomTokens tokens;
   final Uint8List? avatarBytes;
+  final bool isGroup;
 
   const _Avatar({
     required this.name,
@@ -1869,6 +1926,7 @@ class _Avatar extends StatelessWidget {
     required this.isOnline,
     required this.tokens,
     this.avatarBytes,
+    this.isGroup = false,
   });
 
   @override
@@ -1901,7 +1959,13 @@ class _Avatar extends StatelessWidget {
           ),
           child: avatarBytes == null
               ? Center(
-                  child: Text(
+                  child: isGroup
+                      ? Icon(Icons.group_outlined,
+                          size: 20,
+                          color: hasUnread
+                              ? tokens.accentLight
+                              : tokens.textSecondary)
+                      : Text(
                     letter,
                     style: TextStyle(
                       color: hasUnread ? tokens.accentLight : tokens.textSecondary,
@@ -2301,6 +2365,138 @@ class _EditorBtn extends StatelessWidget {
           Text(label,
               style: TextStyle(color: color, fontFamily: 'monospace', fontSize: 11)),
         ],
+      ),
+    );
+  }
+}
+
+// ── Link handling ─────────────────────────────────────────────────────────────
+// URLs in text bubbles are tappable (external browser). The preview card is
+// rendered ONLY from sender-embedded data — the receiver never fetches.
+
+class _LinkifiedText extends StatelessWidget {
+  final String text;
+  final TextStyle style;
+  const _LinkifiedText({required this.text, required this.style});
+
+  static final _urlRe = RegExp(r'https?://[^\s]+');
+
+  @override
+  Widget build(BuildContext context) {
+    final matches = _urlRe.allMatches(text).toList();
+    if (matches.isEmpty) return Text(text, style: style);
+
+    final linkStyle = style.copyWith(
+      decoration: TextDecoration.underline,
+      decorationColor: style.color,
+    );
+    final spans = <InlineSpan>[];
+    var cursor = 0;
+    for (final m in matches) {
+      if (m.start > cursor) {
+        spans.add(TextSpan(text: text.substring(cursor, m.start)));
+      }
+      final url = m.group(0)!;
+      spans.add(TextSpan(
+        text: url,
+        style: linkStyle,
+        recognizer: TapGestureRecognizer()
+          ..onTap = () => launchUrl(Uri.parse(url),
+              mode: LaunchMode.externalApplication),
+      ));
+      cursor = m.end;
+    }
+    if (cursor < text.length) {
+      spans.add(TextSpan(text: text.substring(cursor)));
+    }
+    return Text.rich(TextSpan(style: style, children: spans));
+  }
+}
+
+class _LinkPreviewCard extends StatelessWidget {
+  final String url;
+  final String? title;
+  final String? desc;
+  final Uint8List? imgBytes;
+  final Color textColor;
+  const _LinkPreviewCard({
+    required this.url,
+    required this.title,
+    required this.desc,
+    required this.imgBytes,
+    required this.textColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final host = Uri.tryParse(url)?.host ?? url;
+    return GestureDetector(
+      onTap: () =>
+          launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication),
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 260),
+        decoration: BoxDecoration(
+          color: textColor.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(8),
+          border: Border(
+            left: BorderSide(color: textColor.withValues(alpha: 0.4), width: 2),
+          ),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (imgBytes != null)
+              Builder(builder: (context) {
+                final dpr = MediaQuery.of(context).devicePixelRatio;
+                return Image.memory(
+                  imgBytes!,
+                  width: 260,
+                  height: 130,
+                  fit: BoxFit.cover,
+                  cacheWidth: (260 * dpr).round(),
+                  errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                );
+              }),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (title != null)
+                    Text(title!,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            color: textColor,
+                            fontSize: 13,
+                            fontFamily: 'monospace',
+                            fontWeight: FontWeight.w600)),
+                  if (desc != null) ...[
+                    const SizedBox(height: 2),
+                    Text(desc!,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            color: textColor.withValues(alpha: 0.7),
+                            fontSize: 11.5,
+                            fontFamily: 'monospace')),
+                  ],
+                  const SizedBox(height: 2),
+                  Text(host,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                          color: textColor.withValues(alpha: 0.5),
+                          fontSize: 10.5,
+                          fontFamily: 'monospace')),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

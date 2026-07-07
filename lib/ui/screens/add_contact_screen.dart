@@ -67,6 +67,29 @@ class _AddContactScreenState extends State<AddContactScreen> {
     super.dispose();
   }
 
+  Future<void> _scanQr() async {
+    // The camera plugin (inside flutter_zxing's ReaderWidget) requests the
+    // runtime permission itself; asking via permission_handler first gives a
+    // cleaner UX when it was permanently denied.
+    final status = await Permission.camera.request();
+    if (!status.isGranted) {
+      if (mounted) {
+        setState(() =>
+            _error = 'camera permission needed to scan — or paste the address');
+      }
+      return;
+    }
+    if (!mounted) return;
+    final scanned = await Navigator.of(context).push<String>(
+        _AppRoute(builder: (_) => const _QrScanScreen()));
+    if (scanned != null && mounted) {
+      setState(() {
+        _addressCtrl.text = scanned.trim();
+        _error = null;
+      });
+    }
+  }
+
   Future<void> _add() async {
     final address = _addressCtrl.text.trim();
     if (address.length < 20) {
@@ -180,6 +203,8 @@ class _AddContactScreenState extends State<AddContactScreen> {
               maxLines: 3,
               onChanged: (_) => setState(() => _error = null),
             ),
+            const SizedBox(height: 10),
+            _PhantomButton(label: 'scan QR', onTap: _scanQr),
             const SizedBox(height: 20),
             Text('nickname (optional)',
                 style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 12)),
