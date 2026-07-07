@@ -41,6 +41,13 @@ pub mod ratchet;
 /// C-ABI surface for `dart:ffi` (slice 6, stateless functions).
 pub mod ffi;
 
+/// Kyber-768 round 3 KEM (slice 7) — wire-compatible with Dart `post_quantum`.
+pub mod kyber;
+
+/// Reference vectors captured from the live Dart Kyber (test-only).
+#[cfg(test)]
+pub(crate) mod kyber_test_vectors;
+
 /// A 32-byte secret that is wiped from memory when dropped. Use this for any
 /// key material (DH outputs, chain/root keys, derived keys) so it never
 /// lingers in RAM — the core reason this crate exists.

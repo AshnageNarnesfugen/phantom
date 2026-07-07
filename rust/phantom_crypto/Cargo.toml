@@ -30,6 +30,16 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # mlock/munlock the live ratchet session so its secret pages can't be swapped to
 # disk (Unix/Android). Best-effort; failure is non-fatal.
 libc = "0.2"
+# Kyber-768 **round 3** (the `kyber` feature) — formally verified (hax/F*),
+# the same implementation libsignal uses for PQXDH. NOT the FIPS-203 ML-KEM
+# variant: Phantom's wire format is round-3 (Dart `post_quantum`), and the two
+# don't cross-decapsulate. Slimmed features: no rand (we pass randomness
+# explicitly), no codec/wasm extras.
+libcrux-ml-kem = { version = "0.0.9", default-features = false, features = [
+    "mlkem768",
+    "kyber",
+    "std",
+] }
 
 [profile.release]
 # Keep debug asserts off but do not let the optimizer elide zeroization —

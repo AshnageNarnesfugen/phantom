@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 import 'package:ffi/ffi.dart';
 import 'package:meta/meta.dart';
+import 'package:post_quantum/kyber.dart' as pq;
 
 import '../double_ratchet.dart';
 import '../hybrid_kem.dart';
@@ -36,6 +37,7 @@ class NativeCryptoGate {
   PhantomCryptoNative? _native;
   bool _verified = false;
   bool _ratchetVerified = false;
+  bool _kyberVerified = false;
 
   /// 32-byte key that seals ratchet session state into an opaque blob at persist
   /// (HKDF from the seed, set by `PhantomStorage.initialize`). When set, a
@@ -53,6 +55,11 @@ class NativeCryptoGate {
   /// for the stateful cutover — the binding is wired and verified; the message
   /// body path itself is routed once this is confirmed green on real devices.
   bool get ratchetNative => _ratchetVerified && _native != null;
+
+  /// True when the native Kyber-768 passed its on-device cross-parity oracle
+  /// (keygen + encaps + decaps verified against the Dart implementation), so
+  /// the KEM hot-path calls route through Rust.
+  bool get kyberNative => _kyberVerified && _native != null;
 
   /// The verified native core, or null. Exposed so the ratchet cutover can
   /// build [NativeRatchet] handles once [ratchetNative] is true.
@@ -74,6 +81,100 @@ class NativeCryptoGate {
     // oracle. A drift here only withholds the (not-yet-live) ratchet cutover; it
     // does not disable the already-live stateless path.
     _ratchetVerified = await _verifyRatchet(_native!);
+    // Kyber has its own verdict too — a KEM drift must not disable the ratchet
+    // or the stateless ops, and vice versa.
+    _kyberVerified = _verifyKyber(_native!);
+  }
+
+  /// On-device Kyber-768 cross-parity oracle: with a random seed/nonce, keygen
+  /// must be byte-identical both ways, a native encapsulation must decapsulate
+  /// in DART to the same secret, and a Dart encapsulation must decapsulate in
+  /// native — proving both directions of the real interop (a native peer
+  /// handshaking a Dart peer) on the actual device before any cutover.
+  bool _verifyKyber(PhantomCryptoNative n) {
+    final dbg = TransportDebugger.instance;
+    try {
+      final rng = Random.secure();
+      Uint8List rand(int c) =>
+          Uint8List.fromList(List.generate(c, (_) => rng.nextInt(256)));
+
+      // 1. Deterministic keygen parity.
+      final seed = rand(64);
+      final (dartPk, dartSk) = HybridKEM.generateKeys(seed);
+      final (natPk, natSk) = n.kyber768Keypair(seed);
+      if (!PhantomCryptoNative._eq(natPk, dartPk) || !PhantomCryptoNative._eq(natSk, dartSk)) {
+        return _kyFail(dbg, 'keygen');
+      }
+
+      // 2. Same-nonce encapsulation parity (ct AND ss).
+      final nonce = rand(32);
+      final kyber = pq.Kyber.kem768();
+      final pkObj = pq.KemPublicKey.deserialize(dartPk, 3);
+      final (dartCtObj, dartSs) = kyber.encapsulate(pkObj, nonce);
+      final dartCt = dartCtObj.serialize();
+      final (natCt, natSs) = n.kyber768Encapsulate(dartPk, nonce);
+      if (!PhantomCryptoNative._eq(natCt, dartCt) || !PhantomCryptoNative._eq(natSs, Uint8List.fromList(dartSs))) {
+        return _kyFail(dbg, 'encapsulate');
+      }
+
+      // 3. Cross-decapsulation both directions.
+      final dartDecap = HybridKEM.decapsulate(natCt, dartSk);
+      if (!PhantomCryptoNative._eq(dartDecap, natSs)) return _kyFail(dbg, 'dart-decaps-native-ct');
+      final natDecap = n.kyber768Decapsulate(dartSk, dartCt);
+      if (!PhantomCryptoNative._eq(natDecap, Uint8List.fromList(dartSs))) {
+        return _kyFail(dbg, 'native-decaps-dart-ct');
+      }
+
+      dbg.log('NATIVE: ✓ Rust Kyber-768 parity OK '
+          '(keygen, encaps, cross-decaps both ways)');
+      return true;
+    } catch (e) {
+      dbg.log('NATIVE: ✗ kyber oracle error: $e');
+      return false;
+    }
+  }
+
+  bool _kyFail(TransportDebugger dbg, String which) {
+    dbg.log('NATIVE: ✗ KYBER PARITY MISMATCH on $which — native Kyber NOT trusted');
+    return false;
+  }
+
+  // ── Kyber-768 gate (native when trusted, Dart otherwise) ───────────────────
+
+  /// Deterministic Kyber keypair from a 64-byte seed. Same bytes either path
+  /// (parity-proven), so a device flipping between native/Dart regenerates
+  /// identical keys from its seed.
+  (Uint8List, Uint8List) kyberGenerateKeys(Uint8List seed64) {
+    if (kyberNative) {
+      try {
+        return _native!.kyber768Keypair(seed64);
+      } catch (_) {/* fall through */}
+    }
+    return HybridKEM.generateKeys(seed64);
+  }
+
+  /// Encapsulate to [kyberPkBytes] → (ciphertext, shared secret).
+  (Uint8List, Uint8List) kyberEncapsulate(Uint8List kyberPkBytes) {
+    if (kyberNative) {
+      try {
+        final rng = Random.secure();
+        final nonce =
+            Uint8List.fromList(List.generate(32, (_) => rng.nextInt(256)));
+        return _native!.kyber768Encapsulate(kyberPkBytes, nonce);
+      } catch (_) {/* fall through */}
+    }
+    return HybridKEM.encapsulate(kyberPkBytes);
+  }
+
+  /// Decapsulate [cipherBytes] with [kyberSkBytes] → 32-byte shared secret.
+  /// Native path is verified constant-time (the Dart one is not).
+  Uint8List kyberDecapsulate(Uint8List cipherBytes, Uint8List kyberSkBytes) {
+    if (kyberNative) {
+      try {
+        return _native!.kyber768Decapsulate(kyberSkBytes, cipherBytes);
+      } catch (_) {/* fall through */}
+    }
+    return HybridKEM.decapsulate(cipherBytes, kyberSkBytes);
   }
 
   /// Test-only: load the host `libphantom_crypto.so` from [soPath] and run both
@@ -84,6 +185,7 @@ class NativeCryptoGate {
     _native = PhantomCryptoNative.openPath(soPath);
     _verified = await _native!.runParityOracle();
     _ratchetVerified = await _verifyRatchet(_native!);
+    _kyberVerified = _verifyKyber(_native!);
     return ratchetNative;
   }
 
@@ -94,6 +196,7 @@ class NativeCryptoGate {
   void disableForTest() {
     _verified = false;
     _ratchetVerified = false;
+    _kyberVerified = false;
   }
 
   /// On-device ratchet parity oracle. Drives a full 3-step Alice↔Bob
@@ -210,6 +313,15 @@ typedef _VerifyD = int Function(
     Pointer<Uint8>, Pointer<Uint8>, int, Pointer<Uint8>);
 
 // Stateful ratchet: opaque handle + heap-buffer outputs.
+// Kyber-768 round 3: fixed-size buffers (pk 1184, sk 2400, ct 1088, ss 32).
+typedef _Kyber3C = Int32 Function(Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>);
+typedef _Kyber3D = int Function(Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>);
+
+typedef _Kyber4C = Int32 Function(
+    Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>);
+typedef _Kyber4D = int Function(
+    Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>);
+
 typedef _RatFromJsonC = Pointer<Void> Function(Pointer<Uint8>, IntPtr);
 typedef _RatFromJsonD = Pointer<Void> Function(Pointer<Uint8>, int);
 
@@ -261,6 +373,9 @@ class PhantomCryptoNative {
   late final _X3dhD _x3dh = _lib.lookupFunction<_X3dhC, _X3dhD>('phantom_x3dh_initiate');
   late final _CombineD _combine = _lib.lookupFunction<_CombineC, _CombineD>('phantom_hybrid_combine');
   late final _VerifyD _verify = _lib.lookupFunction<_VerifyC, _VerifyD>('phantom_ed25519_verify');
+  late final _Kyber3D _kyberKeypair = _lib.lookupFunction<_Kyber3C, _Kyber3D>('phantom_kyber768_keypair');
+  late final _Kyber4D _kyberEncaps = _lib.lookupFunction<_Kyber4C, _Kyber4D>('phantom_kyber768_encapsulate');
+  late final _Kyber3D _kyberDecaps = _lib.lookupFunction<_Kyber3C, _Kyber3D>('phantom_kyber768_decapsulate');
   late final _RatFromJsonD _ratFromJson = _lib.lookupFunction<_RatFromJsonC, _RatFromJsonD>('phantom_ratchet_from_json');
   late final _RatEncryptD _ratEncrypt = _lib.lookupFunction<_RatEncryptC, _RatEncryptD>('phantom_ratchet_encrypt');
   late final _RatDecryptD _ratDecrypt = _lib.lookupFunction<_RatDecryptC, _RatDecryptD>('phantom_ratchet_decrypt');
@@ -293,6 +408,52 @@ class PhantomCryptoNative {
 
   Uint8List x25519Shared(Uint8List ourSeed, Uint8List theirPub) =>
       _call2(_x25519, ourSeed, theirPub);
+
+  // ── Kyber-768 round 3 (fixed-size buffers) ─────────────────────────────────
+
+  /// (pk 1184, sk 2400) from a 64-byte seed — byte-identical to Dart's
+  /// `HybridKEM.generateKeys` (parity-proven).
+  (Uint8List, Uint8List) kyber768Keypair(Uint8List seed64) {
+    final s = _toC(seed64);
+    final pk = calloc<Uint8>(1184);
+    final sk = calloc<Uint8>(2400);
+    try {
+      final rc = _kyberKeypair(s, pk, sk);
+      if (rc != 0) throw StateError('kyber keypair rc=$rc');
+      return (_fromC(pk, 1184), _fromC(sk, 2400));
+    } finally {
+      calloc.free(s); calloc.free(pk); calloc.free(sk);
+    }
+  }
+
+  /// (ct 1088, ss 32) — deterministic encapsulation with an explicit nonce.
+  (Uint8List, Uint8List) kyber768Encapsulate(Uint8List pk, Uint8List nonce32) {
+    final p = _toC(pk);
+    final n = _toC(nonce32);
+    final ct = calloc<Uint8>(1088);
+    final ss = calloc<Uint8>(32);
+    try {
+      final rc = _kyberEncaps(p, n, ct, ss);
+      if (rc != 0) throw StateError('kyber encapsulate rc=$rc');
+      return (_fromC(ct, 1088), _fromC(ss, 32));
+    } finally {
+      calloc.free(p); calloc.free(n); calloc.free(ct); calloc.free(ss);
+    }
+  }
+
+  /// ss 32 from (sk 2400, ct 1088) — constant-time, implicit rejection.
+  Uint8List kyber768Decapsulate(Uint8List sk, Uint8List ct) {
+    final s = _toC(sk);
+    final c = _toC(ct);
+    final ss = calloc<Uint8>(32);
+    try {
+      final rc = _kyberDecaps(s, c, ss);
+      if (rc != 0) throw StateError('kyber decapsulate rc=$rc');
+      return _fromC(ss, 32);
+    } finally {
+      calloc.free(s); calloc.free(c); calloc.free(ss);
+    }
+  }
 
   Uint8List hybridCombine(Uint8List x3dh, Uint8List kyber) =>
       _call2(_combine, x3dh, kyber);
@@ -369,7 +530,7 @@ class PhantomCryptoNative {
               remotePublicKey:
                   SimplePublicKey(peerPub, type: KeyPairType.x25519)))
           .extractBytes());
-      if (!_eq(x25519Shared(ourSeed, peerPub), dartShared)) {
+      if (!PhantomCryptoNative._eq(x25519Shared(ourSeed, peerPub), dartShared)) {
         return _fail(dbg, 'x25519');
       }
 
@@ -403,12 +564,12 @@ class PhantomCryptoNative {
                   info: Uint8List.fromList('phantom-x3dh-v1'.codeUnits)))
           .extractBytes());
       final nativeX3dh = x3dhInitiate(aIk, aEph, bIkPub, bSpkPub, bOpkPub);
-      if (!_eq(nativeX3dh, dartX3dh)) return _fail(dbg, 'x3dh');
+      if (!PhantomCryptoNative._eq(nativeX3dh, dartX3dh)) return _fail(dbg, 'x3dh');
 
       // 3. Hybrid combine: random secrets vs HybridKEM.combineSecrets.
       final s1 = rand(32), s2 = rand(32);
       final dartCombine = await HybridKEM.combineSecrets(s1, s2);
-      if (!_eq(hybridCombine(s1, s2), dartCombine)) {
+      if (!PhantomCryptoNative._eq(hybridCombine(s1, s2), dartCombine)) {
         return _fail(dbg, 'hybrid-combine');
       }
 

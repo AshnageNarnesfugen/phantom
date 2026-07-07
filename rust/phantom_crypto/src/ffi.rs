@@ -20,6 +20,10 @@
 //! by the contract (32-byte keys, caller-supplied lengths). No panics cross the
 //! boundary; secret state zeroizes on drop (including the discarded clone).
 
+use crate::kyber::{
+    kyber768_decapsulate, kyber768_encapsulate, kyber768_keypair, KYBER768_CT_LEN,
+    KYBER768_PK_LEN, KYBER768_SK_LEN,
+};
 use crate::ratchet::{EncryptedMessage, RatchetSession};
 use crate::{
     chacha20poly1305_decrypt, chacha20poly1305_encrypt, ed25519_verify, hybrid_combine,
@@ -133,6 +137,81 @@ pub unsafe extern "C" fn phantom_ed25519_verify(
         std::slice::from_raw_parts(msg, msg_len)
     };
     ed25519_verify(&pk, m, &s) as i32
+}
+
+// ── Kyber-768 round 3 (wire-compatible with Dart post_quantum) ────────────────
+
+/// Deterministic Kyber-768 keypair from a 64-byte seed. Writes pk (1184 bytes)
+/// and sk (2400 bytes) into the caller's buffers. Returns 0 on success.
+///
+/// # Safety: `seed` is 64 bytes; `pk_out` 1184 writable; `sk_out` 2400 writable.
+#[no_mangle]
+pub unsafe extern "C" fn phantom_kyber768_keypair(
+    seed: *const u8,
+    pk_out: *mut u8,
+    sk_out: *mut u8,
+) -> i32 {
+    if seed.is_null() || pk_out.is_null() || sk_out.is_null() {
+        return 1;
+    }
+    let mut s = [0u8; 64];
+    s.copy_from_slice(std::slice::from_raw_parts(seed, 64));
+    let (pk, mut sk) = kyber768_keypair(&s);
+    s.zeroize();
+    std::ptr::copy_nonoverlapping(pk.as_ptr(), pk_out, KYBER768_PK_LEN);
+    std::ptr::copy_nonoverlapping(sk.as_ptr(), sk_out, KYBER768_SK_LEN);
+    sk.zeroize();
+    0
+}
+
+/// Kyber-768 encapsulation against `pk` with an explicit 32-byte nonce (hashed
+/// internally, round-3 style). Writes ct (1088) and the 32-byte shared secret.
+/// Returns 0 on success.
+///
+/// # Safety: `pk` is 1184 bytes; `nonce` 32; `ct_out` 1088 writable; `ss_out`
+/// 32 writable.
+#[no_mangle]
+pub unsafe extern "C" fn phantom_kyber768_encapsulate(
+    pk: *const u8,
+    nonce: *const u8,
+    ct_out: *mut u8,
+    ss_out: *mut u8,
+) -> i32 {
+    if pk.is_null() || nonce.is_null() || ct_out.is_null() || ss_out.is_null() {
+        return 1;
+    }
+    let mut p = [0u8; KYBER768_PK_LEN];
+    p.copy_from_slice(std::slice::from_raw_parts(pk, KYBER768_PK_LEN));
+    let mut n = [0u8; 32];
+    n.copy_from_slice(std::slice::from_raw_parts(nonce, 32));
+    let (ct, ss) = kyber768_encapsulate(&p, &n);
+    n.zeroize();
+    std::ptr::copy_nonoverlapping(ct.as_ptr(), ct_out, KYBER768_CT_LEN);
+    std::ptr::copy_nonoverlapping(ss.as_bytes().as_ptr(), ss_out, 32);
+    0
+}
+
+/// Kyber-768 decapsulation (constant-time, implicit rejection — never signals
+/// failure). Writes the 32-byte shared secret. Returns 0 on success.
+///
+/// # Safety: `sk` is 2400 bytes; `ct` 1088; `ss_out` 32 writable.
+#[no_mangle]
+pub unsafe extern "C" fn phantom_kyber768_decapsulate(
+    sk: *const u8,
+    ct: *const u8,
+    ss_out: *mut u8,
+) -> i32 {
+    if sk.is_null() || ct.is_null() || ss_out.is_null() {
+        return 1;
+    }
+    let mut s = [0u8; KYBER768_SK_LEN];
+    s.copy_from_slice(std::slice::from_raw_parts(sk, KYBER768_SK_LEN));
+    let mut c = [0u8; KYBER768_CT_LEN];
+    c.copy_from_slice(std::slice::from_raw_parts(ct, KYBER768_CT_LEN));
+    let ss = kyber768_decapsulate(&s, &c);
+    s.zeroize();
+    std::ptr::copy_nonoverlapping(ss.as_bytes().as_ptr(), ss_out, 32);
+    0
 }
 
 // ── Stateful ratchet: opaque handle + heap-buffer outputs ─────────────────────
@@ -616,6 +695,44 @@ mod tests {
             let p1 = ffi_decrypt(reloaded, M1_HDR, M1_CT, M1_NONCE).unwrap();
             assert_eq!(String::from_utf8(p1).unwrap(), "hola desde dart 1");
             phantom_ratchet_free(reloaded);
+        }
+    }
+
+    #[test]
+    fn ffi_kyber768_round_trips_through_c_abi() {
+        unsafe {
+            let seed = [0x42u8; 64];
+            let mut pk = [0u8; KYBER768_PK_LEN];
+            let mut sk = [0u8; KYBER768_SK_LEN];
+            assert_eq!(
+                phantom_kyber768_keypair(seed.as_ptr(), pk.as_mut_ptr(), sk.as_mut_ptr()),
+                0
+            );
+            // Matches the direct API (and therefore the Dart vectors).
+            let (pk2, sk2) = crate::kyber::kyber768_keypair(&seed);
+            assert_eq!(pk, pk2);
+            assert_eq!(sk.as_slice(), sk2.as_slice());
+
+            let nonce = [0x24u8; 32];
+            let mut ct = [0u8; KYBER768_CT_LEN];
+            let mut ss1 = [0u8; 32];
+            assert_eq!(
+                phantom_kyber768_encapsulate(
+                    pk.as_ptr(), nonce.as_ptr(), ct.as_mut_ptr(), ss1.as_mut_ptr()
+                ),
+                0
+            );
+            let mut ss2 = [0u8; 32];
+            assert_eq!(
+                phantom_kyber768_decapsulate(sk.as_ptr(), ct.as_ptr(), ss2.as_mut_ptr()),
+                0
+            );
+            assert_eq!(ss1, ss2);
+            // Null args rejected, not UB.
+            assert_eq!(
+                phantom_kyber768_keypair(std::ptr::null(), pk.as_mut_ptr(), sk.as_mut_ptr()),
+                1
+            );
         }
     }
 

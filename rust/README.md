@@ -63,20 +63,40 @@ Covered so far (byte-identical, 9/9 parity tests):
   `cargo build --release` emits `libphantom_crypto.so` (Android/Linux) + `.a`
   (iOS).
 
-`cargo test` → 23/23 (parity + ratchet cross-compat + FFI null-safety +
+`cargo test` → 29/29 (parity + ratchet cross-compat + FFI null-safety +
 stateful-handle round-trip, atomicity, status + to_json persistence, sealed-blob
-round-trip & wrong-key rejection).
+round-trip & wrong-key rejection, Kyber-768 keygen/encaps/decaps parity +
+implicit-rejection deviation lock).
 
-## Kyber-768: why it stays in Dart for now
+## Kyber-768: MIGRATED (round-3 wire-compatible via libcrux)
 
 The Dart `post_quantum` package implements **round-3 Kyber** (SHAKE256 KDF over
-the ciphertext hash). The Rust `ml-kem` crates implement **FIPS-203 ML-KEM**,
-which changed the final KDF — so the same ciphertext decapsulates to a
-*different* shared secret across the two. They are not wire-compatible. Kyber
-therefore either (a) stays in Dart and hands its 32-byte secret to
-`hybrid_combine`, or (b) migrates on BOTH sides at once during the cutover
-(with a round-3 Rust crate, cross-verified). Forcing it now would silently
-break hybrid sessions mid-migration.
+the ciphertext hash), NOT FIPS-203 ML-KEM (different final KDF — the two don't
+cross-decapsulate). The escape hatch: **`libcrux-ml-kem` with the `kyber`
+feature** — the formally verified (hax/F*) implementation libsignal uses for
+PQXDH — implements exactly the round-3 variant. Parity-proven against vectors
+from the live Dart (`tool/gen_kyber_vectors.dart` → `src/kyber_test_vectors.rs`):
+**keygen, encapsulation (ct AND ss), and decapsulation are byte-identical**, so
+the migration changes nothing on the wire (`src/kyber.rs`).
+
+Bonus security fix: Dart's implicit-rejection comparison is not constant-time
+(its own source warns about it); libcrux's decapsulation is verified
+constant-time.
+
+**Known deviation (interop-irrelevant, locked in by test)**: on a
+tampered/foreign ciphertext, Dart derives the round-3 reference rejection
+`SHAKE256(z ‖ H(ct))` while libcrux derives the ML-KEM-style
+`SHAKE256(PRF(z ‖ ct) ‖ H(ct))`. That secret only exists on a corrupted/forged
+ciphertext, where ANY value is equally wrong — the handshake fails identically
+on every implementation pairing and nothing persists it. Security holds in both
+(pseudorandom output, no failure signal).
+
+Runtime: three more C-ABI functions (`phantom_kyber768_keypair` /
+`_encapsulate` / `_decapsulate`, fixed-size buffers) behind their own on-device
+oracle (`kyberNative`): keygen parity + same-nonce encaps parity + cross
+decapsulation in BOTH directions (native ct → Dart decaps, Dart ct → native
+decaps). Routed call sites: `_initKyberKeys` (keygen), X3DH initiation
+(encapsulate), INIT-frame handling (decapsulate). Dart fallback as always.
 
 ## Status — crypto ported + parity-proven; FFI wiring is what remains
 
@@ -192,14 +212,12 @@ round-trip, Dart-open fallback, legacy load).
 
 ### What remains
 
-1. **Kyber stays in Dart** — decided. The Dart `post_quantum` package is round-3
-   Kyber (SHAKE256 final KDF); the Rust `ml-kem` crates are FIPS-203 ML-KEM, a
-   different final KDF, so they don't cross-decapsulate. Migrating means either a
-   round-3 Rust crate (`pqc_kyber`, which carries the KyberSlash timing advisory)
-   or moving BOTH sides to ML-KEM at once (a coordinated on-wire change). Neither
-   is worth it: Kyber is a stateless KEM with no long-lived secret state, so the
-   memory-hygiene case that drove the ratchet port doesn't apply. It keeps
-   handing its 32-byte secret to `hybrid_combine` (which runs in Rust).
+Nothing — the migration is complete. Every security-critical primitive
+(X25519/X3DH, Ed25519 verification, HKDF chains, the full double ratchet,
+hybrid combine, and Kyber-768) now runs in Rust when the on-device oracles are
+green, with the byte-identical Dart implementation as automatic fallback.
+Possible future work: migrating both sides to FIPS-203 ML-KEM (a coordinated
+on-wire change, only worth it if the round-3 scheme is ever deprecated).
 
 Nothing changes the on-wire format — the parity vectors + the runtime oracle
 are the guardrails.

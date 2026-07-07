@@ -186,6 +186,34 @@ void main() {
       expect(s(await bobDart.decrypt(aliceNext)), 'after');
     });
 
+    test('Kyber-768: native gate is live and cross-compatible with Dart',
+        () async {
+      if (!soExists) return markTestSkipped('host .so not built');
+      final gate = NativeCryptoGate.instance;
+      // The Kyber oracle ran in enableForTest; with the host .so it must pass.
+      expect(gate.kyberNative, isTrue,
+          reason: 'Kyber cross-parity oracle must be green on the host');
+
+      // End-to-end through the gate (native path): keygen → encaps → decaps.
+      final seed = rand(64);
+      final (pk, sk) = gate.kyberGenerateKeys(seed);
+      expect(pk.length, 1184);
+      expect(sk.length, 2400);
+      final (ct, ss) = gate.kyberEncapsulate(pk);
+      expect(ct.length, 1088);
+      final ssDec = gate.kyberDecapsulate(ct, sk);
+      expect(ssDec, equals(ss));
+
+      // Cross: native-encapsulated ct decapsulates in PURE DART to the same
+      // secret (the wire-compat claim, exercised through the public API).
+      gate.disableForTest();
+      addTearDown(() async {
+        await NativeCryptoGate.instance.enableForTest(soPath);
+      });
+      final ssDart = gate.kyberDecapsulate(ct, sk); // Dart fallback path
+      expect(ssDart, equals(ss));
+    });
+
     test('legacy plaintext sessions still load (no blob key path)', () async {
       if (!soExists) return markTestSkipped('host .so not built');
       // A session serialized the OLD way (plaintext map, no 'blob' key) must

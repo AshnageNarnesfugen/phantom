@@ -1527,9 +1527,11 @@ class PhantomCore {
   // ── Kyber-768 initialisation ───────────────────────────────────────────────
 
   /// Derive the Kyber-768 keypair from [seedPhrase] and hold it in memory.
+  /// Native and Dart derive identical bytes from the seed (parity-proven), so
+  /// the keypair is stable even if a device flips between the two paths.
   Future<void> _initKyberKeys(String seedPhrase) async {
     final seed = await HybridKEM.deriveKyberSeed(seedPhrase);
-    final (pk, sk) = HybridKEM.generateKeys(seed);
+    final (pk, sk) = NativeCryptoGate.instance.kyberGenerateKeys(seed);
     _kyberPublicKeyBytes  = pk;
     _kyberPrivateKeyBytes = sk;
   }
@@ -2422,11 +2424,12 @@ class PhantomCore {
           frame.kyberCipherBytes != null &&
           _kyberPrivateKeyBytes != null) {
         try {
-          final kyberSecret = HybridKEM.decapsulate(
+          final kyberSecret = NativeCryptoGate.instance.kyberDecapsulate(
             frame.kyberCipherBytes!,
             _kyberPrivateKeyBytes!,
           );
-          sharedSecret = await HybridKEM.combineSecrets(sharedSecret, kyberSecret);
+          sharedSecret = await NativeCryptoGate.instance
+              .hybridCombine(sharedSecret, kyberSecret);
         } catch (e) {
           lastError = e;
           continue;

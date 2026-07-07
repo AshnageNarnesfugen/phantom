@@ -3,7 +3,6 @@ import 'dart:typed_data';
 import 'package:bs58check/bs58check.dart' as bs58check;
 import 'package:cryptography/cryptography.dart';
 import 'package:meta/meta.dart';
-import 'hybrid_kem.dart';
 import 'native/phantom_crypto_native.dart';
 
 /// Extended Triple Diffie-Hellman (X3DH) — Signal Protocol.
@@ -326,8 +325,8 @@ class X3DHHandshake {
     Uint8List? kyberCipher;
     Uint8List? hybridSecret;
     if (theirBundle.kyber768PublicKeyBytes != null) {
-      final (cipher, kyberShared) =
-          HybridKEM.encapsulate(theirBundle.kyber768PublicKeyBytes!);
+      final (cipher, kyberShared) = NativeCryptoGate.instance
+          .kyberEncapsulate(theirBundle.kyber768PublicKeyBytes!);
       kyberCipher   = cipher;
       hybridSecret  =
           await NativeCryptoGate.instance.hybridCombine(sharedSecret, kyberShared);
