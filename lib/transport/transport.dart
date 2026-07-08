@@ -181,6 +181,12 @@ class TransportManager {
   /// daemon either.
   bool _lateRetryInProgress = false;
 
+  /// Public re-probe of transports that weren't available earlier. The status
+  /// UI calls this on its refresh timer so a transport that came up after
+  /// initialize (e.g. the Yggdrasil TUN finishing its bootstrap) shows active
+  /// without waiting for the next outgoing message. Same 3 s throttle.
+  Future<void> reprobeInactive() => _activateLateTransports();
+
   Future<void> _activateLateTransports() async {
     if (_ourId.isEmpty || _lateRetryInProgress) return;
     final now = DateTime.now();
@@ -1602,10 +1608,13 @@ class YggdrasilTransport implements PhantomTransport {
         try {
           final res = await Process.run('ip', ['-6', 'addr']);
           if (res.exitCode == 0) {
-            // Strict match for Yggdrasil 0200::/7 — first byte must be 0x02 or 0x03.
-            // In IPv6 text, that's 02xx: or 03xx: (with optional leading-zero omission).
-            // We require the full 4-char first group to avoid matching 2001:, 2a02:, etc.
-            final regex = RegExp(r'inet6\s+(0[23][0-9a-fA-F]{2}:[0-9a-fA-F:]+)/\d+');
+            // Strict match for Yggdrasil 0200::/7 — first byte must be 0x02 or
+            // 0x03. In `ip -6 addr` TEXT the leading zero of the first group is
+            // omitted: 0x0203… renders as `203:…`, never `0203:`. So the first
+            // group is exactly THREE hex chars starting with 2 or 3 — which also
+            // rejects global unicast like 2806: / 2001: (four chars). The old
+            // pattern demanded a literal leading 0 and could never match.
+            final regex = RegExp(r'inet6\s+([23][0-9a-fA-F]{2}:[0-9a-fA-F:]+)/\d+');
             final match = regex.firstMatch(res.stdout.toString());
             if (match != null && match.groupCount >= 1) {
               _address = match.group(1)!;
@@ -1616,7 +1625,14 @@ class YggdrasilTransport implements PhantomTransport {
       }
     }
 
-    // 2. Check if we can bind to an IPv6 address
+    // 2. HONEST availability: no Yggdrasil address → NOT available. The old
+    // check returned true whenever binding :: worked (i.e. always), which
+    // logged "availability = true" on devices with no TUN, no router and no
+    // route to any ygg peer — a false positive that masked the daemon never
+    // starting (field bug: OK logs while the transport was dead).
+    if (_address == null) return false;
+
+    // 3. And our listener must be bindable.
     try {
       final s = await ServerSocket.bind(InternetAddress.anyIPv6, 0);
       await s.close();

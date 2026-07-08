@@ -1272,7 +1272,15 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
     // sheet is open so the user actually sees the status flip from
     // "bootstrapping" to "ready" without closing and re-opening.
     _refreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (mounted) _fetchIpfsStatus();
+      if (mounted) {
+        _fetchIpfsStatus();
+        // Re-probe transports that weren't up at app start (Yggdrasil's TUN
+        // finishing bootstrap, I2P tunnels converging). Without this the
+        // sheet only showed the availability snapshot taken at initialize —
+        // a transport that came up later read "inactive" until the next
+        // outgoing message triggered the lazy re-probe.
+        widget.core?.transport.reprobeInactive();
+      }
     });
   }
 
@@ -1308,7 +1316,10 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
       final ygg = core.transport.transports.whereType<YggdrasilTransport>().firstOrNull;
       final i2p = core.transport.transports.whereType<I2PTransport>().firstOrNull;
       final ipfs = core.transport.transports.whereType<IpfsTransport>().firstOrNull;
+      final yggBundled = await YggdrasilDaemon.instance.isRouterBundled();
+      if (!mounted) return;
       setState(() {
+        _yggRouterMissing = Platform.isAndroid && !yggBundled;
         _yggAddress = ygg?.address;
         _i2pSamReachable    = i2p?.isSamReachable    ?? false;
         _i2pSessionReady    = i2p?.isSessionReady    ?? false;
@@ -1320,6 +1331,7 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
   }
 
   String? _yggAddress;
+  bool _yggRouterMissing = false;
   bool _i2pSamReachable = false;
   bool _i2pSessionReady = false;
   int _i2pFailureCount = 0;
@@ -1418,7 +1430,11 @@ class _TransportStatusSheetState extends State<_TransportStatusSheet> {
           ),
           _TransportRow(
             label: 'yggdrasil',
-            value: _yggAddress != null ? _yggAddress!.substring(0, _yggAddress!.length.clamp(0, 16)) : 'inactive',
+            value: _yggRouterMissing
+                ? 'missing binary'
+                : _yggAddress != null
+                    ? _yggAddress!.substring(0, _yggAddress!.length.clamp(0, 16))
+                    : 'inactive',
             tokens: t,
           ),
           _TransportRow(
@@ -1596,9 +1612,45 @@ class _YggdrasilPeersSheetState extends State<_YggdrasilPeersSheet> {
             label: 'enable yggdrasil',
             value: _enabled,
             tokens: t,
-            onChanged: (v) {
+            onChanged: (v) async {
               setState(() => _enabled = v);
               unawaited(PhantomStorage.instance.setYggEnabled(v));
+              // Enabling must actually bring the tunnel up: trigger the
+              // one-time Android VPN-permission dialog and start the service
+              // right now (before this fix the toggle only wrote the setting
+              // and nothing asked for permission — the dialog was unreachable
+              // and Yggdrasil could never start).
+              final messenger = ScaffoldMessenger.of(context);
+              if (v) {
+                final bundled =
+                    await YggdrasilDaemon.instance.isRouterBundled();
+                if (!bundled) {
+                  messenger.showSnackBar(const SnackBar(
+                    content: Text(
+                        'yggdrasil router not bundled in this APK — rebuild '
+                        'with scripts/build_yggdrasil_mobile.sh',
+                        style: TextStyle(
+                            fontFamily: 'monospace', fontSize: 12)),
+                    duration: Duration(seconds: 4),
+                  ));
+                  return;
+                }
+                final ok = await YggdrasilDaemon.instance
+                    .requestPermissionAndStart();
+                messenger.showSnackBar(SnackBar(
+                  content: Text(
+                      ok
+                          ? 'yggdrasil up — address '
+                            '${YggdrasilDaemon.instance.address ?? "?"}'
+                          : 'yggdrasil could not start (permission denied or '
+                            'another VPN holds the slot)',
+                      style: const TextStyle(
+                          fontFamily: 'monospace', fontSize: 12)),
+                  duration: const Duration(seconds: 4),
+                ));
+              } else {
+                await YggdrasilDaemon.instance.stop();
+              }
             },
           ),
           _YggSwitchRow(

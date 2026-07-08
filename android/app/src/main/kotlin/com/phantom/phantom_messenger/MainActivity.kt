@@ -177,6 +177,24 @@ class MainActivity : FlutterActivity() {
                 "isPrepared" -> {
                     result.success(VpnService.prepare(applicationContext) == null)
                 }
+                // True when yggdrasil-mobile.aar is actually inside this APK.
+                // Lets the UI say "router binary missing" instead of a
+                // misleading generic "inactive".
+                "isRouterBundled" -> {
+                    result.success(YggdrasilVpnService.routerBundled())
+                }
+                // The identity the router provisioned on its first start
+                // (address + full config incl. PrivateKey), or null if it
+                // hasn't started yet. Dart persists it into its config file.
+                "getProvisioned" -> {
+                    val prefs = getSharedPreferences(
+                        YggdrasilVpnService.PREFS_NAME, Context.MODE_PRIVATE)
+                    val addr = prefs.getString(YggdrasilVpnService.KEY_ADDRESS, null)
+                    val cfg  = prefs.getString(YggdrasilVpnService.KEY_CONFIG, null)
+                    result.success(
+                        if (addr == null || cfg == null) null
+                        else mapOf("address" to addr, "config" to cfg))
+                }
                 "requestPermission" -> {
                     val intent = VpnService.prepare(applicationContext)
                     if (intent == null) {

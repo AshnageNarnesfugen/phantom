@@ -37,6 +37,19 @@ class YggdrasilVpnService : VpnService() {
         const val EXTRA_CONFIG = "configJson"
         const val EXTRA_ADDR   = "address"
 
+        // Bootstrap results (final config incl. generated PrivateKey + the
+        // router's real 0200::/7 address) are persisted here so the Dart side
+        // can read them back after the first start and keep the identity
+        // stable across runs. Same pattern as WakuForegroundService's port.
+        const val PREFS_NAME  = "phantom_ygg_prefs"
+        const val KEY_ADDRESS = "ygg_address"
+        const val KEY_CONFIG  = "ygg_config"
+
+        /** True when the gomobile router class is inside this APK. */
+        fun routerBundled(): Boolean = try {
+            Class.forName("mobile.Yggdrasil"); true
+        } catch (_: Throwable) { false }
+
         fun startIntent(ctx: Context, configJson: String, address: String): Intent =
             Intent(ctx, YggdrasilVpnService::class.java).apply {
                 action = ACTION_START
@@ -88,44 +101,87 @@ class YggdrasilVpnService : VpnService() {
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
+    /// Router-FIRST start. The old order (TUN → router) could never bootstrap:
+    /// on a fresh install Dart has no 0200::/7 address to give the TUN, and
+    /// the only thing that can produce one is the router itself. So:
+    ///   1. ensure the config has a PrivateKey (generateConfigJSON when not)
+    ///   2. startJSON the router (works without a TUN — we pump manually)
+    ///   3. ask it for its real address (getAddressString)
+    ///   4. establish the TUN with THAT address
+    ///   5. persist address+config to SharedPreferences so the Dart side can
+    ///      read them back and keep the identity stable across runs
     private fun start(configJson: String, ourAddress: String): Boolean {
         try {
-            // 1. Build TUN
-            val builder = Builder()
-                .setSession("Phantom Yggdrasil")
-                .setMtu(1280)
-                .addAddress(ourAddress, 7)
-                .addRoute("0200::", 7)
-            // Allow our app to bypass the VPN so internal IPFS / TCP keeps working
-            builder.addDisallowedApplication(packageName)
-            val pfd = builder.establish() ?: run {
-                Log.e(TAG, "VpnService.establish() returned null — VPN permission?")
-                return false
-            }
-            tunFd = pfd
-
-            // 2. Load mobile.Yggdrasil via reflection so the app links even
+            // 1. Load mobile.Yggdrasil via reflection so the app links even
             //    when the .aar is absent.
             val yggCls = try {
                 Class.forName("mobile.Yggdrasil")
             } catch (e: ClassNotFoundException) {
                 Log.e(TAG, "mobile.Yggdrasil missing — yggdrasil-mobile.aar not built into this APK")
-                pfd.close(); tunFd = null
                 return false
+            }
+
+            // 2. A config without a PrivateKey would make startJSON mint a new
+            //    ephemeral key (= new address) on EVERY run. Generate a full
+            //    config once and merge our fields (Peers etc.) into it.
+            var effectiveConfig = configJson
+            if (!org.json.JSONObject(configJson).has("PrivateKey")) {
+                try {
+                    val gen = Class.forName("mobile.Mobile")
+                        .getMethod("generateConfigJSON")
+                        .invoke(null) as ByteArray
+                    val full = org.json.JSONObject(String(gen, Charsets.UTF_8))
+                    val ours = org.json.JSONObject(configJson)
+                    for (key in ours.keys()) full.put(key, ours.get(key))
+                    effectiveConfig = full.toString()
+                    Log.i(TAG, "generated persistent Yggdrasil identity")
+                } catch (e: Throwable) {
+                    Log.w(TAG, "generateConfigJSON unavailable — router will use an ephemeral key: $e")
+                }
             }
 
             val ygg = yggCls.getDeclaredConstructor().newInstance()
             yggInstance = ygg
 
-            // 3. Start the router. The contrib/mobile package exposes
-            //    `startJSON([]byte) error` which boots Yggdrasil with the
-            //    given config and a no-op TUN; we feed packets ourselves.
+            // 3. Start the router. contrib/mobile's startJSON boots Yggdrasil
+            //    with a no-op TUN; we feed packets ourselves.
             yggCls.getMethod("startJSON", ByteArray::class.java)
-                .invoke(ygg, configJson.toByteArray(Charsets.UTF_8))
+                .invoke(ygg, effectiveConfig.toByteArray(Charsets.UTF_8))
 
-            // 4. Pump packets
+            // 4. The router knows its real 0200::/7 address; prefer it over
+            //    whatever Dart passed (empty on first run).
+            val realAddress = try {
+                (yggCls.getMethod("getAddressString").invoke(ygg) as? String)
+                    ?.takeIf { it.isNotEmpty() } ?: ourAddress
+            } catch (_: Throwable) { ourAddress }
+            if (realAddress.isEmpty()) {
+                Log.e(TAG, "router produced no address — aborting")
+                shutdown(); return false
+            }
+
+            // 5. Build the TUN with the authoritative address.
+            val builder = Builder()
+                .setSession("Phantom Yggdrasil")
+                .setMtu(1280)
+                .addAddress(realAddress, 7)
+                .addRoute("0200::", 7)
+            // Allow our app to bypass the VPN so internal IPFS / TCP keeps working
+            builder.addDisallowedApplication(packageName)
+            val pfd = builder.establish() ?: run {
+                Log.e(TAG, "VpnService.establish() returned null — VPN permission?")
+                shutdown(); return false
+            }
+            tunFd = pfd
+
+            // 6. Persist the provisioned identity for the Dart side.
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putString(KEY_ADDRESS, realAddress)
+                .putString(KEY_CONFIG, effectiveConfig)
+                .apply()
+
+            // 7. Pump packets
             startPumps(ygg, pfd)
-            Log.i(TAG, "Yggdrasil started; TUN address=$ourAddress")
+            Log.i(TAG, "Yggdrasil started; TUN address=$realAddress")
             return true
         } catch (e: Throwable) {
             Log.e(TAG, "start failed", e)

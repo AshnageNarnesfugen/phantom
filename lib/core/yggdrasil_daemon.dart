@@ -86,29 +86,73 @@ class YggdrasilDaemon {
     _address = null;
   }
 
-  Future<bool> _startService() async {
-    final cfg = await _loadOrGenerateConfig();
-    // Empty cfg.address means we don't yet have a real 0200::/7 from the Go
-    // side. The Kotlin VpnService.Builder.addAddress() rejects an empty
-    // string with IllegalArgumentException, so skip the start entirely in
-    // that case — the user can bring Yggdrasil up later from settings once
-    // the in-process router has produced an address.
-    _address = cfg.address.isEmpty ? null : cfg.address;
-    if (_address == null) {
-      debugPrint('[YggDaemon] no persisted address yet — skipping VPN start; '
-          'Yggdrasil dormant until address is provisioned');
+  /// True when the gomobile router (.aar) is inside this APK. When false the
+  /// service can never run — surfaced in the transport status UI so the user
+  /// sees "missing binary" instead of a misleading "inactive".
+  Future<bool> isRouterBundled() async {
+    if (!Platform.isAndroid) return false;
+    try {
+      return await _ch.invokeMethod<bool>('isRouterBundled') ?? false;
+    } catch (_) {
       return false;
     }
+  }
+
+  Future<bool> _startService() async {
+    final cfg = await _loadOrGenerateConfig();
+    // Empty address = first run. The service now bootstraps router-FIRST:
+    // it starts the router (generating a persistent identity if the config
+    // has no PrivateKey), reads the real 0200::/7 address from it, builds
+    // the TUN with that, and persists both to SharedPreferences. We poll
+    // those back and pin them into our config file so the identity stays
+    // stable across runs.
+    _address = cfg.address.isEmpty ? null : cfg.address;
     try {
       await _ch.invokeMethod<void>('startService', {
         'configJson': cfg.json,
         'address':    cfg.address,
       });
-      debugPrint('[YggDaemon] service started — address=$_address');
-      return true;
     } catch (e) {
       debugPrint('[YggDaemon] startService failed: $e');
       return false;
+    }
+
+    // Wait for the router to provision (first run) or confirm (later runs).
+    for (var i = 0; i < 40; i++) {
+      await Future.delayed(const Duration(milliseconds: 250));
+      try {
+        final prov =
+            await _ch.invokeMethod<Map<Object?, Object?>>('getProvisioned');
+        if (prov != null) {
+          final addr = prov['address'] as String?;
+          final json = prov['config'] as String?;
+          if (addr != null && addr.isNotEmpty && _isYggAddress(addr)) {
+            _address = addr;
+            if (json != null) await _persistProvisioned(addr, json);
+            debugPrint('[YggDaemon] service started — address=$_address');
+            return true;
+          }
+        }
+      } catch (_) {}
+    }
+    // No provisioning seen (router missing / start failed). Whatever address
+    // we had from the config file may still be valid if the service is up.
+    debugPrint('[YggDaemon] no provisioned address after start '
+        '(router missing or failed) — address=$_address');
+    return _address != null;
+  }
+
+  /// Pin the router-provisioned identity (address + full config with
+  /// PrivateKey) into our config file so every later run reuses it.
+  Future<void> _persistProvisioned(String address, String configJson) async {
+    try {
+      final dir = await getApplicationSupportDirectory();
+      final f = File('${dir.path}/yggdrasil.conf.json');
+      final map = jsonDecode(configJson) as Map<String, dynamic>;
+      map['_phantom_address'] = address;
+      await f.writeAsString(jsonEncode(map));
+    } catch (e) {
+      debugPrint('[YggDaemon] could not persist provisioned config: $e');
     }
   }
 
