@@ -174,22 +174,29 @@ class YggdrasilVpnService : VpnService() {
                 shutdown(); return false
             }
 
-            // 5. Build the TUN with the authoritative address. We route ONLY
-            //    the Yggdrasil overlay (0200::/7) into the tunnel — every other
-            //    IPv4/IPv6 destination (IPFS, Waku, I2P on normal internet) has
-            //    no route into the TUN and goes out directly, unaffected.
+            // 5. Build the TUN. Route ONLY the Yggdrasil overlay (0200::/7)
+            //    into the tunnel, and — CRITICALLY — exclude our own package.
             //
-            //    NOTE: we deliberately do NOT addDisallowedApplication(self).
-            //    That excluded OUR app from the tunnel entirely — so our own
-            //    Socket.connect to a peer's 203:… address had no route and
-            //    Yggdrasil could never be a send path for us (the very thing
-            //    we run the router for). The narrow 0200::/7 route already
-            //    keeps IPFS/Waku/I2P direct without excluding the app.
+            //    Why the exclusion is mandatory (learned the hard way from a
+            //    field regression): our reliable transports run as in-package
+            //    daemons (go-waku, kubo, i2pd). When the app is NOT excluded,
+            //    Android binds their sockets to the VPN network; with no default
+            //    route their fleet connections (IPv4 / global IPv6) drop —
+            //    observed on two devices as Waku "no suitable peers found" →
+            //    daemon restart → connection-refused loop the moment ygg came
+            //    up. Excluding the package keeps every daemon on the underlying
+            //    network so messaging is never disrupted by enabling ygg.
+            //
+            //    Trade-off: an excluded app can't originate 0200::/7 traffic
+            //    either, so ygg is not a reliable *send* path for us today —
+            //    acceptable. Messaging correctness (Waku/I2P/IPFS staying up)
+            //    outweighs a marginal overlay transport we don't yet depend on.
             val builder = Builder()
                 .setSession("Phantom Yggdrasil")
                 .setMtu(1280)
                 .addAddress(realAddress, 7)
                 .addRoute("0200::", 7)
+            builder.addDisallowedApplication(packageName)
             val pfd = builder.establish() ?: run {
                 Log.e(TAG, "VpnService.establish() returned null — VPN permission?")
                 shutdown(); return false
