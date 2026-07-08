@@ -26,6 +26,7 @@ import 'notification_service.dart';
 import 'ipfs_daemon.dart';
 import 'i2pd_daemon.dart';
 import 'waku_daemon.dart';
+import 'yggdrasil_daemon.dart';
 import 'transport_debugger.dart';
 import '../transport/transport.dart';
 import '../transport/transport_manager_v2.dart' hide IncomingEnvelope;
@@ -1126,6 +1127,54 @@ class PhantomCore {
       final results = await Connectivity().checkConnectivity();
       return results.any((r) =>
           r == ConnectivityResult.wifi || r == ConnectivityResult.ethernet);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Safety net after the user enables Yggdrasil. Enabling the VPN can drop the
+  /// in-package daemons' fleet connections (a real field regression: Waku died
+  /// on both devices ~30 s after ygg came up). This watches Waku for ~90 s and,
+  /// if it was healthy and then collapses in a SUSTAINED way, blames ygg, stops
+  /// it, persists it off, and tells the user. It only ever DISABLES a marginal
+  /// overlay transport — it can never harm messaging. Arm it from the settings
+  /// toggle (transports are already up there, so attribution is clean).
+  Future<void> guardYggAfterEnable() async {
+    final dbg = TransportDebugger.instance;
+    // Nothing to protect / can't blame ygg if Waku wasn't healthy to begin with.
+    if (!await _wakuHealthy()) return;
+
+    // Sample across the window; require a SUSTAINED collapse (two consecutive
+    // dead checks, ~30 s) so a single fleet blip doesn't disable ygg.
+    var deadStreak = 0;
+    for (var i = 0; i < 6; i++) {
+      await Future<void>.delayed(const Duration(seconds: 15));
+      final healthy = await _wakuHealthy();
+      deadStreak = healthy ? 0 : deadStreak + 1;
+      if (deadStreak >= 2) {
+        dbg.log('YGG: ✗ Waku collapsed right after enabling Yggdrasil — '
+            'backing ygg out to protect messaging.');
+        await YggdrasilDaemon.instance.stop();
+        await storage.setYggEnabled(false);
+        NotificationService.showMessage(
+          contactName: 'Yggdrasil disabled',
+          preview:
+              'it was disrupting your messaging transports — turned it back off',
+          contactId: '',
+        );
+        return;
+      }
+    }
+    dbg.log('YGG: ✓ messaging transports stayed healthy after enabling Yggdrasil.');
+  }
+
+  /// True when the Waku daemon is reachable (its `/debug/v1/info` answers). The
+  /// field collapse showed as the local API going connection-refused (daemon
+  /// restart cascade) → running=false, the unambiguous signal.
+  Future<bool> _wakuHealthy() async {
+    try {
+      final s = await WakuDaemon.instance.status();
+      return s.running;
     } catch (_) {
       return false;
     }

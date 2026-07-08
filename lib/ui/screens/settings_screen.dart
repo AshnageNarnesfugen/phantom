@@ -1621,6 +1621,7 @@ class _YggdrasilPeersSheetState extends State<_YggdrasilPeersSheet> {
               // and nothing asked for permission — the dialog was unreachable
               // and Yggdrasil could never start).
               final messenger = ScaffoldMessenger.of(context);
+              final core = CoreProvider.of(context).core; // capture pre-async
               if (v) {
                 final bundled =
                     await YggdrasilDaemon.instance.isRouterBundled();
@@ -1641,13 +1642,26 @@ class _YggdrasilPeersSheetState extends State<_YggdrasilPeersSheet> {
                   content: Text(
                       ok
                           ? 'yggdrasil up — address '
-                            '${YggdrasilDaemon.instance.address ?? "?"}'
+                            '${YggdrasilDaemon.instance.address ?? "?"} · '
+                            'watching that it doesn\'t disrupt messaging'
                           : 'yggdrasil could not start (permission denied or '
                             'another VPN holds the slot)',
                       style: const TextStyle(
                           fontFamily: 'monospace', fontSize: 12)),
                   duration: const Duration(seconds: 4),
                 ));
+                // Safety net: if enabling ygg collapses the reliable transports
+                // (in-package daemons losing their fleet connections), back it
+                // out automatically. Runs in the background for ~90 s.
+                if (ok && core != null) {
+                  unawaited(core.guardYggAfterEnable().then((_) {
+                    if (mounted) {
+                      core.storage
+                          .getYggEnabled()
+                          .then((v) => setState(() => _enabled = v));
+                    }
+                  }));
+                }
               } else {
                 await YggdrasilDaemon.instance.stop();
               }
