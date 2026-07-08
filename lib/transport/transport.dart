@@ -1854,8 +1854,20 @@ class WakuTransport implements PhantomTransport {
   /// TransportManager also uses this to fan data frames out via IPFS.
   DateTime? _storeDeadUntil;
 
+  /// Per-attempt gossip-settle delay (attempt N waits N×this) and the
+  /// best-effort cooldown after a failed confirm cycle. Overridable in tests
+  /// so the store-death → cooldown → recovery state machine runs instantly.
+  @visibleForTesting
+  Duration confirmUnit = const Duration(seconds: 2);
+  @visibleForTesting
+  Duration deadCooldown = const Duration(seconds: 60);
+
   bool get storeLikelyDead =>
       _storeDeadUntil != null && DateTime.now().isBefore(_storeDeadUntil!);
+
+  // Guards against a stampede: many concurrent publishes each firing _healStore
+  // (the field logs showed 15+ overlapping). One heal at a time.
+  bool _healing = false;
 
   /// Store-connectivity cure, escalating:
   ///  1. re-dial the pinned store nodes (throttled inside the daemon);
@@ -1864,23 +1876,29 @@ class WakuTransport implements PhantomTransport {
   ///  3. if still dead, restart the whole daemon (fresh process = fresh
   ///     dial state), at most once per 3 minutes.
   Future<void> _healStore(TransportDebugger dbg) async {
-    await _daemon.ensureServicePeers();
-    // Give the freshly-POSTed dials a moment before judging them.
-    await Future.delayed(const Duration(seconds: 2));
-    if (await _daemon.hasConnectedStorePeer()) return;
-
-    final now = DateTime.now();
-    if (_lastDaemonRestart != null &&
-        now.difference(_lastDaemonRestart!) < const Duration(minutes: 3)) {
-      return;
-    }
-    _lastDaemonRestart = now;
-    dbg.log('Waku: store nodes still unreachable after re-dial '
-        '(dial backoff?) — restarting daemon');
+    if (_healing) return; // one heal at a time — don't stampede the daemon
+    _healing = true;
     try {
-      await _daemon.restart();
-    } catch (e) {
-      dbg.log('Waku: daemon restart failed: $e');
+      await _daemon.ensureServicePeers();
+      // Give the freshly-POSTed dials a moment before judging them.
+      await Future.delayed(confirmUnit);
+      if (await _daemon.hasConnectedStorePeer()) return;
+
+      final now = DateTime.now();
+      if (_lastDaemonRestart != null &&
+          now.difference(_lastDaemonRestart!) < const Duration(minutes: 3)) {
+        return;
+      }
+      _lastDaemonRestart = now;
+      dbg.log('Waku: store nodes still unreachable after re-dial '
+          '(dial backoff?) — restarting daemon');
+      try {
+        await _daemon.restart();
+      } catch (e) {
+        dbg.log('Waku: daemon restart failed: $e');
+      }
+    } finally {
+      _healing = false;
     }
   }
 
@@ -1930,7 +1948,7 @@ class WakuTransport implements PhantomTransport {
       // Give the gossip time to traverse fleet relay → store node; mesh
       // GRAFT after the first peer connects takes a few heartbeats, hence
       // the growing delay before each verification.
-      await Future.delayed(Duration(seconds: 2 * attempt));
+      await Future.delayed(confirmUnit * attempt);
 
       if (await _storeHasPayload(
           topic: topic, payload: encryptedEnvelope, since: sentAt)) {
@@ -1946,7 +1964,7 @@ class WakuTransport implements PhantomTransport {
       // the next round (throttled internally).
       await _healStore(dbg);
     }
-    _storeDeadUntil = DateTime.now().add(const Duration(seconds: 60));
+    _storeDeadUntil = DateTime.now().add(deadCooldown);
     throw const TransportException(
         'Waku publish never appeared in the fleet store');
   }

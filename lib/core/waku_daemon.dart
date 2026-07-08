@@ -25,6 +25,12 @@ class WakuDaemon {
   static final instance = WakuDaemon._();
   WakuDaemon._();
 
+  /// Subclassable seam for tests: a fake daemon can `extends WakuDaemon` and
+  /// override the REST methods to drive [WakuTransport] deterministically,
+  /// with no network and no real go-waku process.
+  @visibleForTesting
+  WakuDaemon.forTest();
+
   /// REST client bound to an arbitrary endpoint. Used by the desktop lab
   /// (test/lab/) to drive go-waku daemons it spawned itself — possibly
   /// several at once on distinct ports — with the exact same REST methods
@@ -164,6 +170,12 @@ class WakuDaemon {
       debugPrint('[WakuDaemon] stopService error: $e');
     }
     _ensured = false;
+    // Drop the stale endpoint. The restarted daemon binds a NEW dynamic REST
+    // port; keeping the old one made every post-restart request hit a dead
+    // port ("connection refused" forever, on both devices in the field) so the
+    // daemon "restarted" but the app never reconnected. Next ensure() resolves
+    // the fresh port via getApiPort.
+    _dynamicApiUrl = null;
   }
 
   // ── Waku REST API methods ──────────────────────────────────────────────────
@@ -595,11 +607,22 @@ class WakuDaemon {
   /// pinned nodes doesn't reconnect them (go-waku's internal dial backoff
   /// has no reset API). Android only: lab/desktop daemons are spawned and
   /// owned externally.
+  bool _restarting = false;
+
   Future<void> restart() async {
-    if (!Platform.isAndroid) return;
-    debugPrint('[WakuDaemon] restarting daemon');
-    await stop();
-    await ensure();
+    if (!Platform.isAndroid || _restarting) return; // never overlap restarts
+    _restarting = true;
+    try {
+      debugPrint('[WakuDaemon] restarting daemon');
+      await stop();
+      // Let the OS release the REST port and the old process fully exit before
+      // the new daemon tries to bind — a back-to-back stop/start races the
+      // port and the new bind can fail.
+      await Future<void>.delayed(const Duration(seconds: 1));
+      await ensure();
+    } finally {
+      _restarting = false;
+    }
   }
 
   DateTime? _lastPeerHeal;
