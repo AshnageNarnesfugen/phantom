@@ -174,14 +174,22 @@ class YggdrasilVpnService : VpnService() {
                 shutdown(); return false
             }
 
-            // 5. Build the TUN with the authoritative address.
+            // 5. Build the TUN with the authoritative address. We route ONLY
+            //    the Yggdrasil overlay (0200::/7) into the tunnel — every other
+            //    IPv4/IPv6 destination (IPFS, Waku, I2P on normal internet) has
+            //    no route into the TUN and goes out directly, unaffected.
+            //
+            //    NOTE: we deliberately do NOT addDisallowedApplication(self).
+            //    That excluded OUR app from the tunnel entirely — so our own
+            //    Socket.connect to a peer's 203:… address had no route and
+            //    Yggdrasil could never be a send path for us (the very thing
+            //    we run the router for). The narrow 0200::/7 route already
+            //    keeps IPFS/Waku/I2P direct without excluding the app.
             val builder = Builder()
                 .setSession("Phantom Yggdrasil")
                 .setMtu(1280)
                 .addAddress(realAddress, 7)
                 .addRoute("0200::", 7)
-            // Allow our app to bypass the VPN so internal IPFS / TCP keeps working
-            builder.addDisallowedApplication(packageName)
             val pfd = builder.establish() ?: run {
                 Log.e(TAG, "VpnService.establish() returned null — VPN permission?")
                 shutdown(); return false

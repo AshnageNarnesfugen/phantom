@@ -82,6 +82,7 @@ class PhantomCore {
   TransportManagerV2? _transportV2;
   StreamSubscription? _transportV2Sub;
   StreamSubscription? _meshStoreSub;
+  StreamSubscription? _meshDeliveredSub;
   StreamSubscription? _meshRangeSub;
   bool _transportAvailable = false;
   bool get isTransportAvailable => _transportAvailable;
@@ -1331,12 +1332,20 @@ class PhantomCore {
             isHandshake:        isHandshake,
             priority:           priority,
           );
-          final status = (result.success || result.queued)
-              ? MessageStatus.sent
-              : MessageStatus.failed;
+          // Three-state truth: a QUEUED message hasn't actually left the
+          // device (offline / no transport ready) — keep it 'sending' so the
+          // UI shows a clock, not a checkmark. It flips to 'sent' via the
+          // messageStore.delivered listener when it really goes out. Only a
+          // transport actually accepting the frame is 'sent'.
+          final accepted = result.success || result.queued;
+          final status = !accepted
+              ? MessageStatus.failed
+              : result.queued
+                  ? MessageStatus.sending
+                  : MessageStatus.sent;
           await storage.updateMessageStatus(recipientId, message.id, status);
 
-          if (isHandshake && status == MessageStatus.sent &&
+          if (isHandshake && accepted &&
               message.type != MessageType.connectivityInfo &&
               message.type != MessageType.preKeyShare &&
               message.type != MessageType.handshakeAck) {
@@ -2244,6 +2253,14 @@ class PhantomCore {
         // Persist the store to Hive whenever its contents change.
         _meshStoreSub = _transportV2!.messageStore.pendingCountStream.listen((_) {
           storage.saveMessageStore(_transportV2!.messageStore.toJson());
+        });
+        // A queued message finally went out → flip its clock to a checkmark.
+        _meshDeliveredSub = _transportV2!.delivered.listen((p) async {
+          final id = p.fullMessageId, target = p.targetPhantomId;
+          if (id == null || target == null) return;
+          await storage.updateMessageStatus(target, id, MessageStatus.sent);
+          // contactChanges makes the open chat + list reload from storage.
+          notifyContactChanged(target);
         });
       } catch (_) {}
       _transportV2Sub = _transportV2!.incoming.listen(
@@ -3397,6 +3414,7 @@ class PhantomCore {
     await _transportSub?.cancel();
     await _transportV2Sub?.cancel();
     await _meshStoreSub?.cancel();
+    await _meshDeliveredSub?.cancel();
     await _meshRangeSub?.cancel();
     await transport.dispose();
     await _transportV2?.dispose();

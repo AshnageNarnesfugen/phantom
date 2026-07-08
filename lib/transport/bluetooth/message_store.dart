@@ -22,6 +22,10 @@ class PendingMessage {
   final DateTime expiresAt;
   final int deliveryAttempts;
   final String? targetPhantomId; // si se conoce el ID completo del destinatario
+  /// UUID completo del StoredMessage de origen (solo local, no viaja en el
+  /// wire — el MeshPacket trunca el id). Permite que la capa de UI marque la
+  /// palomita cuando un mensaje encolado por fin se entrega.
+  final String? fullMessageId;
 
   const PendingMessage({
     required this.packet,
@@ -29,6 +33,7 @@ class PendingMessage {
     required this.expiresAt,
     this.deliveryAttempts = 0,
     this.targetPhantomId,
+    this.fullMessageId,
   });
 
   bool get isExpired => DateTime.now().isAfter(expiresAt);
@@ -43,6 +48,7 @@ class PendingMessage {
         expiresAt: expiresAt,
         deliveryAttempts: deliveryAttempts + 1,
         targetPhantomId: targetPhantomId,
+        fullMessageId: fullMessageId,
       );
 
   Map<String, dynamic> toJson() => {
@@ -51,6 +57,7 @@ class PendingMessage {
         'expires': expiresAt.millisecondsSinceEpoch,
         'attempts': deliveryAttempts,
         'target': targetPhantomId,
+        if (fullMessageId != null) 'fmid': fullMessageId,
       };
 
   static PendingMessage fromJson(Map<String, dynamic> j) => PendingMessage(
@@ -59,6 +66,7 @@ class PendingMessage {
         expiresAt: DateTime.fromMillisecondsSinceEpoch(j['expires'] as int),
         deliveryAttempts: j['attempts'] as int,
         targetPhantomId: j['target'] as String?,
+        fullMessageId: j['fmid'] as String?,
       );
 }
 
@@ -81,6 +89,11 @@ class MessageStore {
   Stream<int> get pendingCountStream => _pendingController.stream;
   int get pendingCount => _pending.length;
 
+  // Emite el PendingMessage cada vez que uno se entrega, para que el core
+  // pueda voltear su StoredMessage de 'sending' (reloj) a 'sent' (palomita).
+  final _deliveredController = StreamController<PendingMessage>.broadcast();
+  Stream<PendingMessage> get deliveredStream => _deliveredController.stream;
+
   // ── API pública ────────────────────────────────────────────────────────────
 
   /// Agrega un mensaje al store para entrega futura.
@@ -89,6 +102,7 @@ class MessageStore {
     MeshPacket packet, {
     Duration ttl = kDefaultTTL,
     String? targetPhantomId,
+    String? fullMessageId,
   }) {
     if (_pending.length >= kMaxPending) {
       // Intentar hacer espacio expirando mensajes viejos
@@ -104,16 +118,20 @@ class MessageStore {
       enqueuedAt: DateTime.now(),
       expiresAt: DateTime.now().add(ttl),
       targetPhantomId: targetPhantomId,
+      fullMessageId: fullMessageId,
     );
 
     _pendingController.add(_pending.length);
     return true;
   }
 
-  /// Marca un mensaje como entregado — lo elimina del store.
+  /// Marca un mensaje como entregado — lo elimina del store y lo emite en
+  /// [deliveredStream] para que la UI marque la palomita.
   void markDelivered(String messageIdHex) {
-    if (_pending.remove(messageIdHex) != null) {
+    final removed = _pending.remove(messageIdHex);
+    if (removed != null) {
       _pendingController.add(_pending.length);
+      _deliveredController.add(removed);
     }
   }
 

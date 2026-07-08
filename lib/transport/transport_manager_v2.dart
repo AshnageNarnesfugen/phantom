@@ -164,6 +164,7 @@ class TransportManagerV2 {
             encryptedEnvelope: encryptedEnvelope,
           ),
           targetPhantomId: recipientId,
+          fullMessageId: fullMessageId,
         );
         if (ok) _scheduleFlush();
         return ok
@@ -197,6 +198,7 @@ class TransportManagerV2 {
           encryptedEnvelope: encryptedEnvelope,
         ),
         targetPhantomId: recipientId,
+        fullMessageId: fullMessageId,
       );
       _scheduleFlush();
       return SendResult.queued();
@@ -282,6 +284,11 @@ class TransportManagerV2 {
   // ── Public state ──────────────────────────────────────────────────────────
 
   MessageStore get messageStore => _store;
+
+  /// Fires when a previously-queued message is finally delivered (internet
+  /// recovered / a BLE peer appeared). The core flips its StoredMessage from
+  /// 'sending' (clock) to 'sent' (check).
+  Stream<PendingMessage> get delivered => _store.deliveredStream;
 
   TransportStatus get status => TransportStatus(
         mode: _mode,
