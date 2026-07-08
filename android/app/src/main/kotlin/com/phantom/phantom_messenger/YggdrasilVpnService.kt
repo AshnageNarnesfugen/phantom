@@ -45,10 +45,27 @@ class YggdrasilVpnService : VpnService() {
         const val KEY_ADDRESS = "ygg_address"
         const val KEY_CONFIG  = "ygg_config"
 
+        /**
+         * gomobile with `-javapkg=mobile` prefixes the GO package name too, so
+         * the bound class is `mobile.mobile.Yggdrasil` (verified via javap on
+         * the .aar). Older gomobile layouts used a single segment — try both.
+         */
+        fun resolveRouterClass(): Class<*>? {
+            for (name in arrayOf("mobile.mobile.Yggdrasil", "mobile.Yggdrasil")) {
+                try { return Class.forName(name) } catch (_: Throwable) {}
+            }
+            return null
+        }
+
+        fun resolveMobileClass(): Class<*>? {
+            for (name in arrayOf("mobile.mobile.Mobile", "mobile.Mobile")) {
+                try { return Class.forName(name) } catch (_: Throwable) {}
+            }
+            return null
+        }
+
         /** True when the gomobile router class is inside this APK. */
-        fun routerBundled(): Boolean = try {
-            Class.forName("mobile.Yggdrasil"); true
-        } catch (_: Throwable) { false }
+        fun routerBundled(): Boolean = resolveRouterClass() != null
 
         fun startIntent(ctx: Context, configJson: String, address: String): Intent =
             Intent(ctx, YggdrasilVpnService::class.java).apply {
@@ -112,12 +129,10 @@ class YggdrasilVpnService : VpnService() {
     ///      read them back and keep the identity stable across runs
     private fun start(configJson: String, ourAddress: String): Boolean {
         try {
-            // 1. Load mobile.Yggdrasil via reflection so the app links even
+            // 1. Load the router class via reflection so the app links even
             //    when the .aar is absent.
-            val yggCls = try {
-                Class.forName("mobile.Yggdrasil")
-            } catch (e: ClassNotFoundException) {
-                Log.e(TAG, "mobile.Yggdrasil missing — yggdrasil-mobile.aar not built into this APK")
+            val yggCls = resolveRouterClass() ?: run {
+                Log.e(TAG, "mobile.mobile.Yggdrasil missing — yggdrasil-mobile.aar not built into this APK")
                 return false
             }
 
@@ -127,7 +142,7 @@ class YggdrasilVpnService : VpnService() {
             var effectiveConfig = configJson
             if (!org.json.JSONObject(configJson).has("PrivateKey")) {
                 try {
-                    val gen = Class.forName("mobile.Mobile")
+                    val gen = resolveMobileClass()!!
                         .getMethod("generateConfigJSON")
                         .invoke(null) as ByteArray
                     val full = org.json.JSONObject(String(gen, Charsets.UTF_8))
