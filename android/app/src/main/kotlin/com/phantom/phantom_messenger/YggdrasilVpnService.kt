@@ -175,27 +175,25 @@ class YggdrasilVpnService : VpnService() {
             }
 
             // 5. Build the TUN as a SPLIT tunnel: route ONLY the Yggdrasil
-            //    overlay (0200::/7) into it. Everything else — the in-package
-            //    daemons' fleet/libp2p/DNS traffic on IPv4 and global IPv6 —
-            //    matches no route and therefore leaves over the underlying
-            //    network, untouched. This is the standard split-tunnel config
-            //    and is what lets the app ORIGINATE ygg traffic (Socket.connect
-            //    to a peer's 203:… address goes into the TUN) WITHOUT taking the
-            //    daemons off the internet.
+            //    overlay (0200::/7) into it, so our own ygg sends (Socket.connect
+            //    to a peer's 203:… address) go into the TUN while everything else
+            //    matches no route and leaves over the underlying network.
             //
-            //    We deliberately do NOT addDisallowedApplication(self): that
-            //    excluded the whole package from the tunnel, which kept the
-            //    daemons safe but also made ygg a dead send path (our own
-            //    sockets had no route to 0200::/7). Since the narrow route
-            //    already keeps non-ygg traffic direct, exclusion isn't needed —
-            //    and the earlier "enabling ygg killed Waku" was ultimately the
-            //    status.prod fleet flaking + the stale-REST-port restart bug
-            //    (fixed separately), which reproduced with ygg OFF too.
+            //    CRITICAL — scope the tunnel to THIS app only. A VpnService with
+            //    no app filter is a SYSTEM-WIDE VPN: every other app (YouTube, the
+            //    browser, …) is forced onto it, and on real devices their non-ygg
+            //    traffic does NOT cleanly bypass a narrow-route tunnel — it gets
+            //    black-holed, so the user sees "no internet" across the whole
+            //    phone while ygg is on (observed in the field). addAllowed
+            //    application(self) makes the tunnel apply to Phantom and nothing
+            //    else, so other apps are completely untouched. Our daemons run
+            //    under our UID so they stay on the tunnel (their internet traffic
+            //    still bypasses via the narrow route), and ygg is still a live
+            //    send path for us.
             //
-            //    Backstops if a device still disrupts: the stale-port recovery
-            //    heals transient daemon blips in seconds, and the app-side
-            //    guardYggAfterEnable watches the reliable transports and warns
-            //    (or disables ygg) if they actually collapse.
+            //    We deliberately do NOT addDisallowedApplication(self): excluding
+            //    our package left our own sockets with no route to 0200::/7,
+            //    killing ygg as a send path.
             //
             //    No addDnsServer(): system DNS keeps resolving on the underlying
             //    network (go-waku's enrtree DNS discovery must keep working).
@@ -204,6 +202,16 @@ class YggdrasilVpnService : VpnService() {
                 .setMtu(1280)
                 .addAddress(realAddress, 7)
                 .addRoute("0200::", 7)
+            try {
+                builder.addAllowedApplication(packageName)
+                Log.i(TAG, "VPN scoped to $packageName only (other apps bypass)")
+            } catch (e: Throwable) {
+                // If our own package can't be added the tunnel would fall back to
+                // system-wide, which is exactly what breaks other apps — better to
+                // abort than to hijack the whole device's connectivity.
+                Log.e(TAG, "addAllowedApplication($packageName) failed — aborting to avoid a system-wide VPN: $e")
+                shutdown(); return false
+            }
             val pfd = builder.establish() ?: run {
                 Log.e(TAG, "VpnService.establish() returned null — VPN permission?")
                 shutdown(); return false
