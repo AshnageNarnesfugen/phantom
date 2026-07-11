@@ -159,15 +159,50 @@ class YggdrasilDaemon {
   // ── Config ──────────────────────────────────────────────────────────────────
 
   /// Peer set used when the caller hasn't set an override yet AND no
-  /// previous config file exists. Same stable community peers that have
-  /// been online for years. The runtime catalog
+  /// previous config file exists. The runtime catalog
   /// ([YggdrasilPeerCatalog.fallback]) keeps a copy of this list — they
-  /// should stay in sync.
+  /// MUST stay in sync.
+  ///
+  /// Verified reachable 2026-07-11. The previous defaults (incognet.io /
+  /// cwinfo.net) had gone dead — their hostnames stopped resolving in DNS
+  /// entirely — so a fresh device (or any device whose upstream peer fetch
+  /// failed) connected to ZERO peers: Yggdrasil still self-assigned a 0200::/7
+  /// address (derived from the node key, no peer needed) but could not route a
+  /// single packet, which is exactly why ygg never carried a message. A
+  /// geographically diverse set, :443-heavy so restrictive firewalls let it
+  /// through.
   static const List<String> _bootstrapPeers = [
-    'tls://ygg-ukfi.incognet.io:8884',
-    'tls://ygg-ukcov.incognet.io:8884',
-    'tls://uk1.servers.devices.cwinfo.net:58226',
+    'tls://ygg.mkg20001.io:443',
+    'tls://b.ygg.yt:443',
+    'tls://g.ygg.yt:443',
+    'tls://ca.us.ygg.informatics.coop:443',
+    'tls://44.234.134.124:443',
+    'tls://asia.deinfra.org:15015',
+    'tls://193.93.119.42:443',
+    'tls://cirno.nadeko.net:44442',
   ];
+
+  /// Hosts we know are dead (DNS no longer resolves). A device that ran an
+  /// older build persisted these into its on-disk config, and
+  /// [_loadOrGenerateConfig] reuses the persisted `Peers` verbatim — so without
+  /// this purge, upgrading the app would NOT fix a stuck node. We strip any URI
+  /// pointing at one of these on load.
+  static const Set<String> _deadPeerHosts = {
+    'ygg-ukfi.incognet.io',
+    'ygg-ukcov.incognet.io',
+    'uk1.servers.devices.cwinfo.net',
+  };
+
+  /// Drops known-dead peers from [peers]; falls back to [_bootstrapPeers] if
+  /// that would leave the node with nothing to dial. Pure + null-safe so it can
+  /// be unit-tested without a device.
+  static List<String> sanitizePeers(List<String>? peers) {
+    final cleaned = <String>[
+      for (final p in peers ?? const <String>[])
+        if (p.trim().isNotEmpty && !_deadPeerHosts.any(p.contains)) p.trim(),
+    ];
+    return cleaned.isEmpty ? List<String>.from(_bootstrapPeers) : cleaned;
+  }
 
   Future<_YggConfig> _loadOrGenerateConfig() async {
     final dir = await getApplicationSupportDirectory();
@@ -183,9 +218,14 @@ class YggdrasilDaemon {
     // it always wins over whatever is currently on disk. That way changes
     // to the user's custom peer list or to the dynamic public-peer cache
     // take effect on the next launch without manual config editing.
-    final peers = _pendingPeers != null && _pendingPeers!.isNotEmpty
-        ? _pendingPeers!
-        : (existing?['Peers'] as List?)?.cast<String>() ?? _bootstrapPeers;
+    // sanitizePeers strips known-dead hosts an older build may have persisted
+    // and guarantees a non-empty result, so a stale config can't strand the
+    // node with only unreachable peers.
+    final peers = sanitizePeers(
+      _pendingPeers != null && _pendingPeers!.isNotEmpty
+          ? _pendingPeers
+          : (existing?['Peers'] as List?)?.cast<String>(),
+    );
 
     if (existing != null) {
       final addr = existing['_phantom_address'] as String?;

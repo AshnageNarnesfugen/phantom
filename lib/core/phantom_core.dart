@@ -2521,6 +2521,37 @@ class PhantomCore {
     }
   }
 
+  /// Recovery hook for "an obstacle is blocking sends — remove it, then retry
+  /// through the other transports". Today the only obstacle is Yggdrasil: when
+  /// its VpnService comes up Android can reset the in-package daemons' existing
+  /// sockets (fleet / swarm / SAM), so messages sent during that window land in
+  /// the store as 'sending' (the clock) and just sit there until the 30 s retry
+  /// timer or the next connectivity change. Disabling ygg is the user telling
+  /// us the obstacle is gone — so we (1) stop targeting ygg, (2) kick the
+  /// internet daemons to re-establish their peer connections, and (3) flush the
+  /// store so every limbo message is re-attempted over Waku/I2P/IPFS right away,
+  /// then once more after the daemons have had a few seconds to reconnect.
+  Future<void> onYggDisabled() async {
+    final dbg = TransportDebugger.instance;
+    dbg.log('YGG: disabled — retrying limbo messages over the other transports');
+
+    // (1) Stop firing ygg for anyone; the tunnel is going down.
+    transport.clearYggTargets();
+
+    // (2) Nudge the reliable transports back to life. VpnService teardown, like
+    // its startup, can churn routing; re-ensuring reconnects their peers.
+    unawaited(resyncWaku());
+    unawaited(IpfsDaemon.instance.ensure());
+    unawaited(I2pdDaemon.instance.ensure());
+
+    // (3) Drain the store now, and again after the daemons have had a moment to
+    // reconnect (the first pass may hit still-dialing peers).
+    _transportV2?.flushStore();
+    Timer(const Duration(seconds: 5), () {
+      if (!_disposed) _transportV2?.flushStore();
+    });
+  }
+
   Future<void> _sendConnectivityInfo(String recipientId) async {
     final ipfsId = await getMyIpfsPeerId();
 

@@ -245,6 +245,14 @@ class TransportManager {
 
   void setContactYggAddress(String contactId, String address) => _yggAddrs[contactId] = address;
   void setContactI2PDestination(String contactId, String dest) => _i2pDests[contactId] = dest;
+
+  /// Forgets every contact's Yggdrasil address so the fan-out stops targeting
+  /// ygg. Called when the user disables Yggdrasil: even though a ygg failure
+  /// never blocks a send (the fan-out resolves on the FIRST success), a dead
+  /// tunnel is pure wasted effort and log noise. The addresses come back on
+  /// their own when ygg is re-enabled — [_rebroadcastConnectivityForYgg] and
+  /// inbound connectivityInfo frames repopulate the map.
+  void clearYggTargets() => _yggAddrs.clear();
   void setContactIpfsPeerId(String contactId, String peerId) {
     for (var t in _transports.whereType<IpfsTransport>()) {
       t.setContactIpfsPeerId(contactId, peerId);

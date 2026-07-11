@@ -21,6 +21,7 @@ void main() {
 
   _realYggTests();
   _yggReadyHookTests();
+  _clearYggTargetsTests();
 
   group('YggdrasilTransport availability (honesty)', () {
     /// True when this host has a REAL Yggdrasil interface (0200::/7) — e.g. a
@@ -197,6 +198,52 @@ void _yggReadyHookTests() {
       expect(fired, 1);
       await mgr.dispose();
       await Future<void>.delayed(const Duration(milliseconds: 150));
+    });
+  });
+}
+
+/// The user's ask: when ygg is disabled, stop letting it get in the way and
+/// re-drive sends over the other transports. clearYggTargets() is the first
+/// half — it forgets every contact's ygg address so the fan-out no longer even
+/// attempts ygg. Proven over the real ::1 wire: a send lands via ygg before the
+/// clear; after it, ygg is the only backend and there's no target left, so the
+/// publish fails fast (which is exactly what makes TransportManagerV2 fall back
+/// to the store / other paths instead of silently riding a dead tunnel).
+void _clearYggTargetsTests() {
+  group('TransportManager.clearYggTargets (obstacle removal)', () {
+    test('drops ygg from the fan-out; delivery works before, not after',
+        () async {
+      final ygg = YggdrasilTransport(address: '::1');
+      final mgr = TransportManager(transportsOverride: [ygg]);
+      final got = <IncomingEnvelope>[];
+      final sub = mgr.incoming.listen(got.add);
+      await mgr.initialize(ourId: 'clearYggTargetsTest');
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      const bob = 'bobLongEnoughId';
+      mgr.setContactYggAddress(bob, '::1');
+      await mgr.publish(
+          recipientId: bob,
+          encryptedEnvelope: Uint8List.fromList([1, 2, 3, 4]));
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      expect(got, hasLength(1), reason: 'ygg carried the frame while targeted');
+
+      mgr.clearYggTargets();
+      // ygg is now the ONLY transport and has no target → nothing to fire.
+      await expectLater(
+        mgr.publish(
+            recipientId: bob,
+            encryptedEnvelope: Uint8List.fromList([5, 6, 7, 8])),
+        throwsA(isA<TransportException>()),
+        reason: 'with the ygg target cleared and no other backend, the send '
+            'fails fast so the manager fails over instead of black-holing it',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(got, hasLength(1), reason: 'no second frame rode the dead tunnel');
+
+      await sub.cancel();
+      await mgr.dispose();
+      await Future<void>.delayed(const Duration(milliseconds: 200));
     });
   });
 }

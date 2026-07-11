@@ -21,13 +21,20 @@ class YggdrasilPeerCatalog {
       RegExp(r'(tls|tcp|ws|wss|quic)://[a-zA-Z0-9.\-\[\]:]+:[0-9]+');
 
   /// Default fallback peers, used when the network is unreachable and the
-  /// cache is empty. These are stable Yggdrasil community peers that have
-  /// been online for years — safe to hard-code.
+  /// cache is empty. Verified reachable 2026-07-11; kept in sync with
+  /// `YggdrasilDaemon._bootstrapPeers`. The previous defaults had gone dead
+  /// (hostnames stopped resolving), which left offline/fetch-failed nodes with
+  /// zero routable peers — ygg came up with an address but couldn't move a
+  /// packet. Diverse + :443-heavy so restrictive firewalls pass it.
   static const List<String> fallback = [
-    'tls://ygg-ukfi.incognet.io:8884',
-    'tls://ygg-ukcov.incognet.io:8884',
-    'tls://uk1.servers.devices.cwinfo.net:58226',
     'tls://ygg.mkg20001.io:443',
+    'tls://b.ygg.yt:443',
+    'tls://g.ygg.yt:443',
+    'tls://ca.us.ygg.informatics.coop:443',
+    'tls://44.234.134.124:443',
+    'tls://asia.deinfra.org:15015',
+    'tls://193.93.119.42:443',
+    'tls://cirno.nadeko.net:44442',
   ];
 
   final http.Client _client;

@@ -1664,6 +1664,9 @@ class _YggdrasilPeersSheetState extends State<_YggdrasilPeersSheet> {
                 }
               } else {
                 await YggdrasilDaemon.instance.stop();
+                // Obstacle removed: re-drive any messages that got stuck in
+                // limbo while ygg was up, through the other transports.
+                await core?.onYggDisabled();
               }
             },
           ),
