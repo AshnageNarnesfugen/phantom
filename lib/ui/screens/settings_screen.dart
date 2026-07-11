@@ -1571,6 +1571,67 @@ class _YggdrasilPeersSheetState extends State<_YggdrasilPeersSheet> {
     unawaited(_persistPeers());
   }
 
+  bool _applyingPeers = false;
+
+  /// The peer list to hand the daemon right now: the user's non-empty custom
+  /// slots in custom mode, otherwise a freshly-pulled public set (cached /
+  /// hard-coded fallback if the fetch fails). Never empty.
+  Future<List<String>> _resolveEffectivePeers() async {
+    if (_useCustom) {
+      final custom = _slots
+          .map((c) => c.text.trim())
+          .where((s) => s.isNotEmpty)
+          .toList();
+      return custom.isNotEmpty ? custom : YggdrasilPeerCatalog.fallback;
+    }
+    final storage = PhantomStorage.instance;
+    try {
+      final fresh = await YggdrasilPeerCatalog().fetchUpstream();
+      if (fresh.isNotEmpty) {
+        await storage.setYggCachedPeers(fresh).catchError((_) {});
+        return YggdrasilPeerCatalog.pickRandom(
+            fresh, YggdrasilPeerCatalog.defaultPickCount);
+      }
+    } catch (_) {}
+    final cached = await storage.getYggCachedPeers().catchError((_) => null);
+    if (cached != null && cached.peers.isNotEmpty) {
+      return YggdrasilPeerCatalog.pickRandom(
+          cached.peers, YggdrasilPeerCatalog.defaultPickCount);
+    }
+    return YggdrasilPeerCatalog.fallback;
+  }
+
+  /// "update peers" action: persist the slots, resolve the effective list, and
+  /// hand it to the running router so it re-dials NOW instead of on next
+  /// launch. The ygg address is preserved across the bounce.
+  Future<void> _updatePeers() async {
+    if (_applyingPeers) return;
+    final messenger = ScaffoldMessenger.of(context);
+    await _persistPeers();
+    setState(() => _applyingPeers = true);
+    try {
+      final peers = await _resolveEffectivePeers();
+      messenger.showSnackBar(SnackBar(
+        content: Text('applying ${peers.length} peers — bouncing ygg…',
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
+        duration: const Duration(seconds: 2),
+      ));
+      final addr = await YggdrasilDaemon.instance.applyPeers(peers);
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text(
+          addr != null
+              ? 'ygg re-dialed ${peers.length} peers · $addr'
+              : 'saved ${peers.length} peers — they apply when you enable ygg',
+          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+        ),
+        duration: const Duration(seconds: 4),
+      ));
+    } finally {
+      if (mounted) setState(() => _applyingPeers = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = widget.tokens;
@@ -1722,10 +1783,37 @@ class _YggdrasilPeersSheetState extends State<_YggdrasilPeersSheet> {
               ),
             ),
           ),
+          const SizedBox(height: 16),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: _enabled && !_applyingPeers ? _updatePeers : null,
+              icon: _applyingPeers
+                  ? SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: t.accentLight))
+                  : Icon(Icons.sync, color: t.accentLight, size: 16),
+              label: Text(
+                _applyingPeers ? 'updating…' : 'update peers (apply now)',
+                style: TextStyle(
+                    color: _enabled ? t.accentLight : t.textDisabled,
+                    fontFamily: 'monospace',
+                    fontSize: 13),
+              ),
+              style: OutlinedButton.styleFrom(
+                side: BorderSide(
+                    color: t.accentLight
+                        .withValues(alpha: _enabled ? 0.5 : 0.15)),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+              ),
+            ),
+          ),
           const SizedBox(height: 12),
           Text(
             '// peer format: tls://host:port  (also tcp:// quic:// ws:// wss://)\n'
-            '// changes take effect on next app launch',
+            '// "update peers" re-dials the running router now (ygg address stays)',
             style: TextStyle(
                 color: t.textDisabled,
                 fontFamily: 'monospace',

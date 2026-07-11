@@ -86,6 +86,32 @@ class YggdrasilDaemon {
     _address = null;
   }
 
+  /// The peer override currently queued for the next (re)start. Test-only.
+  @visibleForTesting
+  List<String>? get pendingPeersForTest => _pendingPeers;
+
+  /// Applies [peers] to the RUNNING router: sets the override, then bounces the
+  /// in-process yggdrasil node so it drops its current connections and dials
+  /// the new list. This is what makes "update peers" in settings actually take
+  /// effect — before, editing peers only wrote a setting that nothing re-read
+  /// until the next cold app launch.
+  ///
+  /// The node identity + 0200::/7 address survive the bounce (they live in the
+  /// persisted config, whose `Peers` field is the only thing swapped), so
+  /// contacts keep reaching us at the same ygg address. Returns the address on
+  /// a successful restart; null if there's no VPN permission yet (the override
+  /// is still stored, so it applies the moment ygg is enabled) or off-Android.
+  Future<String?> applyPeers(List<String> peers) async {
+    setPeerOverride(peers);
+    if (!Platform.isAndroid) return null;
+    final prepared = await _ch.invokeMethod<bool>('isPrepared') ?? false;
+    if (!prepared) return null; // stored for next start; nothing running to bounce
+    try { await _ch.invokeMethod<void>('stopService'); } catch (_) {}
+    _address = null;
+    final ok = await _startService();
+    return ok ? _address : null;
+  }
+
   /// True when the gomobile router (.aar) is inside this APK. When false the
   /// service can never run — surfaced in the transport status UI so the user
   /// sees "missing binary" instead of a misleading "inactive".

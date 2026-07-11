@@ -71,4 +71,19 @@ void main() {
     // removes hosts we have positively confirmed dead.)
     expect(YggdrasilDaemon.sanitizePeers(custom), custom);
   });
+
+  test('applyPeers records the override so it applies on the next start', () async {
+    // Off-device (no Android VpnService) applyPeers can't bounce a router, so
+    // it returns null — but it MUST still store the override, which is the
+    // "saved — applies when you enable ygg" path the settings button relies on.
+    // (On-device the same call also restarts the running node; that half is
+    // MethodChannel-only and verified on the phone.)
+    final custom = ['tls://my.box.example:9001'];
+    addTearDown(() => YggdrasilDaemon.instance.setPeerOverride(null));
+
+    final addr = await YggdrasilDaemon.instance.applyPeers(custom);
+    expect(addr, isNull, reason: 'no VpnService in a unit test host');
+    expect(YggdrasilDaemon.instance.pendingPeersForTest, custom,
+        reason: 'the new peers must be queued for the next (re)start');
+  });
 }
