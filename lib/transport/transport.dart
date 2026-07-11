@@ -168,6 +168,7 @@ class TransportManager {
         (e) { if (!_incomingController.isClosed) _incomingController.add(e); },
         onError: (e) => dbg.log('TRANSPORT: ${t.name} stream error: $e'),
       ));
+      _maybeFireYggReady(t); // rare, but ygg could already have an address
     }
     
     if (_activeTransports.isEmpty) {
@@ -186,6 +187,25 @@ class TransportManager {
   /// initialize (e.g. the Yggdrasil TUN finishing its bootstrap) shows active
   /// without waiting for the next outgoing message. Same 3 s throttle.
   Future<void> reprobeInactive() => _activateLateTransports();
+
+  /// Fired ONCE, the moment the Yggdrasil transport activates with a real
+  /// 0200::/7 address. Ygg's address isn't known at app start (the router takes
+  /// ~30–60 s to provision it), so the connectivityInfo sent during the initial
+  /// handshake carried `ygg=null` and peers never learned our ygg address —
+  /// which is exactly why "no contacts have Yggdrasil addresses" and ygg was
+  /// never actually used. PhantomCore uses this to re-broadcast connectivityInfo
+  /// (now carrying the address) to every contact.
+  void Function()? onYggReady;
+  bool _yggReadyFired = false;
+
+  void _maybeFireYggReady(PhantomTransport t) {
+    if (t is YggdrasilTransport && !_yggReadyFired && t.address != null) {
+      _yggReadyFired = true;
+      try {
+        onYggReady?.call();
+      } catch (_) {}
+    }
+  }
 
   Future<void> _activateLateTransports() async {
     if (_ourId.isEmpty || _lateRetryInProgress) return;
@@ -210,6 +230,7 @@ class TransportManager {
             ));
             TransportDebugger.instance
                 .log('TRANSPORT: ${t.name} activated late');
+            _maybeFireYggReady(t);
           }
         } catch (_) {}
       }

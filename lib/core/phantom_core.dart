@@ -26,7 +26,6 @@ import 'notification_service.dart';
 import 'ipfs_daemon.dart';
 import 'i2pd_daemon.dart';
 import 'waku_daemon.dart';
-import 'yggdrasil_daemon.dart';
 import 'transport_debugger.dart';
 import '../transport/transport.dart';
 import '../transport/transport_manager_v2.dart' hide IncomingEnvelope;
@@ -1152,14 +1151,16 @@ class PhantomCore {
       final healthy = await _wakuHealthy();
       deadStreak = healthy ? 0 : deadStreak + 1;
       if (deadStreak >= 2) {
-        dbg.log('YGG: ✗ Waku collapsed right after enabling Yggdrasil — '
-            'backing ygg out to protect messaging.');
-        await YggdrasilDaemon.instance.stop();
-        await storage.setYggEnabled(false);
+        // The user wants ygg mandatory, so we do NOT auto-disable it anymore —
+        // just warn. The stale-port recovery + fleet re-dial should heal Waku;
+        // if it doesn't, the user can turn ygg off themselves.
+        dbg.log('YGG: ⚠ Waku looks unhealthy after enabling Yggdrasil — '
+            'ygg kept ON (mandatory); watching recovery.');
         NotificationService.showMessage(
-          contactName: 'Yggdrasil disabled',
+          contactName: 'Yggdrasil',
           preview:
-              'it was disrupting your messaging transports — turned it back off',
+              'messaging transports look degraded — if it persists, disable '
+              'ygg in settings',
           contactId: '',
         );
         return;
@@ -2268,6 +2269,11 @@ class PhantomCore {
   // ── Transport listener ─────────────────────────────────────────────────────
 
   Future<void> _startTransport() async {
+    // When Yggdrasil finishes provisioning its 0200::/7 address (~30–60 s after
+    // start, well after the initial handshake), re-broadcast connectivityInfo so
+    // every contact finally learns our ygg address. Without this the handshake's
+    // connectivityInfo carried ygg=null and ygg was never used at all.
+    transport.onYggReady = () => unawaited(_rebroadcastConnectivityForYgg());
     try {
       await transport.initialize(ourId: myId);
       _transportAvailable = true;
@@ -2492,6 +2498,28 @@ class PhantomCore {
   }
 
   // ── Incoming bytes ─────────────────────────────────────────────────────────
+
+  /// Re-sends connectivityInfo to every contact once Yggdrasil's address is
+  /// finally known (fired by TransportManager.onYggReady). This is what makes
+  /// ygg actually usable: the address didn't exist at handshake time, so peers
+  /// only learn it here. One send per contact with a live session; the payload
+  /// carries the ygg address (plus refreshed IPFS/I2P), and the receiver stores
+  /// it via _handleIncomingConnectivity → setContactYggAddress.
+  Future<void> _rebroadcastConnectivityForYgg() async {
+    final ygg = transport.transports.whereType<YggdrasilTransport>().firstOrNull;
+    if (ygg?.address == null) return;
+    TransportDebugger.instance.log(
+        'YGG: address ready (${ygg!.address!.substring(0, 12)}…) — '
+        're-broadcasting connectivityInfo so contacts can reach us over ygg');
+    for (final id in _sessions.keys.toList()) {
+      try {
+        await _sendConnectivityInfo(id);
+      } catch (e) {
+        TransportDebugger.instance
+            .log('YGG: connectivity re-broadcast to ${id.substring(0, 8)} failed: $e');
+      }
+    }
+  }
 
   Future<void> _sendConnectivityInfo(String recipientId) async {
     final ipfsId = await getMyIpfsPeerId();

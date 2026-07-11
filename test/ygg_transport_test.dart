@@ -19,6 +19,9 @@ import 'package:phantom_messenger/transport/transport.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  _realYggTests();
+  _yggReadyHookTests();
+
   group('YggdrasilTransport availability (honesty)', () {
     /// True when this host has a REAL Yggdrasil interface (0200::/7) — e.g. a
     /// dev machine running the yggdrasil system service.
@@ -128,6 +131,72 @@ void main() {
       await Future.delayed(const Duration(milliseconds: 400));
       expect(got, hasLength(1));
       expect(got.single.data, [9, 9, 9]);
+    });
+  });
+}
+
+/// Real-Yggdrasil path — runs ONLY on a host with an actual 0200::/7 interface
+/// (the dev machine runs the yggdrasil system service; CI skips gracefully).
+/// Proves the transport can bind on and receive at our real ygg address — the
+/// exact socket a remote peer connects to — over the live ygg stack, not ::1.
+void _realYggTests() {
+  group('YggdrasilTransport over the REAL ygg interface', () {
+    late String? yggAddr;
+
+    setUpAll(() async {
+      final probe = YggdrasilTransport();
+      await probe.checkAvailability(); // auto-detects the host 0200::/7 addr
+      yggAddr = probe.address;
+    });
+
+    test('binds on and round-trips a frame over our real 0200::/7 address',
+        () async {
+      final addr = yggAddr;
+      if (addr == null) {
+        return markTestSkipped('host has no Yggdrasil interface');
+      }
+      final rx = YggdrasilTransport(address: addr);
+      final got = <IncomingEnvelope>[];
+      final sub = rx.subscribe(ourId: 'ygg-real').listen(got.add);
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+
+      final tx = YggdrasilTransport(address: addr);
+      final payload =
+          Uint8List.fromList(List.generate(2048, (i) => (i * 31) & 0xff));
+      // Connect to OUR real ygg address:7331 — the same endpoint a peer hits.
+      await tx.publishToAddr(address: addr, data: payload);
+
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      expect(got, hasLength(1),
+          reason: 'a frame sent to our real ygg address must arrive at the '
+              'transport listener bound on that address');
+      expect(got.single.data, payload);
+
+      await sub.cancel();
+      await rx.dispose();
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    });
+  });
+}
+
+/// Fix (B): the moment ygg gets its address, PhantomCore must be told so it can
+/// re-broadcast connectivityInfo (the handshake sent ygg=null, so this is the
+/// only way contacts ever learn our ygg address). Here we prove the manager's
+/// onYggReady hook fires exactly once when a ygg transport activates with an
+/// address, and never for a ygg transport that has none.
+void _yggReadyHookTests() {
+  group('TransportManager.onYggReady (address re-broadcast trigger)', () {
+    test('fires once when ygg activates WITH an address', () async {
+      final ygg = YggdrasilTransport(address: '::1'); // has an address → ready
+      final mgr = TransportManager(transportsOverride: [ygg]);
+      var fired = 0;
+      mgr.onYggReady = () => fired++;
+      await mgr.initialize(ourId: '3gn2xMzaLABTEST');
+      expect(fired, 1, reason: 'ygg-with-address must trigger the re-broadcast');
+      await mgr.reprobeInactive(); // idempotent — no duplicate broadcasts
+      expect(fired, 1);
+      await mgr.dispose();
+      await Future<void>.delayed(const Duration(milliseconds: 150));
     });
   });
 }

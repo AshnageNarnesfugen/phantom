@@ -174,29 +174,36 @@ class YggdrasilVpnService : VpnService() {
                 shutdown(); return false
             }
 
-            // 5. Build the TUN. Route ONLY the Yggdrasil overlay (0200::/7)
-            //    into the tunnel, and — CRITICALLY — exclude our own package.
+            // 5. Build the TUN as a SPLIT tunnel: route ONLY the Yggdrasil
+            //    overlay (0200::/7) into it. Everything else — the in-package
+            //    daemons' fleet/libp2p/DNS traffic on IPv4 and global IPv6 —
+            //    matches no route and therefore leaves over the underlying
+            //    network, untouched. This is the standard split-tunnel config
+            //    and is what lets the app ORIGINATE ygg traffic (Socket.connect
+            //    to a peer's 203:… address goes into the TUN) WITHOUT taking the
+            //    daemons off the internet.
             //
-            //    Why the exclusion is mandatory (learned the hard way from a
-            //    field regression): our reliable transports run as in-package
-            //    daemons (go-waku, kubo, i2pd). When the app is NOT excluded,
-            //    Android binds their sockets to the VPN network; with no default
-            //    route their fleet connections (IPv4 / global IPv6) drop —
-            //    observed on two devices as Waku "no suitable peers found" →
-            //    daemon restart → connection-refused loop the moment ygg came
-            //    up. Excluding the package keeps every daemon on the underlying
-            //    network so messaging is never disrupted by enabling ygg.
+            //    We deliberately do NOT addDisallowedApplication(self): that
+            //    excluded the whole package from the tunnel, which kept the
+            //    daemons safe but also made ygg a dead send path (our own
+            //    sockets had no route to 0200::/7). Since the narrow route
+            //    already keeps non-ygg traffic direct, exclusion isn't needed —
+            //    and the earlier "enabling ygg killed Waku" was ultimately the
+            //    status.prod fleet flaking + the stale-REST-port restart bug
+            //    (fixed separately), which reproduced with ygg OFF too.
             //
-            //    Trade-off: an excluded app can't originate 0200::/7 traffic
-            //    either, so ygg is not a reliable *send* path for us today —
-            //    acceptable. Messaging correctness (Waku/I2P/IPFS staying up)
-            //    outweighs a marginal overlay transport we don't yet depend on.
+            //    Backstops if a device still disrupts: the stale-port recovery
+            //    heals transient daemon blips in seconds, and the app-side
+            //    guardYggAfterEnable watches the reliable transports and warns
+            //    (or disables ygg) if they actually collapse.
+            //
+            //    No addDnsServer(): system DNS keeps resolving on the underlying
+            //    network (go-waku's enrtree DNS discovery must keep working).
             val builder = Builder()
                 .setSession("Phantom Yggdrasil")
                 .setMtu(1280)
                 .addAddress(realAddress, 7)
                 .addRoute("0200::", 7)
-            builder.addDisallowedApplication(packageName)
             val pfd = builder.establish() ?: run {
                 Log.e(TAG, "VpnService.establish() returned null — VPN permission?")
                 shutdown(); return false
