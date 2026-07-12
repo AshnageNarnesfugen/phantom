@@ -1188,6 +1188,18 @@ class PhantomCore {
     final dbg = TransportDebugger.instance;
     try {
       await IpfsDaemon.instance.ensure();
+      // Prime bitswap: connect straight to the sender's IPFS node so the block
+      // transfers directly, instead of hanging on a DHT provider hunt that on
+      // mobile (lowpower profile) frequently never resolves. Best-effort — the
+      // cat still falls back to content routing if the connect doesn't land.
+      final senderIpfs = transport.getContactIpfsPeerId(m.conversationId);
+      if (senderIpfs != null) {
+        dbg.log('MEDIA: priming direct IPFS connect to sender ${senderIpfs.substring(0, senderIpfs.length.clamp(0, 12))}…');
+        // Fire in parallel with the fetch: bitswap re-checks connected peers
+        // continuously, so a connection landing mid-cat is used immediately —
+        // no need to serialise a slow connect ahead of the download.
+        unawaited(IpfsDaemon.instance.connectPeer(senderIpfs));
+      }
       final bytes = await IpfsDaemon.instance.downloadFile(file.cid);
       final display = m.type == MessageType.image
           ? bytes

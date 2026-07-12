@@ -205,6 +205,27 @@ class IpfsDaemon {
     }
   }
 
+  /// Best-effort direct swarm connect to [peerId] (a libp2p PeerID). Priming
+  /// the connection with the sender's node makes a subsequent [downloadFile]
+  /// transfer the block DIRECTLY over bitswap instead of waiting on the DHT
+  /// provider hunt — which on mobile (lowpower profile, weak reprovide) often
+  /// never resolves. bitswap fetches from any connected peer that has the
+  /// block, so a direct connection bypasses content routing entirely. Never
+  /// throws; the cat still falls back to the DHT.
+  Future<void> connectPeer(String peerId) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      final req = await client.postUrl(Uri.parse(
+          '$apiUrl/api/v0/swarm/connect?arg=${Uri.encodeComponent('/p2p/$peerId')}'));
+      final resp = await req.close().timeout(const Duration(seconds: 20));
+      await resp.drain<void>();
+    } catch (_) {
+      // best-effort — downloadFile still tries content routing
+    } finally {
+      client.close(force: true);
+    }
+  }
+
   Future<Uint8List> _catAll(HttpClient client, String cid) async {
     final req = await client.postUrl(Uri.parse('$apiUrl/api/v0/cat?arg=$cid'));
     final resp = await req.close();

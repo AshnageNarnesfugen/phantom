@@ -268,6 +268,14 @@ class TransportManager {
     }
   }
 
+  /// The freshest known IPFS PeerID for [contactId] (learned via connectivity
+  /// info), or null. Used to prime a direct bitswap connection before an image
+  /// download so the block transfers straight from the sender.
+  String? getContactIpfsPeerId(String contactId) => _transports
+      .whereType<IpfsTransport>()
+      .map((t) => t.getContactIpfsPeerId(contactId))
+      .firstWhere((id) => id != null, orElse: () => null);
+
   /// Routes a payload over the network. Behaviour depends on [priority]:
   ///
   ///   * `TransportPriority.control` — used for session-establishment frames
