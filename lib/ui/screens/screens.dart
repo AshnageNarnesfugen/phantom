@@ -20,6 +20,7 @@ import '../../core/waku_daemon.dart';
 import '../../core/yggdrasil_daemon.dart';
 import '../../core/yggdrasil_peers.dart';
 import '../../core/groups.dart';
+import '../../core/secret_chat.dart';
 import '../../core/link_preview_service.dart';
 import '../../core/phantom_core.dart';
 import '../../core/transport_debugger.dart';

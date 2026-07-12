@@ -6,15 +6,19 @@ part of 'screens.dart';
 
 class ChatScreen extends StatefulWidget {
   final String contactName;
-  /// Conversation key: a contact's phantomId, or `grp_<gid>` for groups.
+  /// Conversation key: a contact's phantomId, `grp_<gid>` for groups, or
+  /// `sec_<phantomId>` for a secret chat.
   final String contactId;
   final bool isGroup;
+  /// Secret chat: I2P-only, both-online, separate history under sec_<phantomId>.
+  final bool isSecret;
 
   const ChatScreen({
     super.key,
     required this.contactName,
     required this.contactId,
     this.isGroup = false,
+    this.isSecret = false,
   });
 
   @override
@@ -22,6 +26,11 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
+  /// The real contact phantomId (for presence, sending, contact lookup) —
+  /// distinct from widget.contactId, which is the conversation key.
+  String get _peerId =>
+      widget.isSecret ? secretContactId(widget.contactId) : widget.contactId;
+
   final _scrollCtrl = ScrollController();
   List<StoredMessage>? _messages;
   StreamSubscription<StoredMessage>? _sub;
@@ -137,13 +146,15 @@ class _ChatScreenState extends State<ChatScreen> {
         if (msg.conversationId == widget.contactId) _loadMessages(core);
       });
       if (!widget.isGroup) {
+        // Presence fires for the real phantomId (_peerId), which differs from
+        // the conversation key in a secret chat (sec_<phantomId>).
         _presenceSub = core.presenceChanges.listen((id) {
-          if (id == widget.contactId && mounted) setState(() {});
+          if (id == _peerId && mounted) setState(() {});
         });
         // Re-render when the handshake-ack state flips so the "waiting for
         // first response" banner appears / disappears in real time.
         _handshakeSub = core.handshakeStateChanges.listen((id) {
-          if (id == widget.contactId && mounted) setState(() {});
+          if (id == _peerId && mounted) setState(() {});
         });
       }
       // Reload contact-derived display name when nickname/alias change so
@@ -176,7 +187,7 @@ class _ChatScreenState extends State<ChatScreen> {
       });
       return;
     }
-    final c = await core.storage.getContact(widget.contactId);
+    final c = await core.storage.getContact(_peerId);
     if (!mounted) return;
     final newName = c?.displayName ?? widget.contactName;
     final newVerified = c?.isVerified ?? false;
@@ -342,7 +353,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _receiptsRefired = true;
 
     final toAck = <String>{...unread, ...recentRead}.toList();
-    if (toAck.isNotEmpty && !widget.isGroup) {
+    // Secret chats send nothing but the message itself (no receipts metadata).
+    if (toAck.isNotEmpty && !widget.isGroup && !widget.isSecret) {
       core.sendReadReceipts(widget.contactId, toAck); // fire-and-forget
     }
   }
@@ -365,7 +377,18 @@ class _ChatScreenState extends State<ChatScreen> {
     if (core == null) return;
     final replyId = _replyTo?.id;
     if (mounted) setState(() => _replyTo = null);
-    if (widget.isGroup) {
+    if (widget.isSecret) {
+      try {
+        await core.sendSecretText(_peerId, text);
+      } on PhantomCoreException catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(e.message,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
+          ));
+        }
+      }
+    } else if (widget.isGroup) {
       await core.sendGroupMessage(
           gid: gidOfConversation(widget.contactId), text: text);
     } else {
@@ -383,6 +406,13 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _sendFile(Uint8List bytes, String fileName) async {
     final core = CoreProvider.of(context).core;
     if (core == null) return;
+    if (widget.isSecret) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('secret chats are text-only for now',
+            style: TextStyle(fontFamily: 'monospace', fontSize: 12)),
+      ));
+      return;
+    }
     try {
       if (widget.isGroup) {
         await core.sendGroupFile(
@@ -552,6 +582,10 @@ class _ChatScreenState extends State<ChatScreen> {
               children: [
                 Row(
                   children: [
+                    if (widget.isSecret) ...[
+                      Icon(Icons.lock, color: t.accentLight, size: 14),
+                      const SizedBox(width: 5),
+                    ],
                     Flexible(
                       child: Text(_displayName ?? widget.contactName,
                           overflow: TextOverflow.ellipsis,
@@ -566,6 +600,12 @@ class _ChatScreenState extends State<ChatScreen> {
                     ],
                   ],
                 ),
+                if (widget.isSecret)
+                  Text('secret · I2P-only · live',
+                      style: TextStyle(
+                          color: t.accentLight,
+                          fontFamily: 'monospace',
+                          fontSize: 10)),
                 // The raw phantom id is backend addressing, not user-facing —
                 // the contact's name (nickname, alias, or a short fingerprint
                 // fallback) already identifies them here.
@@ -579,7 +619,7 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
           if (!widget.isGroup &&
-              core?.isContactOnline(widget.contactId) == true)
+              core?.isContactOnline(_peerId) == true)
             Container(
               width: 9, height: 9,
               margin: const EdgeInsets.only(right: 4),
@@ -632,6 +672,11 @@ class _ChatScreenState extends State<ChatScreen> {
         ? _HandshakeWaitingBanner(tokens: t, retryAttempt: retryAttempt)
         : null;
 
+    // Secret chats deliver live only (no store-and-forward), so sending is
+    // disabled until BOTH sides are online. Recomputes on every presence change.
+    final secretLocked =
+        widget.isSecret && (core?.isContactOnline(_peerId) != true);
+
     final scaffold = Scaffold(
       backgroundColor: g ? Colors.transparent : t.bgBase,
       appBar: appBar,
@@ -639,7 +684,29 @@ class _ChatScreenState extends State<ChatScreen> {
         children: [
           Expanded(child: messageList),
           if (handshakeBanner != null) handshakeBanner,
-          inputBar,
+          if (secretLocked)
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+              color: t.bgSurface,
+              child: Row(
+                children: [
+                  Icon(Icons.lock_clock_outlined, color: t.textSecondary, size: 18),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'waiting for ${_displayName ?? widget.contactName} to come '
+                      'online — a secret chat delivers live only',
+                      style: TextStyle(
+                          color: t.textSecondary,
+                          fontFamily: 'monospace',
+                          fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          else
+            inputBar,
         ],
       ),
     );
@@ -1023,6 +1090,18 @@ class _ChatScreenState extends State<ChatScreen> {
                 decoration: BoxDecoration(color: t.divider, borderRadius: BorderRadius.circular(2)),
               ),
               const SizedBox(height: 16),
+              if (!widget.isSecret)
+                _MenuItem(icon: Icons.lock_outline, label: 'start secret chat', tokens: t,
+                  onTap: () {
+                    Navigator.pop(context);
+                    Navigator.push(context, _AppRoute(
+                      builder: (_) => ChatScreen(
+                        contactName: _displayName ?? widget.contactName,
+                        contactId:   secretConversationId(_peerId),
+                        isSecret:    true,
+                      ),
+                    ));
+                  }),
               _MenuItem(icon: Icons.fingerprint, label: 'verify safety number', tokens: t,
                 onTap: () {
                   Navigator.pop(context);
@@ -1296,7 +1375,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _showEditContact(PhantomTokens t, PhantomCore? core) async {
-    final contact = await core?.storage.getContact(widget.contactId);
+    final contact = await core?.storage.getContact(_peerId);
     final nickCtrl = TextEditingController(text: contact?.nickname ?? '');
 
     if (!mounted) return;
@@ -1327,7 +1406,7 @@ class _ChatScreenState extends State<ChatScreen> {
             onPressed: () async {
               final nick = nickCtrl.text.trim();
               if (core != null) {
-                final current = await core.storage.getContact(widget.contactId);
+                final current = await core.storage.getContact(_peerId);
                 if (current != null) {
                   await core.storage.saveContact(
                     current.copyWith(
