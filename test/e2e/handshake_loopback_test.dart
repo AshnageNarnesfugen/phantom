@@ -293,4 +293,32 @@ void main() {
     expect(got!.content, img,
         reason: 'bytes idénticos tras reensamblar + verificar sha256');
   });
+
+  test('delete-for-everyone removes the recipient\'s copy too', () async {
+    final bobAddress = await bob.getMyContactAddress();
+    await alice.addContact(contactAddress: bobAddress!, nickname: 'Bob');
+    final bobGets = nextMessage(bob);
+    final sent =
+        await alice.sendMessage(recipientId: bob.myId, text: 'oops delete me');
+    final bobGot = await bobGets;
+    expect(bobGot.id, sent.id, reason: 'same stable message id on both sides');
+
+    await alice.deleteForEveryone(bob.myId, sent.id);
+
+    // Bob's copy must disappear once the deleteRequest arrives + processes.
+    var gone = false;
+    final deadline = DateTime.now().add(const Duration(seconds: 15));
+    while (DateTime.now().isBefore(deadline)) {
+      final msgs = await bob.storage.getMessages(alice.myId, limit: 50);
+      if (!msgs.any((m) => m.id == sent.id)) {
+        gone = true;
+        break;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    expect(gone, isTrue, reason: 'delete-for-everyone must remove Bob\'s copy');
+    // And Alice's own copy is gone too.
+    final aliceMsgs = await alice.storage.getMessages(bob.myId, limit: 50);
+    expect(aliceMsgs.any((m) => m.id == sent.id), isFalse);
+  });
 }

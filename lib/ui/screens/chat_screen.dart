@@ -427,11 +427,17 @@ class _ChatScreenState extends State<ChatScreen> {
               onTap: () { Navigator.pop(ctx); Clipboard.setData(ClipboardData(text: msg.textContent)); }),
           _MenuItem(icon: Icons.forward_outlined, label: 'forward', tokens: t,
             onTap: () { Navigator.pop(ctx); _showForwardStub(ctx, t); }),
+          _MenuItem(icon: Icons.delete_outline, label: 'delete for me', tokens: t, danger: true,
+            onTap: () async {
+              Navigator.pop(ctx);
+              await core?.deleteMessage(widget.contactId, msg.id);
+              if (mounted) setState(() => _messages?.removeWhere((m) => m.id == msg.id));
+            }),
           if (isOut)
-            _MenuItem(icon: Icons.delete_outline, label: 'delete', tokens: t, danger: true,
+            _MenuItem(icon: Icons.delete_forever_outlined, label: 'delete for everyone', tokens: t, danger: true,
               onTap: () async {
                 Navigator.pop(ctx);
-                await core?.deleteMessage(widget.contactId, msg.id);
+                await core?.deleteForEveryone(widget.contactId, msg.id);
                 if (mounted) setState(() => _messages?.removeWhere((m) => m.id == msg.id));
               }),
           if (isOut && msg.status == MessageStatus.failed)

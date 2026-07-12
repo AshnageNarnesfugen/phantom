@@ -1512,6 +1512,7 @@ class PhantomCore {
       MessageType.avatarData,
       MessageType.aliasData,
       MessageType.readReceipt,
+      MessageType.deleteRequest,
       MessageType.connectivityInfo,
       MessageType.preKeyShare,
       MessageType.handshakeAck,
@@ -2551,6 +2552,25 @@ class PhantomCore {
   Future<void> deleteMessage(String conversationId, String messageId) =>
       storage.deleteMessage(conversationId, messageId);
 
+  /// "Delete for everyone": removes [messageId] locally AND asks [contactId] to
+  /// remove their copy too (a deleteRequest control frame). Best-effort on the
+  /// remote side — if they're offline the frame rides the normal store-and-
+  /// forward and lands when they sync. Only meaningful for outgoing messages.
+  Future<void> deleteForEveryone(String contactId, String messageId) async {
+    await storage.deleteMessage(contactId, messageId);
+    try {
+      await _sendPhantomMessage(
+        recipientId: contactId,
+        message: PhantomMessage(
+          type: MessageType.deleteRequest,
+          content: Uint8List.fromList(utf8.encode(messageId)),
+        ),
+      );
+    } catch (e) {
+      TransportDebugger.instance.log('DELETE: request send failed: $e');
+    }
+  }
+
   /// Archives or unarchives a conversation (contact stays, just hidden).
   Future<void> setConversationArchived(String contactId, {required bool archived}) async {
     final c = await storage.getContact(contactId);
@@ -3523,6 +3543,19 @@ class PhantomCore {
     // completed transfer rewrites its manifest bubble into the real media.
     if (message.type == MessageType.mediaChunk) {
       await _handleMediaChunk(senderId, message.content);
+      return;
+    }
+
+    // "Delete for everyone": the sender removed a message and wants our copy
+    // gone too. Ids are newline-joined; delete each from this conversation.
+    if (message.type == MessageType.deleteRequest) {
+      final ids = utf8.decode(message.content)
+          .split('\n')
+          .where((s) => s.isNotEmpty);
+      for (final id in ids) {
+        await storage.deleteMessage(senderId, id);
+      }
+      notifyContactChanged(senderId);
       return;
     }
 

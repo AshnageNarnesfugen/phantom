@@ -43,6 +43,9 @@ enum MessageType {
   groupControl(0x41),
   typingIndicator(0x10),
   readReceipt(0x11),
+  // "Delete for everyone": ids (newline-joined) the sender wants removed from
+  // the recipient's copy of the conversation too. Not shown in chat.
+  deleteRequest(0x12),
   keyExchange(0x20),
   bundleUpdate(0x21),
   avatarData(0x30),
