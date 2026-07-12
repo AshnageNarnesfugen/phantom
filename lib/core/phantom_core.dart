@@ -94,6 +94,20 @@ class PhantomCore {
   bool isContactOnline(String contactId) => _presence?.isOnline(contactId) ?? false;
   Stream<String> get presenceChanges => _presence?.changes ?? const Stream.empty();
 
+  /// Whether high-privacy mode (I2P-only control plane) is active right now.
+  bool get highPrivacyMode => transport.highPrivacyMode;
+
+  /// Turns high-privacy mode on/off live and persists it. When on, the key
+  /// exchange / control plane rides I2P ONLY (never fanned out), so session
+  /// setup doesn't reveal our IP to the fleet — at the cost of needing the I2P
+  /// path up (the handshake retry covers transient unavailability).
+  Future<void> setHighPrivacyMode(bool v) async {
+    transport.highPrivacyMode = v;
+    await storage.setHighPrivacyMode(v);
+    TransportDebugger.instance
+        .log('PRIVACY: high-privacy mode ${v ? "ON — control plane is I2P-only" : "off"}');
+  }
+
   String? _activeChatId;
   void setActiveChat(String? contactId) => _activeChatId = contactId;
 
@@ -2433,6 +2447,10 @@ class PhantomCore {
     // every contact finally learns our ygg address. Without this the handshake's
     // connectivityInfo carried ygg=null and ygg was never used at all.
     transport.onYggReady = () => unawaited(_rebroadcastConnectivityForYgg());
+    // Apply the persisted high-privacy setting before any handshake runs.
+    try {
+      transport.highPrivacyMode = await storage.getHighPrivacyMode();
+    } catch (_) {}
     try {
       await transport.initialize(ourId: myId);
       _transportAvailable = true;

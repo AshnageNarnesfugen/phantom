@@ -375,6 +375,12 @@ class PhantomStorage {
       (await getSetting<bool>('ygg_enabled')) ?? false;
   Future<void> setYggEnabled(bool v) => setSetting('ygg_enabled', v);
 
+  /// High-privacy mode: route the key-exchange / control plane over I2P only
+  /// (never fanned out), so session setup doesn't reveal our IP. Default off.
+  Future<bool> getHighPrivacyMode() async =>
+      (await getSetting<bool>('high_privacy_mode')) ?? false;
+  Future<void> setHighPrivacyMode(bool v) => setSetting('high_privacy_mode', v);
+
   /// When true, only the custom peers list is used. When false (default),
   /// the daemon picks from the cached dynamic list fetched at startup.
   Future<bool> getYggUseCustomPeers() async =>

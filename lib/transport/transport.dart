@@ -248,6 +248,14 @@ class TransportManager {
     }
   }
 
+  /// High-privacy mode: route control-plane frames (handshake/X3DH, key shares,
+  /// connectivity) over I2P ONLY, never fanned out — so the sensitive session
+  /// setup never reveals our IP to the Waku fleet / IPFS peers. Strict: if the
+  /// I2P path isn't available we FAIL rather than silently leak over another
+  /// transport (the handshake auto-retry then re-sends once I2P is ready).
+  /// Data messages are unaffected (they keep the normal multi-path stack).
+  bool highPrivacyMode = false;
+
   /// Stores transport-specific metadata for contacts (Ygg addresses, I2P destinations, etc.)
   final Map<String, String> _yggAddrs = {};
   final Map<String, String> _i2pDests = {};
@@ -318,6 +326,30 @@ class TransportManager {
     }
 
     final dbg = TransportDebugger.instance;
+
+    // ── High-privacy mode: control frames go over I2P ONLY ────────────────────
+    // The key exchange (INIT/ack/preKeyShare/connectivityInfo) is where linkage
+    // happens — who is contacting whom. Fanning it out reveals our IP to the
+    // Waku fleet and IPFS peers, cancelling I2P's anonymity. So in this mode we
+    // send control frames ONLY over I2P and do NOT fall back to any other path
+    // (a fallback would leak exactly what we're hiding). If I2P can't carry it
+    // right now, we throw: for the INIT the handshake auto-retry re-sends it
+    // once I2P is ready; other control frames are refreshers and retry later.
+    if (highPrivacyMode && priority == TransportPriority.control) {
+      final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
+      final dest = _i2pDests[recipientId];
+      if (i2p == null || !i2p.isAvailable || dest == null) {
+        throw const TransportException(
+            'high-privacy: I2P path not ready — refusing to leak the control '
+            'frame over another transport');
+      }
+      dbg.log('TRANSPORT: [high-privacy] control frame via I2P ONLY → '
+          '${dest.substring(0, 12)}…');
+      await i2p
+          .publishToDest(dest: dest, data: encryptedEnvelope)
+          .timeout(const Duration(seconds: 12));
+      return; // never fan out
+    }
 
     // NOTE: control frames used to short-circuit after a single I2P datagram
     // send. That "success" only means the local SAM bridge accepted the UDP
