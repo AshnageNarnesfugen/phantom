@@ -18,6 +18,7 @@ import 'package:uuid/uuid.dart';
 import 'groups.dart';
 import 'link_preview_service.dart';
 import 'media_chunking.dart';
+import 'secret_chat.dart';
 import 'protocol/message.dart';
 import 'protocol/frame.dart';
 import 'storage/phantom_storage.dart';
@@ -477,12 +478,14 @@ class PhantomCore {
         required Uint8List encryptedEnvelope,
         bool isHandshake = false,
         TransportPriority priority = TransportPriority.data,
+        bool secret = false,
       }) =>
           v1.publish(
             recipientId:       recipientId,
             encryptedEnvelope: encryptedEnvelope,
             isHandshake:       isHandshake,
             priority:          priority,
+            secret:            secret,
           ),
     );
   }
@@ -1386,10 +1389,11 @@ class PhantomCore {
   Future<StoredMessage> _sendPhantomMessage({
     required String recipientId,
     required PhantomMessage message,
+    bool secret = false,
   }) {
     final lock = _sendLocks.putIfAbsent(recipientId, () => _SerialLock());
     return lock.guard(() => _sendPhantomMessageInner(
-        recipientId: recipientId, message: message));
+        recipientId: recipientId, message: message, secret: secret));
   }
 
   /// Ratchet-mutating phase of a send: encrypt, wrap (INIT on first message)
@@ -1472,6 +1476,7 @@ class PhantomCore {
   Future<StoredMessage> _sendPhantomMessageInner({
     required String recipientId,
     required PhantomMessage message,
+    bool secret = false,
   }) async {
     // Queued (unawaited) sends may reach here after dispose(); writing to
     // storage at that point races teardown. No-op instead of throwing — the
@@ -1518,6 +1523,9 @@ class PhantomCore {
       MessageType.handshakeAck,
       MessageType.groupEnvelope,
       MessageType.groupControl,
+      // Secret-chat wrapper: the sender persists the inner message under the
+      // sec_ conversation itself, so the envelope isn't a 1:1 bubble.
+      MessageType.secretEnvelope,
       // Media chunks are the raw bytes of a file in flight — the paired
       // manifest (image/file type) is the visible bubble, not each slice.
       MessageType.mediaChunk,
@@ -1555,6 +1563,7 @@ class PhantomCore {
             encryptedEnvelope:  wire,
             isHandshake:        isHandshake,
             priority:           priority,
+            secret:             secret,
           );
           // Three-state truth: a QUEUED message hasn't actually left the
           // device (offline / no transport ready) — keep it 'sending' so the
@@ -1589,6 +1598,7 @@ class PhantomCore {
             encryptedEnvelope: wire,
             isHandshake: isHandshake,
             priority:    priority,
+            secret:      secret,
           );
           await storage.updateMessageStatus(recipientId, message.id, MessageStatus.sent);
 
@@ -2551,6 +2561,64 @@ class PhantomCore {
   /// Permanently deletes a single message from local storage.
   Future<void> deleteMessage(String conversationId, String messageId) =>
       storage.deleteMessage(conversationId, messageId);
+
+  // ── Secret chats (I2P-only, both-online — see core/secret_chat.dart) ────────
+
+  /// Sends a text into the secret conversation with [contactId]: wrapped in a
+  /// secretEnvelope and routed I2P-ONLY-reliable (never touches Waku/IPFS), so
+  /// the peer never sees your IP. Requires the peer to be online (secret chats
+  /// have no store-and-forward); throws if not, and the send fails closed if
+  /// I2P can't carry it (never falls back to a de-anonymising path).
+  Future<StoredMessage> sendSecretText(String contactId, String text) {
+    return sendSecretMessage(
+      contactId,
+      MessageType.text,
+      Uint8List.fromList(utf8.encode(text)),
+    );
+  }
+
+  Future<StoredMessage> sendSecretMessage(
+      String contactId, MessageType innerType, Uint8List content) async {
+    if (!isContactOnline(contactId)) {
+      throw const PhantomCoreException(
+          'Secret chats deliver live only — the contact is offline.');
+    }
+    final convId = secretConversationId(contactId);
+    final envelope = PhantomMessage(
+      type: MessageType.secretEnvelope,
+      content: packSecretEnvelope(innerType, content),
+    );
+    // Persist our own copy under the secret conversation immediately (same id
+    // as the wire message, so a later delete-for-everyone lines up).
+    final stored = StoredMessage(
+      id: envelope.id,
+      conversationId: convId,
+      type: innerType,
+      content: content,
+      timestampUs: DateTime.now().microsecondsSinceEpoch,
+      direction: MessageDirection.outgoing,
+      status: MessageStatus.sending,
+      senderId: myId,
+    );
+    await storage.saveMessage(stored);
+    notifyContactChanged(convId);
+
+    try {
+      await _sendPhantomMessage(
+        recipientId: contactId,
+        message: envelope,
+        secret: true,
+      );
+      await storage.updateMessageStatus(convId, stored.id, MessageStatus.sent);
+      notifyContactChanged(convId);
+      return stored.copyWith(status: MessageStatus.sent);
+    } catch (e) {
+      await storage.updateMessageStatus(convId, stored.id, MessageStatus.failed);
+      notifyContactChanged(convId);
+      TransportDebugger.instance.log('SECRET: send failed (not leaking): $e');
+      return stored.copyWith(status: MessageStatus.failed);
+    }
+  }
 
   /// "Delete for everyone": removes [messageId] locally AND asks [contactId] to
   /// remove their copy too (a deleteRequest control frame). Best-effort on the
@@ -3543,6 +3611,38 @@ class PhantomCore {
     // completed transfer rewrites its manifest bubble into the real media.
     if (message.type == MessageType.mediaChunk) {
       await _handleMediaChunk(senderId, message.content);
+      return;
+    }
+
+    // Secret chat: unwrap and file under the dedicated sec_ conversation with
+    // this sender — a separate space from the normal chat.
+    if (message.type == MessageType.secretEnvelope) {
+      final inner = unpackSecretEnvelope(message.content);
+      if (inner == null) return;
+      final convId = secretConversationId(senderId);
+      final stored = StoredMessage(
+        id: message.id,
+        conversationId: convId,
+        type: inner.innerType,
+        content: inner.content,
+        timestampUs: DateTime.now().microsecondsSinceEpoch,
+        direction: MessageDirection.incoming,
+        status: MessageStatus.delivered,
+        senderId: senderId,
+      );
+      await storage.saveMessage(stored);
+      _incomingController.add(stored);
+      if (_activeChatId != convId) {
+        final contact = await storage.getContact(senderId);
+        final who = contact?.displayName ?? senderId.substring(0, 6);
+        NotificationService.showMessage(
+          contactName: '🔒 $who',
+          preview: inner.innerType == MessageType.text
+              ? utf8.decode(inner.content)
+              : '[secret ${inner.innerType.name}]',
+          contactId: convId,
+        );
+      }
       return;
     }
 

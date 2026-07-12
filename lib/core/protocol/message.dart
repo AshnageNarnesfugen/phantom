@@ -41,6 +41,9 @@ enum MessageType {
   // group conversation, and the membership-control channel.
   groupEnvelope(0x40),
   groupControl(0x41),
+  // Secret chat (I2P-only, both-online): wraps an inner message so the receiver
+  // files it under the dedicated secret conversation. Never a normal bubble.
+  secretEnvelope(0x42),
   typingIndicator(0x10),
   readReceipt(0x11),
   // "Delete for everyone": ids (newline-joined) the sender wants removed from

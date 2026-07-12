@@ -91,4 +91,20 @@ void main() {
     expect(rec.sent, hasLength(1),
         reason: 'with high-privacy off the control plane uses the full stack');
   });
+
+  test('secret: a secret frame is I2P-only even with global privacy OFF — '
+      'never leaks over another transport', () async {
+    await boot(highPrivacy: false); // global mode off; secret is per-message
+    await expectLater(
+      mgr.publish(
+          recipientId: bob,
+          encryptedEnvelope: payload(),
+          priority: TransportPriority.data,
+          secret: true),
+      throwsA(isA<TransportException>()),
+      reason: 'no I2P path → a secret frame must fail, not fall back',
+    );
+    expect(rec.sent, isEmpty,
+        reason: 'a secret-chat frame must never ride a non-I2P transport');
+  });
 }

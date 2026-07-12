@@ -311,6 +311,7 @@ class TransportManager {
     required Uint8List encryptedEnvelope,
     bool isHandshake = false,
     TransportPriority priority = TransportPriority.data,
+    bool secret = false,
   }) async {
     // Re-probe inactive transports on every publish (throttled to 1/3s).
     // Yggdrasil's availability check passes on virtually every device, so the
@@ -336,20 +337,23 @@ class TransportManager {
     // (a fallback would leak exactly what we're hiding). If I2P can't carry it
     // right now, we throw: for the INIT the handshake auto-retry re-sends it
     // once I2P is ready; other control frames are refreshers and retry later.
-    if (highPrivacyMode && priority == TransportPriority.control) {
+    // Secret-chat frames ALWAYS go I2P-only (per-conversation anonymity),
+    // regardless of the global setting; the global high-privacy mode adds the
+    // same restriction for the control plane.
+    if (secret || (highPrivacyMode && priority == TransportPriority.control)) {
       final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
       final dest = _i2pDests[recipientId];
       if (i2p == null || !i2p.isAvailable || dest == null) {
         throw const TransportException(
-            'high-privacy: I2P path not ready — refusing to leak the control '
-            'frame over another transport');
+            'I2P-only path not ready — refusing to leak the frame over '
+            'another transport');
       }
-      dbg.log('TRANSPORT: [high-privacy] control frame via I2P ONLY → '
+      dbg.log('TRANSPORT: [I2P-only] frame via I2P → '
           '${dest.substring(0, 12)}… (reliable)');
       // Guaranteed delivery: retransmits until the peer ACKs (its own retry
       // budget bounds this; no external timeout that could cut it short).
       await i2p.publishToDestReliable(dest: dest, data: encryptedEnvelope);
-      dbg.log('TRANSPORT: [high-privacy] I2P delivery CONFIRMED');
+      dbg.log('TRANSPORT: [I2P-only] delivery CONFIRMED');
       return; // never fan out
     }
 

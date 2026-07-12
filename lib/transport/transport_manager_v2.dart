@@ -32,6 +32,7 @@ class TransportManagerV2 {
     required Uint8List encryptedEnvelope,
     bool isHandshake,
     TransportPriority priority,
+    bool secret,
   })? _internetPublish;
 
   TransportMode _mode = TransportMode.offline;
@@ -67,6 +68,7 @@ class TransportManagerV2 {
       required Uint8List encryptedEnvelope,
       bool isHandshake,
       TransportPriority priority,
+      bool secret,
     })? internetPublish,
   })  : _btMesh = btMesh,
         _store = store,
@@ -116,6 +118,7 @@ class TransportManagerV2 {
     required Uint8List encryptedEnvelope,
     bool isHandshake = false,
     TransportPriority priority = TransportPriority.data,
+    bool secret = false,
   }) async {
     switch (_mode) {
       case TransportMode.internet:
@@ -136,9 +139,15 @@ class TransportManagerV2 {
             encryptedEnvelope: encryptedEnvelope,
             isHandshake: isHandshake,
             priority: priority,
+            secret: secret,
           );
           return SendResult.sent(via: TransportSource.internet);
         } catch (e) {
+          // Secret frames must NEVER fall back to BLE or the store — a queued
+          // secret message could later flush over Waku and leak the IP the
+          // whole point was to hide. Fail closed; the UI only enables sending
+          // when both peers are online, so I2P should carry it live.
+          if (secret) rethrow;
           // Internet failed — fall back to BLE
           return _sendViaBluetooth(
             recipientId: recipientId,
