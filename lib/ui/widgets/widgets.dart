@@ -2163,21 +2163,32 @@ class _NoisePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final s  = math.pow(strength, 3).toDouble();
     final id = Float64List(16)
       ..[0] = 1 ..[5] = 1 ..[10] = 1 ..[15] = 1;
     final bounds = Offset.zero & size;
-    canvas.saveLayer(bounds, Paint()..blendMode = BlendMode.overlay);
+
+    // strength → LAYER OPACITY, with the noise kept at full 0..255 contrast.
+    //
+    // The old code instead reduced contrast toward a flat 128 grey as strength
+    // dropped (out = s·channel + (1-s)·128, s = strength³). Composited with
+    // overlay onto a DARK background that collapses to a uniform grey veil — its
+    // darkening half does nothing on dark pixels while its lightening half lifts
+    // the whole surface toward ~50% grey — so the moment the slider left zero
+    // the background greyed out. Fading the opacity of full-contrast noise gives
+    // real grain (both darker and lighter speckles) that simply gets fainter,
+    // never a veil. Quadratic keeps the low end gentle; capped so max is texture.
+    final opacity = (strength * strength * 0.5).clamp(0.0, 0.5).toDouble();
+
+    canvas.saveLayer(
+      bounds,
+      Paint()
+        ..blendMode = BlendMode.overlay
+        ..color = Color.fromRGBO(0, 0, 0, opacity),
+    );
     canvas.drawRect(
       bounds,
       Paint()
-        ..shader = ui.ImageShader(noise, TileMode.repeated, TileMode.repeated, id)
-        ..colorFilter = ui.ColorFilter.matrix([
-            s, 0, 0, 0, (1 - s) * 128,
-            0, s, 0, 0, (1 - s) * 128,
-            0, 0, s, 0, (1 - s) * 128,
-            0, 0, 0, 1, 0,
-          ]),
+        ..shader = ui.ImageShader(noise, TileMode.repeated, TileMode.repeated, id),
     );
     canvas.restore();
   }
