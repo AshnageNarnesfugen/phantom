@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:flutter/foundation.dart';
 import '../core/transport_debugger.dart';
 import '../core/waku_daemon.dart';
+import '../core/ipfs_daemon.dart';
 import '../core/yggdrasil_daemon.dart';
 import 'yggdrasil/ygg_ip6.dart';
 import 'yggdrasil/ygg_packet_channel.dart';
@@ -139,8 +140,13 @@ class TransportManager {
             loadKey:     i2pLoadKey,
             persistKey:  i2pPersistKey,
           ),
-          // IPFS: now relegated to file transfer only (on-demand)
-          IpfsTransport(apiUrl: ipfsApiUrl ?? 'http://127.0.0.1:5001'),
+          // IPFS: now relegated to file transfer only (on-demand). Reads the
+          // daemon's REST URL LIVE so a power-save restart on a new ephemeral
+          // port doesn't strand the transport on a dead one.
+          IpfsTransport(
+            apiUrl: ipfsApiUrl ?? 'http://127.0.0.1:5001',
+            apiUrlProvider: () => IpfsDaemon.apiUrl,
+          ),
         ];
 
   /// Checks all transports in parallel and starts every reachable one.
@@ -482,7 +488,21 @@ class TransportManager {
 ///   - ipfs config --json Experimental.Pubsub true
 ///   - ipfs daemon --enable-pubsub-experiment
 class IpfsTransport implements PhantomTransport {
-  final String _apiUrl;
+  final String _fixedApiUrl;
+
+  /// Live source of the daemon's REST URL. Kubo binds an EPHEMERAL API port,
+  /// so when the daemon is stopped (power-save) and restarts it usually comes
+  /// back on a DIFFERENT port. A URL frozen at construction then points at a
+  /// dead port forever (field bug: after a background/power-save cycle every
+  /// IPFS call was `connection refused 127.0.0.1:<old-port>`). Reading it live
+  /// each request picks up the new port the moment the daemon re-registers it —
+  /// the same stale-port fix already applied to Waku. Null in tests/lab (they
+  /// pass a fixed URL).
+  final String Function()? _apiUrlProvider;
+
+  /// Current daemon REST base URL (live if a provider was given).
+  String get _apiUrl => _apiUrlProvider?.call() ?? _fixedApiUrl;
+
   final http.Client _client = http.Client();
   bool _disposed = false;
   final Set<String> _swarmConnected = {};
@@ -645,7 +665,9 @@ class IpfsTransport implements PhantomTransport {
   @override
   bool get isAvailable => true;
 
-  IpfsTransport({required String apiUrl}) : _apiUrl = apiUrl;
+  IpfsTransport({required String apiUrl, String Function()? apiUrlProvider})
+      : _fixedApiUrl = apiUrl,
+        _apiUrlProvider = apiUrlProvider;
 
   @override
   Future<bool> checkAvailability() async {
