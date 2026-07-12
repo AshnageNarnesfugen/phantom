@@ -119,6 +119,15 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: Text(c.displayName, style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 13)),
           ),
+          _MenuItem(icon: Icons.lock_outline, label: 'start secret chat', tokens: t,
+            onTap: () {
+              Navigator.pop(ctx);
+              Navigator.push(ctx, _AppRoute(builder: (_) => ChatScreen(
+                contactName: c.displayName,
+                contactId:   secretConversationId(c.phantomId),
+                isSecret:    true,
+              )));
+            }),
           _MenuItem(icon: Icons.archive_outlined, label: c.isArchived ? 'unarchive' : 'archive', tokens: t,
             onTap: () async {
               Navigator.pop(ctx);
