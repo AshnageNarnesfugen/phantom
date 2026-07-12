@@ -88,6 +88,7 @@ class PhantomCore {
   bool get isTransportAvailable => _transportAvailable;
 
   PresenceService? _presence;
+  StreamSubscription<String>? _presenceMediaSub;
   String? _ipfsApiUrl;
   bool isContactOnline(String contactId) => _presence?.isOnline(contactId) ?? false;
   Stream<String> get presenceChanges => _presence?.changes ?? const Stream.empty();
@@ -2364,6 +2365,20 @@ class PhantomCore {
         _notifyTransportIpfsPeerId(c.phantomId, c.ipfsPeerId!);
       }
     }
+    // Rendezvous for media: an image/file lives only on the SENDER's IPFS node
+    // (no store-and-forward for the bytes), so the block can only transfer while
+    // that node is reachable. The message frame (CID) arrives offline via Waku
+    // store, but the download hangs if the sender is asleep. So the moment a
+    // contact is seen online, re-attempt any of their still-unresolved media —
+    // this is the window where bitswap can actually pull the block.
+    _presenceMediaSub = _presence!.changes.listen((contactId) {
+      if (_presence?.isOnline(contactId) ?? false) {
+        TransportDebugger.instance.log(
+            'MEDIA: ${contactId.substring(0, contactId.length.clamp(0, 8))} '
+            'came online — retrying any pending downloads');
+        unawaited(resolvePendingMedia(contactId));
+      }
+    });
   }
 
   // ── Contacts / conversation management ────────────────────────────────────
@@ -3536,6 +3551,7 @@ class PhantomCore {
     await _meshStoreSub?.cancel();
     await _meshDeliveredSub?.cancel();
     await _meshRangeSub?.cancel();
+    await _presenceMediaSub?.cancel();
     await transport.dispose();
     await _transportV2?.dispose();
     _presence?.dispose();
