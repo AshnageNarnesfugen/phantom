@@ -249,4 +249,48 @@ void main() {
     await alice.sendMessage(recipientId: bob.myId, text: 'de vuelta');
     expect((await bobGets).textContent, 'de vuelta');
   });
+
+  test('imagen grande viaja por chunked store-and-forward (sin IPFS) y se '
+      'reensambla byte-exacta', () async {
+    // Handshake para dejar la sesión establecida en ambos sentidos.
+    final bobAddress = await bob.getMyContactAddress();
+    await alice.addContact(contactAddress: bobAddress!, nickname: 'Bob');
+    final firstToBob = nextMessage(bob);
+    await alice.sendMessage(recipientId: bob.myId, text: 'hi');
+    await firstToBob;
+    final backToAlice = nextMessage(alice);
+    await bob.sendMessage(recipientId: alice.myId, text: 'hey');
+    await backToAlice;
+
+    // 200 KB: por encima de inlineMediaMax (64 KB) y por debajo de
+    // chunkedMediaMax → ruta chunked store-and-forward (manifest + N chunks),
+    // exactamente como una foto real. Sin IPFS, sin rendezvous.
+    final img =
+        Uint8List.fromList(List.generate(200 * 1024, (i) => (i * 131 + 7) & 0xff));
+    final sent =
+        await alice.sendFile(recipientId: bob.myId, bytes: img, fileName: 'foto.jpg');
+    // La copia local de Alice ya muestra los bytes reales (no el manifest).
+    expect(sent.content, img, reason: 'el emisor ve su imagen de inmediato');
+
+    // Bob termina con el mensaje-imagen resuelto == bytes originales, armado
+    // solo con los chunks que viajaron por el transporte (aquí el loopback,
+    // en el teléfono el store de Waku).
+    StoredMessage? got;
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (DateTime.now().isBefore(deadline)) {
+      final msgs = await bob.storage.getMessages(alice.myId, limit: 50);
+      for (final m in msgs) {
+        if (m.type == MessageType.image && m.content.length == img.length) {
+          got = m;
+          break;
+        }
+      }
+      if (got != null) break;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    expect(got, isNotNull,
+        reason: 'la imagen debe reensamblarse desde los chunks S&F, sin IPFS');
+    expect(got!.content, img,
+        reason: 'bytes idénticos tras reensamblar + verificar sha256');
+  });
 }

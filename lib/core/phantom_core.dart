@@ -17,6 +17,7 @@ import 'crypto/x3dh.dart';
 import 'package:uuid/uuid.dart';
 import 'groups.dart';
 import 'link_preview_service.dart';
+import 'media_chunking.dart';
 import 'protocol/message.dart';
 import 'protocol/frame.dart';
 import 'storage/phantom_storage.dart';
@@ -614,11 +615,37 @@ class PhantomCore {
   /// message cap.
   static const int inlineMediaMax = 64 * 1024;
 
+  /// Upper bound for chunked store-and-forward. Media between [inlineMediaMax]
+  /// and this is split into encrypted frames that ride Waku's store (offline-
+  /// capable, no IPFS). Larger than this falls back to the IPFS CID pointer —
+  /// a huge file would otherwise flood the fleet store with hundreds of chunks.
+  /// Downscaled images sit comfortably below it, so photos are always S&F.
+  static const int chunkedMediaMax = 4 * 1024 * 1024;
+
+  /// Reassembles inbound chunked-media transfers (keyed by transfer id). Waku's
+  /// store re-supplies missing chunks on the next sync, so this stays in memory.
+  final MediaReassembler _mediaReassembler = MediaReassembler();
+
+  /// transfer-id (hex) → the manifest message it belongs to, so a completed
+  /// reassembly can rewrite the right "[receiving…]" bubble into the media.
+  final Map<String,
+          ({String conversationId, String messageId, bool isImage, String name})>
+      _pendingMediaTransfers = {};
+
   Future<StoredMessage> sendFile({
     required String recipientId,
     required Uint8List bytes,
     required String fileName,
   }) async {
+    // Chunked store-and-forward for mid-size media: the bytes ride Waku's store
+    // as encrypted frames, so the recipient reassembles them whenever THEY come
+    // online — no IPFS, no rendezvous. (≤64 KB still goes inline in one frame;
+    // > chunkedMediaMax still uses the IPFS CID pointer.)
+    if (bytes.length > inlineMediaMax && bytes.length <= chunkedMediaMax) {
+      return _sendChunkedMedia(
+          recipientId: recipientId, bytes: bytes, fileName: fileName);
+    }
+
     final built = await _buildOutgoingFileContent(bytes, fileName);
 
     final stored = await _sendPhantomMessage(
@@ -691,6 +718,77 @@ class PhantomCore {
       ..[4 + nameBytes.length] = sz & 0xff
       ..setAll(5 + nameBytes.length, cidBytes);
     return (type: type, wire: wire, display: display);
+  }
+
+  static bool _isImageName(String name) {
+    final l = name.toLowerCase();
+    return l.endsWith('.jpg') || l.endsWith('.jpeg') || l.endsWith('.png') ||
+        l.endsWith('.gif') || l.endsWith('.webp');
+  }
+
+  /// Sends [bytes] via chunked store-and-forward: a manifest (the visible
+  /// image/file bubble) plus N encrypted [MessageType.mediaChunk] frames. The
+  /// sender's own bubble is rewritten to the real bytes immediately (we already
+  /// have them); the chunks upload in the background so the UI isn't blocked.
+  Future<StoredMessage> _sendChunkedMedia({
+    required String recipientId,
+    required Uint8List bytes,
+    required String fileName,
+  }) async {
+    var safeName = fileName;
+    while (utf8.encode(safeName).length > 255 && safeName.isNotEmpty) {
+      safeName = safeName.substring(1);
+    }
+    final isImage = _isImageName(safeName);
+    final split = MediaChunker.split(bytes, name: safeName, isImage: isImage);
+    TransportDebugger.instance.log(
+        'MEDIA: sending $safeName as ${split.chunks.length} S&F chunks '
+        '(${bytes.length} B)');
+
+    // 1. The manifest IS the chat message the recipient sees ("receiving…").
+    final stored = await _sendPhantomMessage(
+      recipientId: recipientId,
+      message: PhantomMessage(
+          type: isImage ? MessageType.image : MessageType.file,
+          content: split.manifest.encode()),
+    );
+
+    // 2. Our own copy: swap the manifest for the displayable bytes — no reason
+    //    to "receive" our own image.
+    final display = stored.copyWith(
+        content: isImage ? bytes : encodeFileDisplayContent(safeName, bytes));
+    await storage.saveMessage(display);
+
+    // 3. Push the chunks in the background (bounded concurrency) — Alice's image
+    //    already shows, so she never waits on the upload.
+    unawaited(_pushMediaChunks(recipientId, split.chunks));
+    return display;
+  }
+
+  Future<void> _pushMediaChunks(
+      String recipientId, List<MediaChunkFrame> chunks) async {
+    const concurrency = 4;
+    var next = 0;
+    Future<void> worker() async {
+      while (!_disposed) {
+        final i = next++; // synchronous → each worker takes a distinct index
+        if (i >= chunks.length) return;
+        try {
+          await _sendPhantomMessage(
+            recipientId: recipientId,
+            message: PhantomMessage(
+                type: MessageType.mediaChunk, content: chunks[i].encode()),
+          );
+        } catch (e) {
+          TransportDebugger.instance.log('MEDIA: chunk $i send failed: $e');
+        }
+      }
+    }
+
+    await Future.wait([for (var w = 0; w < concurrency; w++) worker()]);
+    TransportDebugger.instance
+        .log('MEDIA: dispatched ${chunks.length} chunks to '
+            '${recipientId.substring(0, recipientId.length.clamp(0, 8))}');
   }
 
   // ── Groups (serverless, pairwise fanout — see core/groups.dart) ─────────────
@@ -1219,6 +1317,51 @@ class PhantomCore {
     }
   }
 
+  // ── Chunked store-and-forward media (see core/media_chunking.dart) ──────────
+
+  /// Parses [content] as a chunked-media manifest, exposing just what the chat
+  /// UI needs to render a "receiving …" placeholder. Null for inline/CID/other.
+  static ({String name, int size})? tryParseChunkedManifest(Uint8List content) {
+    final m = MediaManifest.decode(content, maxSize: chunkedMediaMax);
+    return m == null ? null : (name: m.name, size: m.size);
+  }
+
+  /// Registers an inbound chunked transfer. If the chunks already arrived
+  /// (out-of-order store replay), completes immediately.
+  void _registerMediaManifest(StoredMessage stored, MediaManifest m) {
+    _pendingMediaTransfers[m.idHex] = (
+      conversationId: stored.conversationId,
+      messageId: stored.id,
+      isImage: stored.type == MessageType.image,
+      name: m.name,
+    );
+    final done = _mediaReassembler.onManifest(m);
+    if (done != null) unawaited(_finalizeMediaTransfer(m.idHex, done));
+  }
+
+  Future<void> _handleMediaChunk(String senderId, Uint8List content) async {
+    final frame = MediaChunkFrame.decode(content);
+    if (frame == null) return;
+    final done = _mediaReassembler.onChunk(frame);
+    if (done != null) await _finalizeMediaTransfer(frame.idHex, done);
+  }
+
+  /// A transfer completed + passed its integrity check: rewrite the manifest
+  /// bubble into the displayable bytes and refresh the conversation.
+  Future<void> _finalizeMediaTransfer(String idHex, Uint8List bytes) async {
+    final p = _pendingMediaTransfers.remove(idHex);
+    if (p == null) return;
+    final msgs = await storage.getMessages(p.conversationId, limit: 500);
+    final m = msgs.where((x) => x.id == p.messageId).firstOrNull;
+    if (m == null) return;
+    final display =
+        p.isImage ? bytes : encodeFileDisplayContent(p.name, bytes);
+    await storage.saveMessage(m.copyWith(content: display));
+    TransportDebugger.instance
+        .log('MEDIA: ✓ reassembled ${p.name} (${bytes.length} B) from S&F chunks');
+    notifyContactChanged(p.conversationId);
+  }
+
   /// Per-recipient send locks. Encrypting mutates the ratchet session and
   /// persists it — two concurrent sends to the same contact (e.g. a text
   /// racing the automatic connectivityInfo/preKeyShare after a handshake)
@@ -1360,6 +1503,9 @@ class PhantomCore {
       MessageType.handshakeAck,
       MessageType.groupEnvelope,
       MessageType.groupControl,
+      // Media chunks are the raw bytes of a file in flight — the paired
+      // manifest (image/file type) is the visible bubble, not each slice.
+      MessageType.mediaChunk,
     };
     if (!systemTypes.contains(message.type)) {
       await storage.saveMessage(stored);
@@ -2613,9 +2759,20 @@ class PhantomCore {
   /// Used right after a handshake so the contact has material to spend on the
   /// next session, even when no OPKs were consumed this round.
   Future<void> _advertiseExistingOpks(String recipientId) async {
-    final store = await storage.getPreKeyStore();
-    if (store == null) return;
+    // Fire-and-forget from _sendConnectivityInfo, so it can still be mid-flight
+    // when the core is torn down — opening the prekey box against an already-
+    // deleted storage dir throws. Bail if we've been disposed.
+    if (_disposed) return;
+    final store = await () async {
+      try {
+        return await storage.getPreKeyStore();
+      } catch (_) {
+        return null; // storage closing/gone underneath us
+      }
+    }();
+    if (store == null || _disposed) return;
     for (final entry in store.oneTimePreKeyPrivates.entries) {
+      if (_disposed) return;
       try {
         final pub = await _opkPublicOf(entry.value);
         await _sendPreKeyShare(recipientId, entry.key, pub);
@@ -3344,6 +3501,13 @@ class PhantomCore {
       return;
     }
 
+    // A chunked-media slice — not a chat bubble. Feed it to the reassembler; a
+    // completed transfer rewrites its manifest bubble into the real media.
+    if (message.type == MessageType.mediaChunk) {
+      await _handleMediaChunk(senderId, message.content);
+      return;
+    }
+
     final stored = StoredMessage.fromPhantomMessage(
       msg:            message,
       conversationId: senderId,
@@ -3353,15 +3517,19 @@ class PhantomCore {
     await storage.saveMessage(stored);
     _incomingController.add(stored);
 
-    // Media arrives as a CID pointer. Auto-fetch only when the download
-    // policy allows it on the current network (Always / WiFi-only / Manual);
-    // otherwise the message stays a pointer and the chat renders a download
-    // button. Inline media never reaches here as a pointer (its bytes ARE
-    // the content), so it always shows immediately.
+    // Media may arrive as: (a) a chunked-S&F manifest — the bytes are streaming
+    // in as mediaChunk frames and the reassembler completes it (offline-capable,
+    // no IPFS); (b) an IPFS CID pointer — auto-fetch per the download policy;
+    // (c) inline bytes — already displayable, nothing to do.
     if (stored.type == MessageType.image || stored.type == MessageType.file) {
-      final parsed = tryParseFileWireContent(stored.content);
-      if (parsed != null && await _shouldAutoDownloadMedia()) {
-        unawaited(_resolveMediaMessage(stored, parsed));
+      final manifest = MediaManifest.decode(stored.content);
+      if (manifest != null) {
+        _registerMediaManifest(stored, manifest);
+      } else {
+        final parsed = tryParseFileWireContent(stored.content);
+        if (parsed != null && await _shouldAutoDownloadMedia()) {
+          unawaited(_resolveMediaMessage(stored, parsed));
+        }
       }
     }
 

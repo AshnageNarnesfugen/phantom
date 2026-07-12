@@ -26,6 +26,12 @@ enum MessageType {
   text(0x01),
   image(0x02),
   file(0x03),
+  // One slice of a large image/file sent via chunked store-and-forward: the
+  // bytes are split into encrypted frames that ride Waku's store like any
+  // message, so the receiver reassembles them whenever it comes online — no
+  // IPFS, no need for the sender to be online at fetch time. Never shown in
+  // chat; the paired image/file "manifest" message is the visible bubble.
+  mediaChunk(0x05),
   // Text with a SENDER-generated link preview (Signal-style): the sender
   // fetched the page and embedded {url,title,desc,img} as JSON, so the
   // receiver renders a card without ever contacting the site (no IP leak on

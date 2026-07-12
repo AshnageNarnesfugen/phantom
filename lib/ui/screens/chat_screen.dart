@@ -61,6 +61,16 @@ class _ChatScreenState extends State<ChatScreen> {
     return PhantomCore.tryParseFileWireContent(msg.content);
   }
 
+  /// Non-null while a media message is still an in-flight chunked transfer (its
+  /// bytes are streaming in as store-and-forward chunks). Renders a "receiving"
+  /// card until the reassembler completes it and rewrites the content.
+  ({String name, int size})? _manifestFor(StoredMessage msg) {
+    if (msg.type != MessageType.image && msg.type != MessageType.file) {
+      return null;
+    }
+    return PhantomCore.tryParseChunkedManifest(msg.content);
+  }
+
   Future<void> _downloadMedia(PhantomCore? core, StoredMessage msg) async {
     if (core == null || _downloading.contains(msg.id)) return;
     setState(() => _downloading.add(msg.id));
@@ -707,11 +717,14 @@ class _ChatScreenState extends State<ChatScreen> {
                 isOut;
         // Non-null while this media is still an undownloaded CID pointer.
         final ptr = _pointerFor(msg);
+        // Non-null while a chunked transfer is still streaming in (auto).
+        final manifest = _manifestFor(msg);
+        final resolved = ptr == null && manifest == null;
         return Padding(
           padding: EdgeInsets.only(bottom: nextSame ? 2 : 10),
           child: GestureDetector(
             onLongPress: () => _showMsgMenu(context, t, core, msg),
-            onTap: (msg.type == MessageType.image && ptr == null)
+            onTap: (msg.type == MessageType.image && resolved)
                 ? () => _openImageViewer(context, t, core, msg.content)
                 : null,
             child: ChatBubble(
@@ -725,14 +738,15 @@ class _ChatScreenState extends State<ChatScreen> {
               showTail:     !nextSame,
               status:       msg.status,
               replyPreview: _replyPreviewFor(msg),
-              // A media message still holding a CID pointer hasn't been
-              // downloaded yet → render the download card, not the bytes.
-              mediaContent: (msg.type != MessageType.text && ptr == null)
+              // A media message still holding a CID pointer / streaming in as
+              // chunks isn't displayable yet → render the card, not the bytes.
+              mediaContent: (msg.type != MessageType.text && resolved)
                   ? msg.content
                   : null,
-              pendingDownload:
-                  ptr == null ? null : (name: ptr.name, size: ptr.size),
-              downloading: _downloading.contains(msg.id),
+              pendingDownload: manifest ??
+                  (ptr == null ? null : (name: ptr.name, size: ptr.size)),
+              // Chunked transfers stream in automatically → always "receiving".
+              downloading: manifest != null || _downloading.contains(msg.id),
               onDownload: () => _downloadMedia(core, msg),
               onForwardVideo: () => _forwardVideo(core, msg),
               messageType:  msg.type,
