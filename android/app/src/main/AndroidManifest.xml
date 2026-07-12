@@ -59,16 +59,6 @@
     <!-- BLE feature — no requerida, permite instalar en dispositivos sin BLE -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false"/>
 
-    <!-- Yggdrasil VpnService — establishes a TUN device for the 0200::/7 mesh.
-         BIND_VPN_SERVICE is the system permission Android requires for any
-         VpnService subclass; the user is also prompted via VpnService.prepare()
-         the first time we start the service. -->
-    <queries>
-        <intent>
-            <action android:name="android.net.VpnService"/>
-        </intent>
-    </queries>
-
     <application
         android:label="Phantom Messenger"
         android:name="${applicationName}"
@@ -139,18 +129,18 @@
             android:exported="false"
             android:foregroundServiceType="dataSync"/>
 
-        <!-- Yggdrasil VPN service — owns the TUN device that hosts our 0200::/7
-             address. permission=BIND_VPN_SERVICE is mandatory for any
-             VpnService subclass per Android security model. -->
+        <!-- Yggdrasil router — headless (NO TUN / VpnService). Hosts the
+             in-process yggdrasil-go router that dials tls:// peers over normal
+             internet and exposes Send/Recv; the Dart side moves IPv6 packets
+             over channels. Runs in the MAIN process (NOT :ygg): the service and
+             MainActivity's send/recv channel handlers share the router instance
+             via companion statics, which only works in one process. A foreground
+             service keeps the process alive while backgrounded — with none of
+             the system-wide-tunnel fallout the old VpnService had. -->
         <service
-            android:name=".YggdrasilVpnService"
+            android:name=".YggdrasilService"
             android:exported="false"
-            android:permission="android.permission.BIND_VPN_SERVICE"
-            android:foregroundServiceType="dataSync">
-            <intent-filter>
-                <action android:name="android.net.VpnService"/>
-            </intent-filter>
-        </service>
+            android:foregroundServiceType="dataSync"/>
 
         <!-- Waku relay node — lightweight P2P messaging with store-and-forward.
              Runs in its own process (:waku) for the same survival reasons as

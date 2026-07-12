@@ -1676,11 +1676,9 @@ class _YggdrasilPeersSheetState extends State<_YggdrasilPeersSheet> {
             onChanged: (v) async {
               setState(() => _enabled = v);
               unawaited(PhantomStorage.instance.setYggEnabled(v));
-              // Enabling must actually bring the tunnel up: trigger the
-              // one-time Android VPN-permission dialog and start the service
-              // right now (before this fix the toggle only wrote the setting
-              // and nothing asked for permission — the dialog was unreachable
-              // and Yggdrasil could never start).
+              // Enabling starts the headless router service right now. No VPN
+              // permission dialog anymore — the router runs without a TUN, so
+              // it can never hijack the device's routing or the app's daemons.
               final messenger = ScaffoldMessenger.of(context);
               final core = CoreProvider.of(context).core; // capture pre-async
               if (v) {
@@ -1702,11 +1700,9 @@ class _YggdrasilPeersSheetState extends State<_YggdrasilPeersSheet> {
                 messenger.showSnackBar(SnackBar(
                   content: Text(
                       ok
-                          ? 'yggdrasil up — address '
-                            '${YggdrasilDaemon.instance.address ?? "?"} · '
-                            'watching that it doesn\'t disrupt messaging'
-                          : 'yggdrasil could not start (permission denied or '
-                            'another VPN holds the slot)',
+                          ? 'yggdrasil up (headless) — address '
+                            '${YggdrasilDaemon.instance.address ?? "?"}'
+                          : 'yggdrasil could not start (router binary missing?)',
                       style: const TextStyle(
                           fontFamily: 'monospace', fontSize: 12)),
                   duration: const Duration(seconds: 4),

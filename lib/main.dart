@@ -228,21 +228,18 @@ class _PhantomAppState extends State<PhantomApp> with WidgetsBindingObserver {
   /// `ensure()`. When Yggdrasil is disabled in settings we just skip the
   /// daemon entirely so the VPN permission never gets requested.
   Future<void> _prepareYggdrasilAndEnsure() async {
-    // Storage isn't initialized until the user has an account, so on the
-    // first launch (pre-onboarding) we skip and fall back to the daemon's
-    // built-in bootstrap peers. Settings will pick this up on the next
-    // launch after onboarding writes the seed + initializes storage.
+    // Storage isn't initialized until the user has an account. Pre-onboarding
+    // we do NOT start the router (no account, no peers, no reason to run a
+    // foreground service before the user exists). Settings picks it up on the
+    // next launch after onboarding writes the seed + initializes storage.
     bool storageReady = true;
     try { PhantomStorage.instance; } catch (_) { storageReady = false; }
-    if (!storageReady) {
-      await YggdrasilDaemon.instance.ensure();
-      return;
-    }
+    if (!storageReady) return;
 
     final storage = PhantomStorage.instance;
     final enabled = await storage.getYggEnabled().catchError((_) => false);
     if (!enabled) {
-      // User has Yggdrasil off — don't start the VPN service at all.
+      // User has Yggdrasil off — don't start the router service at all.
       return;
     }
 

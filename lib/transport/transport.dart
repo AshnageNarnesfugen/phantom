@@ -6,6 +6,9 @@ import 'package:http/http.dart' as http;
 import 'package:flutter/foundation.dart';
 import '../core/transport_debugger.dart';
 import '../core/waku_daemon.dart';
+import '../core/yggdrasil_daemon.dart';
+import 'yggdrasil/ygg_ip6.dart';
+import 'yggdrasil/ygg_packet_channel.dart';
 
 /// Abstract transport layer.
 ///
@@ -1589,17 +1592,26 @@ class I2PTransport implements PhantomTransport {
 ///
 /// Uses direct TCP/IPv6 with length-prefixed framing:
 ///   [4-byte big-endian length][payload]
+/// Yggdrasil transport — TUN-less. The in-process router (gomobile
+/// `mobile.Yggdrasil`) dials its `tls://` peers over the normal internet and
+/// exposes `Send`/`Recv` for IPv6 packets. We craft/parse those packets in
+/// userspace ([YggIp6]) and move them over a [YggPacketChannel] — NO Android
+/// VpnService/TUN, so ygg can never hijack the device's routing or black-hole
+/// the app's own daemons (the old failure mode). Our frames ride a UDP datagram
+/// on [listenPort] purely for port multiplexing; the router routes by the IPv6
+/// destination and ignores layer-4.
 class YggdrasilTransport implements PhantomTransport {
-  static const int listenPort = 7331;
-  static const int _maxPayloadBytes = 1024 * 1024; // 1 MB safety cap
-  ServerSocket? _server;
+  static const int listenPort = YggIp6.phantomPort;
+
+  final YggPacketChannel _channel;
+  StreamSubscription<Uint8List>? _rxSub;
   bool _disposed = false;
 
   @override
   final String name = 'yggdrasil-tcp';
 
   @override
-  bool get isAvailable => true;
+  bool get isAvailable => _address != null;
 
   String? _address;
 
@@ -1607,90 +1619,38 @@ class YggdrasilTransport implements PhantomTransport {
 
   void setManualAddress(String ip) => _address = ip.isEmpty ? null : ip;
 
-  YggdrasilTransport({String? address}) : _address = address;
+  YggdrasilTransport({String? address, YggPacketChannel? channel})
+      : _address = address,
+        _channel = channel ?? PlatformYggPacketChannel();
 
   @override
   Future<bool> checkAvailability() async {
-    // 1. Auto-detect Yggdrasil IP if not provided
-    if (_address == null) {
-      try {
-        final interfaces = await NetworkInterface.list(type: InternetAddressType.IPv6);
-        for (final interface in interfaces) {
-          for (final addr in interface.addresses) {
-            final bytes = addr.rawAddress;
-            // Yggdrasil uses the 0200::/7 subnet.
-            // This means the first byte must be exactly 0x02 or 0x03.
-            if (bytes.length == 16 && (bytes[0] == 0x02 || bytes[0] == 0x03)) {
-              _address = addr.address;
-              TransportDebugger.instance.log('Yggdrasil: auto-detected IP $_address on ${interface.name}');
-              break;
-            }
-          }
-          if (_address != null) break;
-        }
-      } catch (e) {
-        TransportDebugger.instance.log('Yggdrasil: interface scan failed - $e');
-      }
-
-      // Fallback: Aggressive OS-level routing table scan (bypasses Android VPN hiding)
-      if (_address == null && (Platform.isAndroid || Platform.isLinux)) {
-        try {
-          final res = await Process.run('ip', ['-6', 'addr']);
-          if (res.exitCode == 0) {
-            // Strict match for Yggdrasil 0200::/7 — first byte must be 0x02 or
-            // 0x03. In `ip -6 addr` TEXT the leading zero of the first group is
-            // omitted: 0x0203… renders as `203:…`, never `0203:`. So the first
-            // group is exactly THREE hex chars starting with 2 or 3 — which also
-            // rejects global unicast like 2806: / 2001: (four chars). The old
-            // pattern demanded a literal leading 0 and could never match.
-            final regex = RegExp(r'inet6\s+([23][0-9a-fA-F]{2}:[0-9a-fA-F:]+)/\d+');
-            final match = regex.firstMatch(res.stdout.toString());
-            if (match != null && match.groupCount >= 1) {
-              _address = match.group(1)!;
-              TransportDebugger.instance.log('Yggdrasil: auto-detected IP $_address via native scan');
-            }
-          }
-        } catch (_) {}
-      }
-    }
-
-    // 2. HONEST availability: no Yggdrasil address → NOT available. The old
-    // check returned true whenever binding :: worked (i.e. always), which
-    // logged "availability = true" on devices with no TUN, no router and no
-    // route to any ygg peer — a false positive that masked the daemon never
-    // starting (field bug: OK logs while the transport was dead).
-    if (_address == null) return false;
-
-    // 3. And our listener must be bindable.
-    try {
-      final s = await ServerSocket.bind(InternetAddress.anyIPv6, 0);
-      await s.close();
-      return true;
-    } catch (_) {
-      return false;
-    }
+    // The router (via the native service) is the source of truth for our
+    // address now — there is no TUN interface to scan. Pull it from the daemon
+    // if the caller didn't inject one. Honest: no address → not available
+    // (no router provisioned yet → nothing to send/receive on).
+    _address ??= YggdrasilDaemon.instance.address;
+    return _address != null;
   }
 
-  /// Sends [data] to [address] with a 4-byte big-endian length prefix.
-  /// The receiver reads exactly [length] bytes then closes — no ambiguity.
+  /// Builds an IPv6+UDP packet ([YggIp6]) from our address to [address] and
+  /// hands it to the router. Throws [TransportException] if we have no address
+  /// yet or the frame exceeds the ygg MTU (the fan-out then uses another path).
   Future<void> publishToAddr({required String address, required Uint8List data}) async {
     final dbg = TransportDebugger.instance;
-    dbg.log('Yggdrasil: connecting to $address:$listenPort (${data.length} bytes)');
-    
-    Socket? s;
+    final src = _address;
+    if (src == null) {
+      throw const TransportException('Yggdrasil has no local address yet');
+    }
     try {
-      s = await Socket.connect(address, listenPort, timeout: const Duration(seconds: 5));
-      // Write 4-byte big-endian length header
-      final header = ByteData(4)..setUint32(0, data.length, Endian.big);
-      s.add(header.buffer.asUint8List());
-      s.add(data);
-      await s.flush();
-      dbg.log('Yggdrasil: sent ${data.length} bytes to $address');
+      final pkt = YggIp6.buildPacket(srcAddr: src, dstAddr: address, payload: data);
+      await _channel.send(pkt);
+      dbg.log('Yggdrasil: sent ${data.length} bytes to $address (${pkt.length}B pkt)');
+    } on ArgumentError catch (e) {
+      throw TransportException('Yggdrasil frame too large: $e');
     } catch (e) {
       dbg.log('Yggdrasil: send failed to $address — $e');
-      rethrow;
-    } finally {
-      try { await s?.close(); } catch (_) {}
+      throw TransportException('Yggdrasil send failed: $e');
     }
   }
 
@@ -1703,105 +1663,31 @@ class YggdrasilTransport implements PhantomTransport {
   Stream<IncomingEnvelope> subscribe({required String ourId}) {
     final dbg = TransportDebugger.instance;
     final controller = StreamController<IncomingEnvelope>();
+    dbg.log('Yggdrasil: listening for UDP:$listenPort frames over the router');
 
-    () async {
-      // Retry bind up to 3 times with delay if the port is busy (e.g. quick restart)
-      for (int attempt = 1; attempt <= 3; attempt++) {
-        try {
-          _server = await ServerSocket.bind(InternetAddress.anyIPv6, listenPort);
-          dbg.log('Yggdrasil: listening on port $listenPort');
-          break;
-        } catch (e) {
-          if (attempt == 3) {
-            dbg.log('Yggdrasil: ✗ failed to bind port $listenPort after 3 attempts: $e');
-            await controller.close();
-            return;
-          }
-          dbg.log('Yggdrasil: port $listenPort busy, retrying in ${attempt * 2}s (attempt $attempt/3)');
-          await Future.delayed(Duration(seconds: attempt * 2));
-        }
+    _rxSub = _channel.incoming.listen((packet) {
+      if (_disposed) return;
+      final dg = YggIp6.parse(packet, wantPort: listenPort);
+      if (dg == null || dg.payload.isEmpty) return; // not ours / malformed
+      dbg.log('Yggdrasil: received ${dg.payload.length} bytes from ${dg.srcAddr}');
+      if (!controller.isClosed) {
+        controller.add(IncomingEnvelope(
+          data: dg.payload,
+          transportName: name,
+          receivedAt: DateTime.now(),
+        ));
       }
+    }, onError: (Object e) => dbg.log('Yggdrasil: rx stream error: $e'));
 
-      if (_server == null) {
-        await controller.close();
-        return;
-      }
-
-      await for (final client in _server!) {
-        if (_disposed) break;
-        // Handle each connection concurrently so a stalled peer doesn't
-        // block the server from accepting other connections.
-        unawaited(_handleClient(client, dbg).then((envelope) {
-          if (envelope != null && !controller.isClosed) {
-            controller.add(envelope);
-          }
-        }).catchError((_) {}));
-      }
-      await controller.close();
-    }();
-
+    controller.onCancel = () => _rxSub?.cancel();
     return controller.stream;
-  }
-
-  /// Read a single length-prefixed message from [client] with a timeout.
-  /// Returns null if the read fails or times out.
-  Future<IncomingEnvelope?> _handleClient(Socket client, TransportDebugger dbg) async {
-    try {
-      final data = await _readLengthPrefixed(client)
-          .timeout(const Duration(seconds: 30));
-      if (data == null || data.isEmpty) return null;
-      dbg.log('Yggdrasil: received ${data.length} bytes from ${client.remoteAddress.address}');
-      return IncomingEnvelope(
-        data: data,
-        transportName: name,
-        receivedAt: DateTime.now(),
-      );
-    } catch (e) {
-      dbg.log('Yggdrasil: client read error: $e');
-      return null;
-    } finally {
-      try { client.close(); } catch (_) {}
-    }
-  }
-
-  /// Reads a 4-byte big-endian length header, then exactly that many payload bytes.
-  /// Falls back to reading all-until-close for backward compatibility with
-  /// senders that don't send a length prefix (pre-fix versions).
-  Future<Uint8List?> _readLengthPrefixed(Socket socket) async {
-    final allBytes = <int>[];
-    await for (final chunk in socket) {
-      allBytes.addAll(chunk);
-      // Once we have at least the 4-byte header, check payload size
-      if (allBytes.length >= 4) {
-        final view = ByteData.sublistView(Uint8List.fromList(allBytes.sublist(0, 4)));
-        final payloadLen = view.getUint32(0, Endian.big);
-        // Sanity check: reject absurdly large payloads
-        if (payloadLen > _maxPayloadBytes) {
-          return null; // Malformed or attack
-        }
-        if (allBytes.length >= 4 + payloadLen) {
-          return Uint8List.fromList(allBytes.sublist(4, 4 + payloadLen));
-        }
-      }
-    }
-    // Socket closed before we got the full payload.
-    // Backward compatibility: if there's no valid length prefix,
-    // treat the entire buffer as the payload (old-style framing).
-    if (allBytes.length > 4) {
-      final view = ByteData.sublistView(Uint8List.fromList(allBytes.sublist(0, 4)));
-      final maybeLen = view.getUint32(0, Endian.big);
-      if (maybeLen == allBytes.length - 4) {
-        return Uint8List.fromList(allBytes.sublist(4));
-      }
-    }
-    // Old-style: no length prefix, entire buffer is the message
-    return allBytes.isNotEmpty ? Uint8List.fromList(allBytes) : null;
   }
 
   @override
   Future<void> dispose() async {
     _disposed = true;
-    await _server?.close();
+    await _rxSub?.cancel();
+    await _channel.dispose();
   }
 }
 

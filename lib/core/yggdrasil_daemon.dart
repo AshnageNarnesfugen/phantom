@@ -29,6 +29,7 @@ class YggdrasilDaemon {
   YggdrasilDaemon._();
 
   bool _ensured = false;
+  bool _running = false;
   String? _address;
 
   /// Yggdrasil IPv6 we're advertising on the mesh, or null if not running.
@@ -47,18 +48,13 @@ class YggdrasilDaemon {
     _pendingPeers = peers;
   }
 
-  /// Idempotent setup. Generates a config on first run and starts the VPN
-  /// service if we already have permission. Otherwise the user must invoke
-  /// [requestPermissionAndStart] from the settings UI.
+  /// Idempotent setup. Generates a config on first run and starts the headless
+  /// router service. No VPN permission is involved anymore (the router runs
+  /// without a TUN), so this can bring ygg up on its own at launch.
   Future<void> ensure() async {
     if (!Platform.isAndroid || _ensured) return;
     _ensured = true;
     try {
-      final prepared = await _ch.invokeMethod<bool>('isPrepared') ?? false;
-      if (!prepared) {
-        debugPrint('[YggDaemon] VPN permission not granted — skipping auto-start');
-        return;
-      }
       await _startService();
     } catch (e) {
       debugPrint('[YggDaemon] ensure() failed: $e');
@@ -66,16 +62,14 @@ class YggdrasilDaemon {
     }
   }
 
-  /// Triggers the system VPN-permission dialog and starts the service if granted.
-  /// Returns true on success.
+  /// Starts the headless router. Name kept for existing call sites — there is
+  /// no VPN-permission dialog now (no TUN). Returns true on success.
   Future<bool> requestPermissionAndStart() async {
     if (!Platform.isAndroid) return false;
     try {
-      final ok = await _ch.invokeMethod<bool>('requestPermission') ?? false;
-      if (!ok) return false;
-      return _startService();
+      return await _startService();
     } catch (e) {
-      debugPrint('[YggDaemon] permission flow failed: $e');
+      debugPrint('[YggDaemon] start failed: $e');
       return false;
     }
   }
@@ -83,6 +77,7 @@ class YggdrasilDaemon {
   Future<void> stop() async {
     if (!Platform.isAndroid) return;
     try { await _ch.invokeMethod<void>('stopService'); } catch (_) {}
+    _running = false;
     _address = null;
   }
 
@@ -103,10 +98,9 @@ class YggdrasilDaemon {
   /// is still stored, so it applies the moment ygg is enabled) or off-Android.
   Future<String?> applyPeers(List<String> peers) async {
     setPeerOverride(peers);
-    if (!Platform.isAndroid) return null;
-    final prepared = await _ch.invokeMethod<bool>('isPrepared') ?? false;
-    if (!prepared) return null; // stored for next start; nothing running to bounce
+    if (!Platform.isAndroid || !_running) return null; // stored for next start
     try { await _ch.invokeMethod<void>('stopService'); } catch (_) {}
+    _running = false;
     _address = null;
     final ok = await _startService();
     return ok ? _address : null;
@@ -138,6 +132,7 @@ class YggdrasilDaemon {
         'configJson': cfg.json,
         'address':    cfg.address,
       });
+      _running = true;
     } catch (e) {
       debugPrint('[YggDaemon] startService failed: $e');
       return false;

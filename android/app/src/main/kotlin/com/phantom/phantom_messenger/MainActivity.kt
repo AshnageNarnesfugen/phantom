@@ -7,13 +7,13 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
-import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -21,8 +21,6 @@ import java.io.FileOutputStream
 
 class MainActivity : FlutterActivity() {
     private var gattServer: PhantomGattServer? = null
-    private var pendingVpnPermissionResult: MethodChannel.Result? = null
-    private val VPN_PERMISSION_REQ = 0xFEED
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -166,50 +164,39 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // ── Yggdrasil VPN daemon channel ──────────────────────────────────────
+        // ── Yggdrasil daemon channel (headless router, no VPN) ────────────────
         MethodChannel(
             flutterEngine!!.dartExecutor.binaryMessenger,
             "phantom/yggdrasil_daemon",
         ).setMethodCallHandler { call, result ->
             when (call.method) {
-                // Returns true when the user has already granted VPN permission.
-                // When false, the caller should next invoke "requestPermission".
-                "isPrepared" -> {
-                    result.success(VpnService.prepare(applicationContext) == null)
-                }
+                // No VPN permission is needed anymore — the router is headless
+                // (no TUN). Kept returning true so any older caller still works.
+                "isPrepared", "requestPermission" -> result.success(true)
                 // True when yggdrasil-mobile.aar is actually inside this APK.
                 // Lets the UI say "router binary missing" instead of a
                 // misleading generic "inactive".
                 "isRouterBundled" -> {
-                    result.success(YggdrasilVpnService.routerBundled())
+                    result.success(YggdrasilService.routerBundled())
                 }
                 // The identity the router provisioned on its first start
                 // (address + full config incl. PrivateKey), or null if it
                 // hasn't started yet. Dart persists it into its config file.
                 "getProvisioned" -> {
                     val prefs = getSharedPreferences(
-                        YggdrasilVpnService.PREFS_NAME, Context.MODE_PRIVATE)
-                    val addr = prefs.getString(YggdrasilVpnService.KEY_ADDRESS, null)
-                    val cfg  = prefs.getString(YggdrasilVpnService.KEY_CONFIG, null)
+                        YggdrasilService.PREFS_NAME, Context.MODE_PRIVATE)
+                    val addr = prefs.getString(YggdrasilService.KEY_ADDRESS, null)
+                    val cfg  = prefs.getString(YggdrasilService.KEY_CONFIG, null)
                     result.success(
                         if (addr == null || cfg == null) null
                         else mapOf("address" to addr, "config" to cfg))
-                }
-                "requestPermission" -> {
-                    val intent = VpnService.prepare(applicationContext)
-                    if (intent == null) {
-                        result.success(true)
-                    } else {
-                        pendingVpnPermissionResult = result
-                        startActivityForResult(intent, VPN_PERMISSION_REQ)
-                    }
                 }
                 "startService" -> {
                     try {
                         val args = call.arguments as Map<*, *>
                         val cfg  = args["configJson"] as String
                         val addr = args["address"] as String
-                        val intent = YggdrasilVpnService.startIntent(applicationContext, cfg, addr)
+                        val intent = YggdrasilService.startIntent(applicationContext, cfg, addr)
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                             startForegroundService(intent)
                         } else {
@@ -222,7 +209,7 @@ class MainActivity : FlutterActivity() {
                 }
                 "stopService" -> {
                     try {
-                        startService(YggdrasilVpnService.stopIntent(applicationContext))
+                        startService(YggdrasilService.stopIntent(applicationContext))
                         result.success(null)
                     } catch (e: Exception) {
                         result.error("YGG_STOP_FAILED", e.message, null)
@@ -231,6 +218,37 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+
+        // ── Yggdrasil packet I/O (userspace replacement for the TUN) ──────────
+        // Dart crafts/parses the IPv6 packets and moves them over these channels
+        // to the headless router's Send/Recv.
+        MethodChannel(
+            flutterEngine!!.dartExecutor.binaryMessenger,
+            "phantom/yggdrasil_io",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "send" -> {
+                    val pkt = call.arguments as? ByteArray
+                    if (pkt == null) {
+                        result.error("YGG_IO", "packet must be a byte array", null)
+                    } else {
+                        result.success(YggdrasilService.send(pkt))
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+        EventChannel(
+            flutterEngine!!.dartExecutor.binaryMessenger,
+            "phantom/yggdrasil_io/incoming",
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(args: Any?, sink: EventChannel.EventSink?) {
+                YggdrasilService.setSink(sink)
+            }
+            override fun onCancel(args: Any?) {
+                YggdrasilService.setSink(null)
+            }
+        })
 
         // ── Waku daemon channel ───────────────────────────────────────────────
         MethodChannel(
@@ -356,15 +374,6 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        if (requestCode == VPN_PERMISSION_REQ) {
-            pendingVpnPermissionResult?.success(resultCode == RESULT_OK)
-            pendingVpnPermissionResult = null
-            return
-        }
-        super.onActivityResult(requestCode, resultCode, data)
     }
 
     override fun onDestroy() {

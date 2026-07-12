@@ -48,14 +48,14 @@
 -keep class com.phantom.phantom_messenger.I2pdForegroundService { *; }
 -keep class com.phantom.phantom_messenger.I2pdForegroundService$Companion { *; }
 -keep class com.phantom.phantom_messenger.I2pdBootReceiver { *; }
--keep class com.phantom.phantom_messenger.YggdrasilVpnService { *; }
--keep class com.phantom.phantom_messenger.YggdrasilVpnService$Companion { *; }
+-keep class com.phantom.phantom_messenger.YggdrasilService { *; }
+-keep class com.phantom.phantom_messenger.YggdrasilService$Companion { *; }
 -keep class com.phantom.phantom_messenger.PhantomMessagingService { *; }
 -keep class com.phantom.phantom_messenger.PhantomMessagingService$Companion { *; }
 -keep class com.phantom.phantom_messenger.PhantomGattServer { *; }
 
 # Yggdrasil mobile bind — we load mobile.Yggdrasil reflectively from
-# YggdrasilVpnService when the .aar is present in the APK. R8 must not
+# YggdrasilService when the .aar is present in the APK. R8 must not
 # rename or strip it; missing entirely is fine (class load just fails).
 -keep class mobile.** { *; }
 -dontwarn mobile.**
