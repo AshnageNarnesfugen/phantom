@@ -60,9 +60,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       core.storage.getSetting<bool>('link_previews_enabled').then((v) {
         if (mounted && v != null) setState(() => _linkPreviews = v);
       });
-      core.storage.getHighPrivacyMode().then((v) {
-        if (mounted) setState(() => _highPrivacy = v);
-      });
       _loadGlass(core);
       _refreshStatus();
       _refreshTimer ??= Timer.periodic(const Duration(seconds: 2), (_) => _refreshStatus());
@@ -77,7 +74,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// Sender-generated link previews (Signal-style). OFF by default: generating
   /// one means the sender's device fetches the URL (IP visible to the site).
   bool _linkPreviews = false;
-  bool _highPrivacy = false;
 
   static const _mediaModeLabels = {
     'always': 'always',
@@ -376,30 +372,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             label: 'show seed phrase',
             tokens: t,
             onTap: () => _showSeedWarning(t),
-          ),
-          _SettingTile(
-            icon: Icons.shield_moon_outlined,
-            label: 'high privacy',
-            value: _highPrivacy ? 'on' : 'off',
-            tokens: t,
-            onTap: () {
-              final next = !_highPrivacy;
-              setState(() => _highPrivacy = next);
-              unawaited(core?.setHighPrivacyMode(next) ?? Future.value());
-              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                content: Text(
-                  next
-                      ? 'high privacy ON — the key exchange rides I2P ONLY, so '
-                        'session setup never reveals your IP to the fleet. '
-                        'Needs I2P up on both sides; the handshake retries until '
-                        'it lands. Messages still use the normal stack.'
-                      : 'high privacy off — the key exchange fans out over all '
-                        'transports (faster, but reveals your IP)',
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-                ),
-                duration: const Duration(seconds: 5),
-              ));
-            },
           ),
           // ── Media ────────────────────────────────────────────
           _SectionHeader('media', t),
