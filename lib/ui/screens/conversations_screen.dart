@@ -291,6 +291,14 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
               onPressed: () => setState(() => _showArchived = !_showArchived),
             ),
           IconButton(
+            icon: Icon(Icons.people_outline,
+                color: g ? Colors.white70 : t.iconDefault, size: 20),
+            tooltip: 'contacts',
+            onPressed: () => Navigator.push(context,
+                _AppRoute(builder: (_) => const ContactsScreen()))
+                .then((_) => _loadData(core)),
+          ),
+          IconButton(
             icon: Icon(Icons.settings_outlined,
                 color: g ? Colors.white70 : t.iconDefault, size: 20),
             onPressed: () => Navigator.push(context,

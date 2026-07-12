@@ -31,6 +31,7 @@ import '../widgets/widgets.dart';
 
 part 'onboarding_screen.dart';
 part 'conversations_screen.dart';
+part 'contacts_screen.dart';
 part 'chat_screen.dart';
 part 'add_contact_screen.dart';
 part 'settings_screen.dart';
