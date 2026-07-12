@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import '../core/transport_debugger.dart';
 import '../core/waku_daemon.dart';
 import '../core/ipfs_daemon.dart';
+import '../core/reliable_i2p.dart';
 import '../core/yggdrasil_daemon.dart';
 import 'yggdrasil/ygg_ip6.dart';
 import 'yggdrasil/ygg_packet_channel.dart';
@@ -344,10 +345,11 @@ class TransportManager {
             'frame over another transport');
       }
       dbg.log('TRANSPORT: [high-privacy] control frame via I2P ONLY → '
-          '${dest.substring(0, 12)}…');
-      await i2p
-          .publishToDest(dest: dest, data: encryptedEnvelope)
-          .timeout(const Duration(seconds: 12));
+          '${dest.substring(0, 12)}… (reliable)');
+      // Guaranteed delivery: retransmits until the peer ACKs (its own retry
+      // budget bounds this; no external timeout that could cut it short).
+      await i2p.publishToDestReliable(dest: dest, data: encryptedEnvelope);
+      dbg.log('TRANSPORT: [high-privacy] I2P delivery CONFIRMED');
       return; // never fan out
     }
 
@@ -1365,6 +1367,16 @@ class I2PTransport implements PhantomTransport {
 
   final _incoming = StreamController<IncomingEnvelope>.broadcast();
 
+  /// ACK+retransmit layer for guaranteed delivery over I2P's fire-and-forget
+  /// datagrams (used by [publishToDestReliable] / high-privacy mode). Sends via
+  /// the same plain datagram path; the receive loop routes inbound datagrams
+  /// through it so ACKs/dupes are handled and plain frames pass through.
+  late final ReliableI2p _reliable = ReliableI2p(
+    rawSend: (dest, frame) => publishToDest(dest: dest, data: frame),
+    retransmit: const Duration(seconds: 6),
+    maxRetries: 6,
+  );
+
   /// SAM session identifier. Regenerated on every connection attempt to
   /// avoid DUPLICATED_ID when a previous SESSION CREATE was accepted by
   /// SAM but its reply timed out on our side (cold-start i2pd can take
@@ -1554,12 +1566,30 @@ class I2PTransport implements PhantomTransport {
     final sourceDest = utf8.decode(data.sublist(0, nl), allowMalformed: true).trim();
     final payload = Uint8List.fromList(data.sublist(nl + 1));
     if (payload.isEmpty) return;
+    // Route through the reliability layer: reliable DATA frames get ACKed +
+    // deduped (returns the inner payload), ACKs/dupes return null, and plain
+    // datagrams pass straight through.
+    final delivered = _reliable.onDatagram(
+        sourceDest.isEmpty ? '?' : sourceDest, payload);
+    if (delivered == null || delivered.isEmpty) return;
     _incoming.add(IncomingEnvelope(
-      data: payload,
+      data: delivered,
       transportName: name,
       receivedAt: DateTime.now(),
       i2pSourceDestination: sourceDest.isEmpty ? null : sourceDest,
     ));
+  }
+
+  /// Like [publishToDest] but GUARANTEED: retransmits until the peer ACKs. The
+  /// returned future completes only on confirmed delivery (or throws after the
+  /// retry budget). Used by high-privacy mode, where the control frame rides
+  /// I2P alone and a silent datagram loss would strand the handshake.
+  Future<void> publishToDestReliable(
+      {required String dest, required Uint8List data}) async {
+    if (!await _ensureSession()) {
+      throw const TransportException('I2P session unavailable');
+    }
+    await _reliable.sendReliable(dest, data);
   }
 
   /// Sends [data] to a known peer destination via the SAM datagram port.
@@ -1643,6 +1673,7 @@ class I2PTransport implements PhantomTransport {
   @override
   Future<void> dispose() async {
     _disposed = true;
+    _reliable.dispose();
     await _teardown();
     try { _udp?.close(); } catch (_) {}
     _udp = null;
