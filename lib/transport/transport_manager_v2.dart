@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:connectivity_plus/connectivity_plus.dart';
-import 'transport.dart' show TransportPriority;
+import 'transport.dart' show TransportPriority, TransportException;
 import 'bluetooth/bluetooth_mesh_transport.dart';
 import 'bluetooth/mesh_protocol.dart';
 import 'bluetooth/message_store.dart';
@@ -157,6 +157,14 @@ class TransportManagerV2 {
         }
 
       case TransportMode.bluetoothMesh:
+        // Same fail-closed rule as the internet branch above: BLE mesh is not
+        // I2P. A secret frame handed to the mesh would be relayed by whatever
+        // phones are in range and could later flush over an internet path,
+        // which is exactly the de-anonymisation the mode exists to prevent.
+        if (secret) {
+          throw const TransportException(
+              'Secret chats need I2P — refusing to send over the BLE mesh');
+        }
         return _sendViaBluetooth(
           recipientId: recipientId,
           fullMessageId: fullMessageId,
@@ -164,6 +172,14 @@ class TransportManagerV2 {
         );
 
       case TransportMode.offline:
+        // Never park a secret frame in the store-and-forward queue: it would
+        // sit there and flush over Waku/IPFS the moment connectivity returns,
+        // leaking the IP the secret chat exists to hide. Secret chats deliver
+        // live or not at all.
+        if (secret) {
+          throw const TransportException(
+              'Secret chats deliver live only — no transport available');
+        }
         // No transport available — save to local store
         final ok = _store.enqueue(
           MeshPacket.message(

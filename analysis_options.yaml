@@ -6,6 +6,13 @@ include: package:flutter_lints/flutter.yaml
 analyzer:
   exclude:
     - local_packages/**
+    - build/**
+    - android/**
+    - ios/**
+    - web/**
+    - windows/**
+    - macos/**
+    - linux/**
   errors:
     todo: ignore
     deprecated_member_use: warning

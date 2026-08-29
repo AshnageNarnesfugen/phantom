@@ -15,6 +15,12 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
   List<ContactRecord>? _contacts;
   final Map<String, StoredMessage?> _lastMessages = {};
   List<GroupRecord> _groups = const [];
+  /// Contacts that have a LIVE secret conversation (a `sec_` history holding at
+  /// least one message). They get their own row. Without this an inbound secret
+  /// message was invisible: it creates the `sec_<sender>` conversation in
+  /// storage, but this list is built from the contact book, so the receiver had
+  /// no way to reach the chat that had just been created for them.
+  List<ContactRecord> _secrets = const [];
   final Map<String, Uint8List?> _avatars = {};
   StreamSubscription<StoredMessage>? _msgSub;
   StreamSubscription<String>? _presenceSub;
@@ -79,9 +85,17 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
     final groups   = await core.getGroups();
     final lastMsgs = <String, StoredMessage?>{};
     final avatars  = <String, Uint8List?>{};
+    final secrets  = <ContactRecord>[];
     for (final c in contacts) {
       lastMsgs[c.phantomId] = await core.getLastMessage(c.phantomId);
       avatars[c.phantomId]  = await core.getContactAvatar(c.phantomId);
+      // A secret chat exists the moment either side puts a message in it.
+      final secConv = secretConversationId(c.phantomId);
+      final secLast = await core.getLastMessage(secConv);
+      if (secLast != null) {
+        lastMsgs[secConv] = secLast;
+        secrets.add(c);
+      }
     }
     for (final g in groups) {
       final conv = groupConversationId(g.gid);
@@ -91,6 +105,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
       setState(() {
         _contacts = contacts;
         _groups   = groups;
+        _secrets  = secrets;
         _lastMessages.addAll(lastMsgs);
         _avatars.addAll(avatars);
       });
@@ -101,6 +116,11 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
     if (_contacts == null) return [];
     return _contacts!.where((c) => c.isArchived == _showArchived).toList();
   }
+
+  /// Secret rows follow their contact into/out of the archive.
+  List<ContactRecord> get _visibleSecrets => _showArchived
+      ? const []
+      : _secrets.where((c) => !c.isArchived).toList();
 
   bool get _hasArchived => _contacts?.any((c) => c.isArchived) ?? false;
 
@@ -126,7 +146,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
                 contactName: c.displayName,
                 contactId:   secretConversationId(c.phantomId),
                 isSecret:    true,
-              )));
+              ))).then((_) => _loadData(core));
             }),
           _MenuItem(icon: Icons.archive_outlined, label: c.isArchived ? 'unarchive' : 'archive', tokens: t,
             onTap: () async {
@@ -144,6 +164,40 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
             onTap: () async {
               Navigator.pop(ctx);
               await core.deleteContact(c.phantomId);
+              _loadData(core);
+            }),
+          const SizedBox(height: 16),
+        ],
+      ),
+    );
+  }
+
+  /// Long-press on a secret row. Deliberately minimal: a secret chat has no
+  /// archive and no contact actions (those live on the normal row) — the only
+  /// thing you do to it is destroy it.
+  void _showSecretMenu(BuildContext ctx, PhantomTokens t, PhantomCore core, ContactRecord c) {
+    final conv = secretConversationId(c.phantomId);
+    showModalBottomSheet(
+      context: ctx,
+      backgroundColor: t.bgSurface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(t.radiusCard))),
+      builder: (_) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 8),
+          Container(width: 36, height: 3, decoration: BoxDecoration(color: t.divider, borderRadius: BorderRadius.circular(2))),
+          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Text('🔒 ${c.displayName}',
+                style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 13)),
+          ),
+          _MenuItem(icon: Icons.delete_sweep_outlined, label: 'delete secret chat', tokens: t, danger: true,
+            onTap: () async {
+              Navigator.pop(ctx);
+              // clearMessages, NOT deleteConversation — the ratchet session is
+              // keyed by the contact id and is shared with the normal chat.
+              await core.storage.clearMessages(conv);
               _loadData(core);
             }),
           const SizedBox(height: 16),
@@ -173,6 +227,7 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
     }
 
     final visible = _visible;
+    final secrets = _visibleSecrets;
 
     final g      = _glassEnabled;
     final bgPath = g && _useWallpaper ? _appWallpaperPath : null;
@@ -188,13 +243,15 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
         Expanded(
           child: _contacts == null
               ? Center(child: CircularProgressIndicator(color: t.accentLight, strokeWidth: 1))
-              : (visible.isEmpty && (_showArchived || _groups.isEmpty))
+              : (visible.isEmpty &&
+                      (_showArchived || (_groups.isEmpty && secrets.isEmpty)))
                   ? _EmptyContacts(tokens: t, archived: _showArchived)
                   : ListView.builder(
                       itemCount: visible.length +
-                          (_showArchived ? 0 : _groups.length),
+                          (_showArchived ? 0 : _groups.length) +
+                          secrets.length,
                       itemBuilder: (context, i) {
-                        // Groups first, then contacts.
+                        // Groups first, then secret chats, then contacts.
                         if (!_showArchived && i < _groups.length) {
                           final grp  = _groups[i];
                           final conv = groupConversationId(grp.gid);
@@ -224,8 +281,37 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
                               .then((_) => _loadData(core)),
                           );
                         }
-                        final c = visible[
-                            i - (_showArchived ? 0 : _groups.length)];
+                        final rest = i - (_showArchived ? 0 : _groups.length);
+                        if (rest < secrets.length) {
+                          final sc   = secrets[rest];
+                          final conv = secretConversationId(sc.phantomId);
+                          final last = _lastMessages[conv];
+                          return ConversationTile(
+                            displayName: sc.displayName,
+                            phantomId:   conv,
+                            isSecret:    true,
+                            lastMessage: switch (last?.type) {
+                              MessageType.text => last?.textContent,
+                              null => 'secret · I2P-only · live',
+                              _ => '[${last!.type.name}]',
+                            },
+                            timeLabel: last != null
+                                ? _formatTime(last.timestamp)
+                                : null,
+                            unreadCount: 0,
+                            isOnline:    core.isContactOnline(sc.phantomId),
+                            avatarBytes: _avatars[sc.phantomId],
+                            onTap: () => Navigator.push(context,
+                              _AppRoute(builder: (_) => ChatScreen(
+                                contactName: sc.displayName,
+                                contactId:   conv,
+                                isSecret:    true)))
+                              .then((_) => _loadData(core)),
+                            onLongPress: () =>
+                                _showSecretMenu(context, t, core, sc),
+                          );
+                        }
+                        final c = visible[rest - secrets.length];
                         final last = _lastMessages[c.phantomId];
                         return ConversationTile(
                           displayName: c.displayName,

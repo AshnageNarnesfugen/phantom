@@ -2616,7 +2616,11 @@ class PhantomCore {
       await storage.updateMessageStatus(convId, stored.id, MessageStatus.failed);
       notifyContactChanged(convId);
       TransportDebugger.instance.log('SECRET: send failed (not leaking): $e');
-      return stored.copyWith(status: MessageStatus.failed);
+      // Surface it. Swallowing this left the sender staring at a chat that
+      // looked fine while nothing had left the device — a fail-closed send
+      // that fails silently is indistinguishable from a delivered one.
+      throw PhantomCoreException(
+          e is TransportException ? e.message : 'secret send failed: $e');
     }
   }
 

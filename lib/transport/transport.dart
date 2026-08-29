@@ -344,15 +344,33 @@ class TransportManager {
       final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
       final dest = _i2pDests[recipientId];
       if (i2p == null || !i2p.isAvailable || dest == null) {
-        throw const TransportException(
-            'I2P-only path not ready — refusing to leak the frame over '
+        // Name the missing piece. This used to throw silently, so a secret
+        // send that never left the device looked identical in the log to one
+        // that did — the field test could only report "nothing happened".
+        final why = i2p == null
+            ? 'no I2P transport active'
+            : !i2p.isAvailable
+                ? 'I2P session not ready'
+                : 'no I2P destination known for this contact';
+        dbg.log('TRANSPORT: [I2P-only] REFUSED ($why) — not leaking over '
+            'another transport');
+        throw TransportException(
+            'I2P-only path not ready ($why) — refusing to leak the frame over '
             'another transport');
       }
       dbg.log('TRANSPORT: [I2P-only] frame via I2P → '
           '${dest.substring(0, 12)}… (reliable)');
       // Guaranteed delivery: retransmits until the peer ACKs (its own retry
       // budget bounds this; no external timeout that could cut it short).
-      await i2p.publishToDestReliable(dest: dest, data: encryptedEnvelope);
+      try {
+        await i2p.publishToDestReliable(dest: dest, data: encryptedEnvelope);
+      } catch (e) {
+        // The ARQ gave up (no ACK inside its retry budget) — the peer's I2P
+        // side never acknowledged the frame. Say so: it's the difference
+        // between "we never sent" and "we sent, nobody answered".
+        dbg.log('TRANSPORT: [I2P-only] UNCONFIRMED — no ACK from the peer ($e)');
+        rethrow;
+      }
       dbg.log('TRANSPORT: [I2P-only] delivery CONFIRMED');
       return; // never fan out
     }

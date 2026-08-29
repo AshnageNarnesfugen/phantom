@@ -1786,6 +1786,9 @@ class ConversationTile extends StatelessWidget {
   final Uint8List? avatarBytes;
   /// Group conversations render a group glyph instead of the letter avatar.
   final bool isGroup;
+  /// Secret conversations (`sec_<id>`) render a lock next to the name so the
+  /// row is distinguishable from the normal chat with the same contact.
+  final bool isSecret;
 
   const ConversationTile({
     super.key,
@@ -1799,6 +1802,7 @@ class ConversationTile extends StatelessWidget {
     this.onLongPress,
     this.avatarBytes,
     this.isGroup = false,
+    this.isSecret = false,
   });
 
   @override
@@ -1835,6 +1839,10 @@ class ConversationTile extends StatelessWidget {
                 children: [
                   Row(
                     children: [
+                      if (isSecret) ...[
+                        Icon(Icons.lock, size: 13, color: t.accentLight),
+                        const SizedBox(width: 5),
+                      ],
                       Expanded(
                         child: Text(
                           displayName,
