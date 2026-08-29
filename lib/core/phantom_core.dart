@@ -429,9 +429,35 @@ class PhantomCore {
     final contacts = await storage.getAllContacts();
     for (final c in contacts) {
       if (c.yggdrasilAddress != null) transport.setContactYggAddress(c.phantomId, c.yggdrasilAddress!);
-      if (c.i2pDestination != null) transport.setContactI2PDestination(c.phantomId, c.i2pDestination!);
+      if (c.i2pDestination != null) {
+        // Self-heal: installs that learned a dest from a SAM 3.2+ datagram
+        // header stored it with " FROM_PORT=n TO_PORT=n" appended. Repair it
+        // here instead of making the user re-scan the QR — the base64 dest is
+        // the first token, and the rest was never part of the address.
+        final repaired = await _repairI2pDest(c);
+        if (repaired != null) transport.setContactI2PDestination(c.phantomId, repaired);
+      }
       if (c.ipfsPeerId != null) transport.setContactIpfsPeerId(c.phantomId, c.ipfsPeerId!);
     }
+  }
+
+  /// Returns a usable I2P destination for [c], rewriting the stored record if
+  /// it needed repair, or null if nothing salvageable is on file.
+  Future<String?> _repairI2pDest(ContactRecord c) async {
+    final stored = c.i2pDestination!;
+    if (looksLikeI2pDestination(stored)) return stored;
+    final head = stored.trim().split(' ').first;
+    if (!looksLikeI2pDestination(head)) {
+      TransportDebugger.instance.log(
+          'I2P: ✗ stored dest for ${c.phantomId.substring(0, 8)} is unusable '
+          '(${stored.length} chars) — replies will not ride I2P');
+      return null;
+    }
+    await storage.saveContact(c.copyWith(i2pDestination: head));
+    TransportDebugger.instance.log(
+        'I2P: repaired stored dest for ${c.phantomId.substring(0, 8)} '
+        '(stripped ${stored.length - head.length} trailing chars)');
+    return head;
   }
 
   static TransportManager _buildTransport(TransportConfig? config,
@@ -2566,9 +2592,9 @@ class PhantomCore {
 
   /// Sends a text into the secret conversation with [contactId]: wrapped in a
   /// secretEnvelope and routed I2P-ONLY-reliable (never touches Waku/IPFS), so
-  /// the peer never sees your IP. Requires the peer to be online (secret chats
-  /// have no store-and-forward); throws if not, and the send fails closed if
-  /// I2P can't carry it (never falls back to a de-anonymising path).
+  /// the peer never sees your IP. Delivery is live-only — enforced by the I2P
+  /// reliable layer's ACK, not by a presence guess — and fails closed if I2P
+  /// can't carry it (never falls back to a de-anonymising path).
   Future<StoredMessage> sendSecretText(String contactId, String text) {
     return sendSecretMessage(
       contactId,
@@ -2579,9 +2605,18 @@ class PhantomCore {
 
   Future<StoredMessage> sendSecretMessage(
       String contactId, MessageType innerType, Uint8List content) async {
+    // Presence is a HINT here, not a gate. It rides IPFS pubsub heartbeats
+    // plus a 90s implicit window from the last decrypted live frame — and in
+    // the field the IPFS side is routinely dead (gossipsub peers = 0), so the
+    // contact reads "offline" while I2P is carrying their messages fine.
+    // Refusing to send on that signal blocked real sends. The I2P path has
+    // something strictly better: the reliable layer's end-to-end ACK. Let the
+    // ACK decide — no ACK means no delivery, the message fails, and nothing
+    // was queued or fanned out in the meantime. The live-only guarantee is
+    // unchanged; it just stops being enforced by a broken oracle.
     if (!isContactOnline(contactId)) {
-      throw const PhantomCoreException(
-          'Secret chats deliver live only — the contact is offline.');
+      TransportDebugger.instance.log(
+          'SECRET: presence says offline — sending anyway, the I2P ACK decides');
     }
     final convId = secretConversationId(contactId);
     final envelope = PhantomMessage(
@@ -3024,6 +3059,15 @@ class PhantomCore {
   /// gossipsub mesh failures.
   Future<void> _learnI2pDestFromIncoming(String contactId, String i2pDest) async {
     if (i2pDest.isEmpty) return;
+    // Never overwrite a good destination with a malformed one. This value is
+    // persisted and every future reply is addressed to it, so a bad write is a
+    // silent, permanent one-way break in the conversation.
+    if (!looksLikeI2pDestination(i2pDest)) {
+      TransportDebugger.instance.log(
+          'I2P: ✗ refusing to learn malformed dest for '
+          '${contactId.substring(0, 8)} (${i2pDest.length} chars)');
+      return;
+    }
     final contact = await storage.getContact(contactId);
     if (contact == null) return;
     if (contact.i2pDestination == i2pDest) return;

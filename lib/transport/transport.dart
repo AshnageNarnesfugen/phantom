@@ -63,6 +63,16 @@ enum TransportPriority {
   broadcast,
 }
 
+/// True if [s] looks like an I2P destination: base64 in I2P's alphabet, at
+/// least the 516 characters of a bare (certificate-less) destination.
+///
+/// Exists because a destination reaches us from three places — a scanned QR,
+/// a peer's connectivityInfo, and the source line of an inbound SAM datagram —
+/// and only the first two are structured. A bad one is silently fatal: SAM
+/// drops the send, the datagram never leaves, and the UI reports "sent".
+bool looksLikeI2pDestination(String s) =>
+    s.length >= 516 && RegExp(r'^[A-Za-z0-9~-]+={0,2}$').hasMatch(s);
+
 @immutable
 class IncomingEnvelope {
   final Uint8List data;
@@ -1581,11 +1591,21 @@ class I2PTransport implements PhantomTransport {
     if (event != RawSocketEvent.read) return;
     final dg = _udp!.receive();
     if (dg == null) return;
-    // SAM v3 forwarded datagram format: "<source_destination>\n<payload>".
+    // SAM v3 forwarded datagram header. TWO shapes, depending on the version
+    // negotiated at HELLO:
+    //   3.0 / 3.1 → "<dest>\n<payload>"
+    //   3.2+      → "<dest> FROM_PORT=n TO_PORT=n\n<payload>"
+    // We negotiate 3.3, so it is always the second shape. Taking the whole
+    // line as the destination glued " FROM_PORT=0 TO_PORT=0" onto every dest
+    // learned from an incoming frame — which then went into the contact record
+    // as their I2P destination AND straight back out in our SAM send header.
+    // Keep the first whitespace-delimited token: correct under both shapes.
     final data = dg.data;
     final nl = data.indexOf(10);
     if (nl < 0 || nl >= data.length - 1) return;
-    final sourceDest = utf8.decode(data.sublist(0, nl), allowMalformed: true).trim();
+    final headerLine =
+        utf8.decode(data.sublist(0, nl), allowMalformed: true).trim();
+    final sourceDest = headerLine.isEmpty ? '' : headerLine.split(' ').first;
     final payload = Uint8List.fromList(data.sublist(nl + 1));
     if (payload.isEmpty) return;
     // Route through the reliability layer: reliable DATA frames get ACKed +
@@ -1594,11 +1614,20 @@ class I2PTransport implements PhantomTransport {
     final delivered = _reliable.onDatagram(
         sourceDest.isEmpty ? '?' : sourceDest, payload);
     if (delivered == null || delivered.isEmpty) return;
+    // Only offer the source dest upward if it actually looks like one — the
+    // upper layer PERSISTS it as the contact's destination and replies to it
+    // forever after, so a malformed header must not poison the address book.
+    final learnable = looksLikeI2pDestination(sourceDest);
+    if (!learnable && sourceDest.isNotEmpty) {
+      TransportDebugger.instance.log(
+          'I2P: ignoring unparseable source dest in datagram header '
+          '(${sourceDest.length} chars)');
+    }
     _incoming.add(IncomingEnvelope(
       data: delivered,
       transportName: name,
       receivedAt: DateTime.now(),
-      i2pSourceDestination: sourceDest.isEmpty ? null : sourceDest,
+      i2pSourceDestination: learnable ? sourceDest : null,
     ));
   }
 

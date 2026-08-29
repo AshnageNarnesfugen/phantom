@@ -672,9 +672,12 @@ class _ChatScreenState extends State<ChatScreen> {
         ? _HandshakeWaitingBanner(tokens: t, retryAttempt: retryAttempt)
         : null;
 
-    // Secret chats deliver live only (no store-and-forward), so sending is
-    // disabled until BOTH sides are online. Recomputes on every presence change.
-    final secretLocked =
+    // Secret chats deliver live only — but that is enforced by the I2P ACK,
+    // not by this flag. Presence rides IPFS heartbeats that are routinely dead
+    // in the field, so gating the composer on it locked people out of chats
+    // that were working. It is a warning strip above the input now; the send
+    // still runs and still fails closed if the peer really isn't there.
+    final secretPeerOffline =
         widget.isSecret && (core?.isContactOnline(_peerId) != true);
 
     final scaffold = Scaffold(
@@ -684,29 +687,28 @@ class _ChatScreenState extends State<ChatScreen> {
         children: [
           Expanded(child: messageList),
           if (handshakeBanner != null) handshakeBanner,
-          if (secretLocked)
+          if (secretPeerOffline)
             Container(
-              padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
               color: t.bgSurface,
               child: Row(
                 children: [
-                  Icon(Icons.lock_clock_outlined, color: t.textSecondary, size: 18),
+                  Icon(Icons.lock_clock_outlined, color: t.textSecondary, size: 16),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
-                      'waiting for ${_displayName ?? widget.contactName} to come '
-                      'online — a secret chat delivers live only',
+                      "${_displayName ?? widget.contactName} looks offline — a "
+                      'secret chat delivers live, so the send may not land',
                       style: TextStyle(
                           color: t.textSecondary,
                           fontFamily: 'monospace',
-                          fontSize: 12),
+                          fontSize: 11),
                     ),
                   ),
                 ],
               ),
-            )
-          else
-            inputBar,
+            ),
+          inputBar,
         ],
       ),
     );
