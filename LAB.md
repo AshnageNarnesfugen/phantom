@@ -1,8 +1,9 @@
 # Phantom Lab — depurar handshake y mensajería sin instalar APKs
 
-Dos laboratorios reproducen en el escritorio lo que antes requería dos
-teléfonos con APKs recién flasheados. Ambos ejercitan **el mismo código que
-corre en producción** (PhantomCore / WakuTransport), no reimplementaciones.
+Cuatro laboratorios reproducen en el escritorio lo que antes requería dos
+teléfonos con APKs recién flasheados. Todos ejercitan **el mismo código que
+corre en producción** (PhantomCore / WakuTransport / I2PTransport / MeshRouter),
+no reimplementaciones.
 
 ## 1. Lab de protocolo (loopback) — `test/e2e/handshake_loopback_test.dart`
 
@@ -152,11 +153,56 @@ imposibles**. Se añadió `MeshFragment`/`MeshReassembler` (magic 'PF' vs 'PH' d
 MeshPacket, reensamblaje por groupId con caducidad) y se cableó en el
 transporte (split según MTU negociado al enviar, offer() al recibir).
 
+## 4. Lab de I2P (dos dispositivos sobre SAM) — `test/lab/i2p_lab_test.dart`
+
+Dos `PhantomCore` con el `I2PTransport` **de producción** hablando entre sí a
+través de un `FakeSamBridge` (`test/support/fake_sam_bridge.dart`) en vez de
+i2pd: mismo handshake SAM, mismo reenvío de datagramas por UDP, misma capa de
+ACK/retransmisión, mismo aprendizaje de destinos. Lo único ausente es la red
+I2P, que nunca fue donde estaban los bugs. ~45 s, sin descargas.
+
+```bash
+flutter test test/lab/i2p_lab_test.dart
+```
+
+Cubre: handshake X3DH sobre I2P, mensajería en ambos sentidos (incluida la
+dirección que se rompe en campo — la del lado que nunca escaneó un QR), que
+los destinos aprendidos del header del datagrama queden limpios, el chat
+secreto extremo a extremo (I2P-only, historial `sec_` propio) y el ARQ
+aguantando 40% de pérdida de datagramas.
+
+El bridge es fiel en las tres formas que han mordido:
+
+- **El header del datagrama depende de la versión.** Hasta SAM 3.1 un
+  datagrama reenviado es `<dest>\n<payload>`; desde 3.2 es
+  `<dest> FROM_PORT=n TO_PORT=n\n<payload>`. Negociamos 3.3, así que la
+  segunda forma es la que ve un teléfono de verdad.
+- **Silencio ante un destino inválido.** SAM no reporta un envío irruteable:
+  descarta el datagrama y la escritura UDP del cliente igual tiene éxito, así
+  que un destino roto se ve idéntico a uno bueno desde la app. El bridge lleva
+  `droppedSends` — la visibilidad que el bridge real te niega.
+- **Pérdida.** `lossRate` hace concreto que los datagramas I2P son
+  fire-and-forget, para poder probar el ARQ en vez de suponerlo.
+
+`strictSendHeader` (activo en el lab) hace que el bridge NO parsee opciones en
+el header de envío: el destino debe ser un destino pelado o el datagrama se
+cae. Es la lectura conservadora y la que obliga al transporte a mandar una
+dirección limpia.
+
+Dividendo inmediato: con el parseo viejo (línea entera del header como
+destino) el lab falla en rojo mostrando
+`<dest> FROM_PORT=0 TO_PORT=0` guardado como dirección del contacto — pisando
+la que venía limpia del QR. Ese era el bug de "los mensajes no se sincronizan"
+en una sola dirección. Y el chat secreto **seguía pasando**, solo que tardando
+37 s en vez de 1 s porque el ARQ tapaba el agujero retransmitiendo: por eso el
+lab también asierta que ningún datagrama fue descartado.
+
 ## Flujo recomendado antes de tocar un teléfono
 
 ```bash
 flutter test                                    # suite completa (labs incluidos)
 flutter test test/e2e/handshake_loopback_test.dart   # ¿bug de protocolo?
+flutter test test/lab/i2p_lab_test.dart              # ¿bug de I2P/SAM/ACK?
 flutter test test/lab/waku_live_test.dart            # ¿bug de red/fleet?
 ```
 
