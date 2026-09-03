@@ -1057,3 +1057,165 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
     );
   }
 }
+
+// ── Secret chat entry ─────────────────────────────────────────────────────────
+
+/// Opens the secret chat with [contactId] — but only if it can actually work.
+///
+/// A secret chat is live-only and I2P-only: with the peer unreachable there is
+/// no store-and-forward to fall back on, so letting someone into the room just
+/// to watch their message fail is worse than not opening the door. This probes
+/// the real I2P round trip first (a few seconds behind a spinner) and, when it
+/// fails, says which part is missing instead of "offline".
+Future<void> openSecretChat(
+  BuildContext context, {
+  required PhantomCore core,
+  required String contactId,
+  required String contactName,
+}) async {
+  final t = PhantomTheme.tokensOf(context);
+  final messenger = ScaffoldMessenger.of(context);
+  final navigator = Navigator.of(context);
+
+  // Probe behind a blocking dialog: the answer is a round trip through I2P
+  // tunnels, which is seconds, not milliseconds.
+  showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => _SecretProbeDialog(tokens: t, contactName: contactName),
+  );
+  final status = await core.probeSecretChannel(contactId);
+  if (!context.mounted) return;
+  navigator.pop(); // the probe dialog
+
+  if (!status.isReady) {
+    messenger.showSnackBar(SnackBar(
+      duration: const Duration(seconds: 5),
+      content: Text(
+        'no secret chat with $contactName — ${status.reason}',
+        style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+      ),
+    ));
+    return;
+  }
+
+  navigator.push(_AppRoute(
+    builder: (_) => ChatScreen(
+      contactName: contactName,
+      contactId: secretConversationId(contactId),
+      isSecret: true,
+    ),
+  ));
+}
+
+class _SecretProbeDialog extends StatelessWidget {
+  final PhantomTokens tokens;
+  final String contactName;
+  const _SecretProbeDialog({required this.tokens, required this.contactName});
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: tokens.bgSurface,
+      content: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(
+                strokeWidth: 1.5, color: tokens.accentLight),
+          ),
+          const SizedBox(width: 14),
+          Flexible(
+            child: Text(
+              'reaching $contactName over I2P…',
+              style: TextStyle(
+                  color: tokens.textSecondary,
+                  fontFamily: 'monospace',
+                  fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Replaces the composer in a secret chat that cannot deliver right now, and
+/// says which part is missing. "Offline" would be a guess; these are answers.
+class _SecretPathBar extends StatelessWidget {
+  final PhantomTokens tokens;
+  /// null while the first probe is still in flight.
+  final SecretPathStatus? status;
+  final String peerName;
+  final bool probing;
+  final Future<void> Function() onRetry;
+
+  const _SecretPathBar({
+    required this.tokens,
+    required this.status,
+    required this.peerName,
+    required this.probing,
+    required this.onRetry,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final checking = status == null || probing;
+    final text = checking
+        ? 'checking the I2P path to $peerName…'
+        : switch (status!) {
+            SecretPathStatus.ready => 'ready',
+            SecretPathStatus.i2pNotReady =>
+              'your I2P session is still coming up — a secret chat needs it',
+            SecretPathStatus.noDestination =>
+              'no I2P address for $peerName yet — message them normally once '
+                  'so their address arrives',
+            SecretPathStatus.peerUnreachable =>
+              '$peerName is not answering over I2P — a secret chat delivers '
+                  'live, with nothing stored on the way',
+          };
+
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+      color: tokens.bgSurface,
+      child: Row(
+        children: [
+          if (checking)
+            SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(
+                  strokeWidth: 1.5, color: tokens.textSecondary),
+            )
+          else
+            Icon(Icons.lock_clock_outlined,
+                color: tokens.textSecondary, size: 16),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              text,
+              style: TextStyle(
+                  color: tokens.textSecondary,
+                  fontFamily: 'monospace',
+                  fontSize: 11,
+                  height: 1.4),
+            ),
+          ),
+          if (!checking) ...[
+            const SizedBox(width: 8),
+            GestureDetector(
+              onTap: onRetry,
+              child: Padding(
+                padding: const EdgeInsets.all(4),
+                child: Icon(Icons.refresh,
+                    size: 17, color: tokens.accentLight),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}

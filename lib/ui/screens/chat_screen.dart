@@ -32,6 +32,15 @@ class _ChatScreenState extends State<ChatScreen> {
       widget.isSecret ? secretContactId(widget.contactId) : widget.contactId;
 
   final _scrollCtrl = ScrollController();
+
+  /// Secret chats only. Whether the I2P round trip to the peer works right
+  /// now — null while the first probe is in flight. Gates the composer: a
+  /// live-only chat with nobody on the other end has nothing to send into,
+  /// and presence is not a trustworthy answer to that question.
+  SecretPathStatus? _secretPath;
+  Timer? _secretProbeTimer;
+  bool _secretProbing = false;
+
   List<StoredMessage>? _messages;
   StreamSubscription<StoredMessage>? _sub;
   StreamSubscription<String>? _presenceSub;
@@ -145,11 +154,25 @@ class _ChatScreenState extends State<ChatScreen> {
       _sub = core.incomingMessages.listen((msg) {
         if (msg.conversationId == widget.contactId) _loadMessages(core);
       });
+      if (widget.isSecret) {
+        // Probe now, then keep it fresh while the screen is up so the composer
+        // unlocks by itself the moment the peer's tunnels come back. One empty
+        // datagram every 30s, foreground only — the screen is disposed when
+        // you leave, which stops it.
+        unawaited(_probeSecretPath());
+        _secretProbeTimer = Timer.periodic(
+            const Duration(seconds: 30), (_) => unawaited(_probeSecretPath()));
+      }
       if (!widget.isGroup) {
         // Presence fires for the real phantomId (_peerId), which differs from
         // the conversation key in a secret chat (sec_<phantomId>).
         _presenceSub = core.presenceChanges.listen((id) {
-          if (id == _peerId && mounted) setState(() {});
+          if (id == _peerId && mounted) {
+            setState(() {});
+            // Presence is a poor gate but a fine hint: when it says they just
+            // showed up, that is a good moment to ask I2P for the real answer.
+            if (widget.isSecret) unawaited(_probeSecretPath());
+          }
         });
         // Re-render when the handshake-ack state flips so the "waiting for
         // first response" banner appears / disappears in real time.
@@ -387,6 +410,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
           ));
         }
+        // The send is the strongest probe there is, and it just said no.
+        unawaited(_probeSecretPath());
       }
     } else if (widget.isGroup) {
       await core.sendGroupMessage(
@@ -401,6 +426,22 @@ class _ChatScreenState extends State<ChatScreen> {
     // Reload from storage so messages are always shown in timestamp order,
     // even when multiple sends complete out of order (e.g. large file + text).
     if (mounted) _loadMessages(core, jumpToBottom: true);
+  }
+
+  /// Asks I2P whether this secret chat can deliver right now. Cheap (one
+  /// empty datagram, ACKed by the peer's transport and never surfaced to
+  /// them) and authoritative, unlike presence.
+  Future<void> _probeSecretPath() async {
+    if (!widget.isSecret || _secretProbing) return;
+    final core = _core;
+    if (core == null) return;
+    _secretProbing = true;
+    try {
+      final status = await core.probeSecretChannel(_peerId);
+      if (mounted) setState(() => _secretPath = status);
+    } finally {
+      _secretProbing = false;
+    }
   }
 
   Future<void> _sendFile(Uint8List bytes, String fileName) async {
@@ -530,6 +571,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void dispose() {
     _core?.setActiveChat(null);
+    _secretProbeTimer?.cancel();
     _sub?.cancel();
     _presenceSub?.cancel();
     _handshakeSub?.cancel();
@@ -672,13 +714,12 @@ class _ChatScreenState extends State<ChatScreen> {
         ? _HandshakeWaitingBanner(tokens: t, retryAttempt: retryAttempt)
         : null;
 
-    // Secret chats deliver live only — but that is enforced by the I2P ACK,
-    // not by this flag. Presence rides IPFS heartbeats that are routinely dead
-    // in the field, so gating the composer on it locked people out of chats
-    // that were working. It is a warning strip above the input now; the send
-    // still runs and still fails closed if the peer really isn't there.
-    final secretPeerOffline =
-        widget.isSecret && (core?.isContactOnline(_peerId) != true);
+    // Secret chats deliver live only, so the composer is gated — but on an
+    // actual I2P round trip to the peer, not on presence. Presence rides IPFS
+    // heartbeats that are routinely dead in the field and would lock people
+    // out of chats that were working; the probe answers about the exact path
+    // the message will take. Null means the first probe is still in flight.
+    final secretBlocked = widget.isSecret && _secretPath?.isReady != true;
 
     final scaffold = Scaffold(
       backgroundColor: g ? Colors.transparent : t.bgBase,
@@ -687,28 +728,16 @@ class _ChatScreenState extends State<ChatScreen> {
         children: [
           Expanded(child: messageList),
           if (handshakeBanner != null) handshakeBanner,
-          if (secretPeerOffline)
-            Container(
-              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
-              color: t.bgSurface,
-              child: Row(
-                children: [
-                  Icon(Icons.lock_clock_outlined, color: t.textSecondary, size: 16),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      "${_displayName ?? widget.contactName} looks offline — a "
-                      'secret chat delivers live, so the send may not land',
-                      style: TextStyle(
-                          color: t.textSecondary,
-                          fontFamily: 'monospace',
-                          fontSize: 11),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          inputBar,
+          if (secretBlocked)
+            _SecretPathBar(
+              tokens: t,
+              status: _secretPath,
+              peerName: _displayName ?? widget.contactName,
+              probing: _secretProbing,
+              onRetry: _probeSecretPath,
+            )
+          else
+            inputBar,
         ],
       ),
     );
@@ -1094,15 +1123,14 @@ class _ChatScreenState extends State<ChatScreen> {
               const SizedBox(height: 16),
               if (!widget.isSecret)
                 _MenuItem(icon: Icons.lock_outline, label: 'start secret chat', tokens: t,
-                  onTap: () {
+                  onTap: () async {
                     Navigator.pop(context);
-                    Navigator.push(context, _AppRoute(
-                      builder: (_) => ChatScreen(
-                        contactName: _displayName ?? widget.contactName,
-                        contactId:   secretConversationId(_peerId),
-                        isSecret:    true,
-                      ),
-                    ));
+                    final core = CoreProvider.of(context).core;
+                    if (core == null || !mounted) return;
+                    await openSecretChat(context,
+                        core: core,
+                        contactId: _peerId,
+                        contactName: _displayName ?? widget.contactName);
                   }),
               _MenuItem(icon: Icons.fingerprint, label: 'verify safety number', tokens: t,
                 onTap: () {

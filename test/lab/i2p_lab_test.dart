@@ -206,6 +206,74 @@ void main() {
         reason: 'the run is only meaningful if loss actually happened');
   });
 
+  group('secret-path probe — the gate on the secret chat', () {
+    test('says ready when the peer is actually there', () async {
+      await introduce();
+      expect(await bob.probeSecretChannel(await _idOf(alice)),
+          SecretPathStatus.ready);
+    });
+
+    test('is invisible to the peer — no message, no bubble, no event',
+        () async {
+      await introduce();
+      final aliceId = await _idOf(alice);
+      final bobId = await _idOf(bob);
+
+      // Let the handshake tail (ack, preKeyShare, connectivityInfo) finish, or
+      // we would be measuring that traffic instead of the probe.
+      await Future.delayed(const Duration(seconds: 2));
+      final normalBefore = (await alice.storage.getMessages(bobId)).length;
+
+      var sawSomething = false;
+      final sub = alice.incomingMessages.listen((_) => sawSomething = true);
+
+      expect(await bob.probeSecretChannel(aliceId), SecretPathStatus.ready);
+      await Future.delayed(const Duration(milliseconds: 500));
+      await sub.cancel();
+
+      expect(sawSomething, isFalse,
+          reason: 'an empty reliable datagram is ACKed by the transport and '
+              'dropped before anything reaches the app');
+      expect(await alice.storage.getMessages(secretConversationId(bobId)),
+          isEmpty,
+          reason: 'probing must not create the secret conversation');
+      expect((await alice.storage.getMessages(bobId)).length, normalBefore,
+          reason: 'nor add anything to the ordinary one');
+    });
+
+    test('says peerUnreachable when nothing gets through', () async {
+      await introduce();
+      // The peer is up but the path is not: every datagram dies in transit,
+      // which is what an I2P chat looks like when tunnels are gone.
+      bridge.lossRate = 1.0;
+      expect(
+        await bob.probeSecretChannel(await _idOf(alice),
+            timeout: const Duration(seconds: 2)),
+        SecretPathStatus.peerUnreachable,
+      );
+    });
+
+    test('recovers on its own once the path is back', () async {
+      await introduce();
+      final aliceId = await _idOf(alice);
+      bridge.lossRate = 1.0;
+      expect(
+          await bob.probeSecretChannel(aliceId,
+              timeout: const Duration(seconds: 2)),
+          SecretPathStatus.peerUnreachable);
+      // This is what the 30s re-probe behind the locked composer is for.
+      bridge.lossRate = 0.0;
+      expect(await bob.probeSecretChannel(aliceId), SecretPathStatus.ready);
+    });
+
+    test('says noDestination for a contact we have no I2P address for',
+        () async {
+      await introduce();
+      expect(await bob.probeSecretChannel('3zzzNoSuchContactId'),
+          SecretPathStatus.noDestination);
+    });
+  });
+
   test('a datagram to an unknown destination vanishes without a word',
       () async {
     await introduce();

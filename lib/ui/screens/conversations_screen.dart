@@ -140,13 +140,13 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
             child: Text(c.displayName, style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 13)),
           ),
           _MenuItem(icon: Icons.lock_outline, label: 'start secret chat', tokens: t,
-            onTap: () {
+            onTap: () async {
               Navigator.pop(ctx);
-              Navigator.push(ctx, _AppRoute(builder: (_) => ChatScreen(
-                contactName: c.displayName,
-                contactId:   secretConversationId(c.phantomId),
-                isSecret:    true,
-              ))).then((_) => _loadData(core));
+              await openSecretChat(context,
+                  core: core,
+                  contactId: c.phantomId,
+                  contactName: c.displayName);
+              if (mounted) _loadData(core);
             }),
           _MenuItem(icon: Icons.archive_outlined, label: c.isArchived ? 'unarchive' : 'archive', tokens: t,
             onTap: () async {

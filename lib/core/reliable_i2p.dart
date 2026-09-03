@@ -46,7 +46,18 @@ class ReliableI2p {
 
   /// Sends [payload] to [dest] reliably. The returned future completes when the
   /// peer ACKs (delivery confirmed) or errors after [maxRetries] unacked tries.
-  Future<void> sendReliable(String dest, Uint8List payload) {
+  ///
+  /// [every] and [tries] override the instance budget for one call. A message
+  /// wants the patient default; a liveness probe wants an answer while someone
+  /// is looking at a spinner, and a slow "no" is a wrong answer.
+  Future<void> sendReliable(
+    String dest,
+    Uint8List payload, {
+    Duration? every,
+    int? tries,
+  }) {
+    final period = every ?? retransmit;
+    final budget = tries ?? maxRetries;
     final id = _newId();
     final frame = _encode(_flagData, id, payload);
     final completer = Completer<void>();
@@ -58,13 +69,13 @@ class ReliableI2p {
       _pending.remove(id);
       if (!completer.isCompleted) {
         completer.completeError(
-            StateError('I2P reliable: no ACK after $maxRetries attempts'));
+            StateError('I2P reliable: no ACK after $budget attempts'));
       }
     }
 
     void fire() {
       if (completer.isCompleted) return;
-      if (attempts >= maxRetries) {
+      if (attempts >= budget) {
         giveUp();
         return;
       }
@@ -74,7 +85,7 @@ class ReliableI2p {
 
     _pending[id] = _Pending(completer, () => timer?.cancel());
     fire(); // first attempt immediately
-    timer = Timer.periodic(retransmit, (_) => fire());
+    timer = Timer.periodic(period, (_) => fire());
     return completer.future;
   }
 

@@ -73,6 +73,39 @@ enum TransportPriority {
 bool looksLikeI2pDestination(String s) =>
     s.length >= 516 && RegExp(r'^[A-Za-z0-9~-]+={0,2}$').hasMatch(s);
 
+/// Why a secret chat can or cannot run right now. A secret chat is live-only
+/// and I2P-only, so "can I use it" has exactly these answers — and each one
+/// tells the user something different about what to do next.
+enum SecretPathStatus {
+  /// Our I2P session is up, we hold the peer's destination, and they answered.
+  ready,
+
+  /// Our own side isn't up yet — i2pd still building tunnels, usually.
+  i2pNotReady,
+
+  /// We have no I2P destination for this contact. They have never reached us
+  /// over I2P and their contact address carried none.
+  noDestination,
+
+  /// Everything on our side works and the peer did not answer the probe.
+  peerUnreachable,
+}
+
+extension SecretPathStatusX on SecretPathStatus {
+  bool get isReady => this == SecretPathStatus.ready;
+
+  /// Short, user-facing reason. Deliberately says what is wrong rather than
+  /// "offline": with I2P the difference between "your tunnels aren't up" and
+  /// "they aren't answering" is the difference between waiting and giving up.
+  String get reason => switch (this) {
+        SecretPathStatus.ready => 'ready',
+        SecretPathStatus.i2pNotReady => 'your I2P session is still coming up',
+        SecretPathStatus.noDestination =>
+          'no I2P address on file for this contact yet',
+        SecretPathStatus.peerUnreachable => 'their I2P side is not answering',
+      };
+}
+
 @immutable
 class IncomingEnvelope {
   final Uint8List data;
@@ -316,6 +349,27 @@ class TransportManager {
   ///
   /// Throws [TransportException] only when *every* attempt fails — the caller
   /// then falls back to BLE mesh / persistent store.
+  /// Can a secret chat with [recipientId] actually carry a message right now?
+  ///
+  /// Answers over the real path instead of guessing from presence. Presence
+  /// rides IPFS pubsub heartbeats plus a 90s window from the last decrypted
+  /// frame; in the field the IPFS side is routinely dead, so it reports
+  /// "offline" for a contact whose messages are arriving over I2P. Gating a
+  /// live-only chat on that signal locked people out of working chats.
+  Future<SecretPathStatus> probeSecretPath(String recipientId,
+      {Duration timeout = const Duration(seconds: 8)}) async {
+    if (_activeTransports.isEmpty) await _activateLateTransports();
+    final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
+    if (i2p == null || !i2p.isAvailable) return SecretPathStatus.i2pNotReady;
+    final dest = _i2pDests[recipientId];
+    if (dest == null) return SecretPathStatus.noDestination;
+    final ok = await i2p.probeReachable(dest: dest, timeout: timeout);
+    TransportDebugger.instance.log(
+        'SECRET: I2P probe → ${recipientId.substring(0, 8)} '
+        '${ok ? "ANSWERED" : "no answer in ${timeout.inSeconds}s"}');
+    return ok ? SecretPathStatus.ready : SecretPathStatus.peerUnreachable;
+  }
+
   Future<void> publish({
     required String recipientId,
     required Uint8List encryptedEnvelope,
@@ -1641,6 +1695,32 @@ class I2PTransport implements PhantomTransport {
       throw const TransportException('I2P session unavailable');
     }
     await _reliable.sendReliable(dest, data);
+  }
+
+  /// Is [dest] answering RIGHT NOW?
+  ///
+  /// Sends an empty reliable datagram and waits for the ACK. The ACK comes from
+  /// the peer's own reliability layer before anything is delivered upward, and
+  /// an empty payload is dropped on their side (`delivered.isEmpty`), so this
+  /// is invisible to them — no notification, no session touched, no bubble.
+  ///
+  /// This is a real answer about the exact path a secret chat will use, which
+  /// no presence heartbeat can give: it proves our tunnels are up, that we
+  /// hold a destination that resolves, and that someone is listening behind it.
+  Future<bool> probeReachable({
+    required String dest,
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    if (!await _ensureSession()) return false;
+    final period = const Duration(seconds: 2);
+    final tries = (timeout.inMilliseconds / period.inMilliseconds).ceil().clamp(1, 12);
+    try {
+      await _reliable.sendReliable(dest, Uint8List(0),
+          every: period, tries: tries);
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// Sends [data] to a known peer destination via the SAM datagram port.

@@ -51,14 +51,15 @@ class _ContactsScreenState extends State<ContactsScreen> {
     if (mounted) setState(() => _contacts = contacts);
   }
 
-  void _openChat(ContactRecord c, {bool secret = false}) {
+  /// Normal 1:1 chat. Secret chats go through [openSecretChat], which will
+  /// not open a room that cannot deliver.
+  void _openChat(ContactRecord c) {
     Navigator.push(
       context,
       _AppRoute(
         builder: (_) => ChatScreen(
           contactName: c.displayName,
-          contactId: secret ? secretConversationId(c.phantomId) : c.phantomId,
-          isSecret: secret,
+          contactId: c.phantomId,
         ),
       ),
     );
@@ -100,9 +101,13 @@ class _ContactsScreenState extends State<ContactsScreen> {
                 icon: Icons.lock_outline,
                 label: 'secret chat',
                 tokens: t,
-                onTap: () {
+                onTap: () async {
                   Navigator.pop(ctx);
-                  _openChat(c, secret: true);
+                  if (!mounted) return;
+                  await openSecretChat(context,
+                      core: core,
+                      contactId: c.phantomId,
+                      contactName: c.displayName);
                 }),
             _MenuItem(
                 icon: Icons.person_remove_outlined,

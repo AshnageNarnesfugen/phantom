@@ -2590,6 +2590,14 @@ class PhantomCore {
 
   // ── Secret chats (I2P-only, both-online — see core/secret_chat.dart) ────────
 
+  /// Whether a secret chat with [contactId] can carry a message right now,
+  /// answered by an actual I2P round trip to them (see
+  /// [TransportManager.probeSecretPath]). The UI gates the composer and the
+  /// "start secret chat" action on this instead of on presence, which lies.
+  Future<SecretPathStatus> probeSecretChannel(String contactId,
+          {Duration timeout = const Duration(seconds: 8)}) =>
+      transport.probeSecretPath(contactId, timeout: timeout);
+
   /// Sends a text into the secret conversation with [contactId]: wrapped in a
   /// secretEnvelope and routed I2P-ONLY-reliable (never touches Waku/IPFS), so
   /// the peer never sees your IP. Delivery is live-only — enforced by the I2P
