@@ -1181,12 +1181,15 @@ class _SecretPathBar extends StatelessWidget {
             SecretPathStatus.ready => 'ready',
             SecretPathStatus.i2pNotReady =>
               'your I2P session is still coming up — a secret chat needs it',
+            SecretPathStatus.i2pWarmingUp =>
+              'your I2P router is still building tunnels — this takes a minute '
+                  'or two after opening the app',
             SecretPathStatus.noDestination =>
               'no I2P address for $peerName yet — message them normally once '
                   'so their address arrives',
             SecretPathStatus.peerUnreachable =>
-              '$peerName is not answering over I2P — a secret chat delivers '
-                  'live, with nothing stored on the way',
+              '$peerName is not answering over I2P — Phantom has to be open on '
+                  'their phone, it shuts I2P down in the background',
           };
 
     return Container(

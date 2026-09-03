@@ -266,6 +266,33 @@ void main() {
       expect(await bob.probeSecretChannel(aliceId), SecretPathStatus.ready);
     });
 
+    test('a cold local router is not blamed on the peer', () async {
+      // Nothing has ever come back over I2P and the session is seconds old:
+      // an unanswered probe is evidence about our own router, not about them.
+      // Reporting peerUnreachable here sends the user to check the wrong phone.
+      bridge.lossRate = 1.0;
+      final bobAddress = await bob.getMyContactAddress();
+      await alice.addContact(contactAddress: bobAddress!, nickname: 'Bob');
+
+      expect(
+        await alice.probeSecretChannel(await _idOf(bob),
+            timeout: const Duration(seconds: 2)),
+        SecretPathStatus.i2pWarmingUp,
+      );
+    });
+
+    test('once I2P has proven itself, silence IS about the peer', () async {
+      // introduce() puts real datagrams through in both directions, so our
+      // tunnels are known good. Now the same total loss means something else.
+      await introduce();
+      bridge.lossRate = 1.0;
+      expect(
+        await bob.probeSecretChannel(await _idOf(alice),
+            timeout: const Duration(seconds: 2)),
+        SecretPathStatus.peerUnreachable,
+      );
+    });
+
     test('says noDestination for a contact we have no I2P address for',
         () async {
       await introduce();

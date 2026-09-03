@@ -81,8 +81,14 @@ enum SecretPathStatus {
   /// Our I2P session is up, we hold the peer's destination, and they answered.
   ready,
 
-  /// Our own side isn't up yet — i2pd still building tunnels, usually.
+  /// Our own side isn't up yet — no SAM session at all.
   i2pNotReady,
+
+  /// Our SAM session exists but nothing has ever come back over I2P, and it
+  /// only just came up. The probe went unanswered, and that is about our
+  /// router, not about them: i2pd answers SAM long before it has usable
+  /// tunnels. Blaming the peer here sends the user to check the wrong phone.
+  i2pWarmingUp,
 
   /// We have no I2P destination for this contact. They have never reached us
   /// over I2P and their contact address carried none.
@@ -101,9 +107,16 @@ extension SecretPathStatusX on SecretPathStatus {
   String get reason => switch (this) {
         SecretPathStatus.ready => 'ready',
         SecretPathStatus.i2pNotReady => 'your I2P session is still coming up',
+        SecretPathStatus.i2pWarmingUp =>
+          'your I2P router is still building tunnels — give it a minute',
         SecretPathStatus.noDestination =>
           'no I2P address on file for this contact yet',
-        SecretPathStatus.peerUnreachable => 'their I2P side is not answering',
+        // Said plainly because it is the actionable half: backgrounding
+        // Phantom stops i2pd after three minutes, so an unanswered probe
+        // usually means the app is not open on their phone.
+        SecretPathStatus.peerUnreachable =>
+          'they are not answering over I2P — Phantom has to be open on their '
+              'phone, it shuts I2P down in the background',
       };
 }
 
@@ -361,6 +374,12 @@ class TransportManager {
   // lookup on top of the round trip. A field capture had a probe give up at
   // 8s and the peer's I2P session come up 4 seconds later — a "no" that was
   // only ever a "not yet".
+  /// How long after a SAM session appears we still treat an unanswered probe
+  /// as our own router warming up. i2pd needs tunnels plus a lease-set lookup;
+  /// a field capture had two SAM timeouts before the session came up and the
+  /// first probe 23s later, which was never going to be answered.
+  static const _i2pWarmUpWindow = Duration(minutes: 2);
+
   Future<SecretPathStatus> probeSecretPath(String recipientId,
       {Duration timeout = const Duration(seconds: 12)}) async {
     if (_activeTransports.isEmpty) await _activateLateTransports();
@@ -369,10 +388,22 @@ class TransportManager {
     final dest = _i2pDests[recipientId];
     if (dest == null) return SecretPathStatus.noDestination;
     final ok = await i2p.probeReachable(dest: dest, timeout: timeout);
+    // No answer is ambiguous, and the two readings send the user to different
+    // phones. If nothing has ever come back over I2P and the session only just
+    // came up, our router is the untested part — say so instead of accusing
+    // the peer.
+    final verdict = ok
+        ? SecretPathStatus.ready
+        : (!i2p.hasProvenPath &&
+                (i2p.sessionAge ?? Duration.zero) < _i2pWarmUpWindow)
+            ? SecretPathStatus.i2pWarmingUp
+            : SecretPathStatus.peerUnreachable;
     TransportDebugger.instance.log(
         'SECRET: I2P probe → ${recipientId.substring(0, 8)} '
-        '${ok ? "ANSWERED" : "no answer in ${timeout.inSeconds}s"}');
-    return ok ? SecretPathStatus.ready : SecretPathStatus.peerUnreachable;
+        '${ok ? "ANSWERED" : "no answer in ${timeout.inSeconds}s"} '
+        '(session ${i2p.sessionAge?.inSeconds ?? -1}s old, '
+        'proven=${i2p.hasProvenPath}) → ${verdict.name}');
+    return verdict;
   }
 
   Future<void> publish({
@@ -1461,6 +1492,8 @@ class I2PTransport implements PhantomTransport {
 
   Socket? _control;
   RawDatagramSocket? _udp;
+  DateTime? _sessionReadyAt;
+  DateTime? _lastInboundAt;
   String? _myDest;
   String? _myPrivKey;
   bool _disposed = false;
@@ -1504,9 +1537,29 @@ class I2PTransport implements PhantomTransport {
   /// distinguish "bridge running, still bootstrapping" from "bridge down".
   bool get isSamReachable => _samReachable;
 
-  /// True only after we have a working SESSION CREATE and a destination key
-  /// — i.e. we can actually send / receive I2P datagrams right now.
+  /// True only after we have a working SESSION CREATE and a destination key.
+  ///
+  /// It does NOT mean I2P works yet. SAM answers SESSION CREATE long before
+  /// i2pd has client tunnels, so a router that has just started is "ready" and
+  /// still cannot carry a datagram — and the first send to a new destination
+  /// pays for a lease-set lookup on top of that. See [hasProvenPath].
   bool get isSessionReady => _ready;
+
+  /// How long since the SAM session came up, or null if it hasn't.
+  Duration? get sessionAge => _sessionReadyAt == null
+      ? null
+      : DateTime.now().difference(_sessionReadyAt!);
+
+  /// Whether anything has actually come back over I2P recently.
+  ///
+  /// An inbound datagram is proof our tunnels are built and working; nothing
+  /// else is. Without it, a probe that goes unanswered says nothing about the
+  /// peer — our own router may simply not be warm.
+  bool get hasProvenPath {
+    final at = _lastInboundAt;
+    return at != null &&
+        DateTime.now().difference(at) < const Duration(minutes: 5);
+  }
 
   /// Number of consecutive SESSION CREATE attempts that have failed since
   /// the last success. Useful for the UI to show "still trying" vs "stuck".
@@ -1642,6 +1695,7 @@ class I2PTransport implements PhantomTransport {
       lines.listen((_) {}, onError: (_) {});
 
       _ready = true;
+      _sessionReadyAt = DateTime.now();
       _consecutiveFailures = 0;
       return true;
     } catch (e) {
@@ -1683,6 +1737,9 @@ class I2PTransport implements PhantomTransport {
     // Route through the reliability layer: reliable DATA frames get ACKed +
     // deduped (returns the inner payload), ACKs/dupes return null, and plain
     // datagrams pass straight through.
+    // Anything arriving at all is proof our tunnels are up, ACKs included —
+    // record it before the reliability layer swallows them.
+    _lastInboundAt = DateTime.now();
     final delivered = _reliable.onDatagram(
         sourceDest.isEmpty ? '?' : sourceDest, payload);
     if (delivered == null || delivered.isEmpty) return;
