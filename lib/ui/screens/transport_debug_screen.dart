@@ -16,13 +16,20 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
   String get _apiBase => '${IpfsDaemon.apiUrl}/api/v0';
   final _client         = http.Client();
   final _logScroll      = ScrollController();
-  StreamSubscription<String>? _logSub;
+  StreamSubscription<LogGroup>? _logSub;
   // Batch log updates to prevent setState storms (e.g. reconnect spin-loops).
-  Timer?       _logFlushTimer;
-  List<String> _pendingLines = [];
+  Timer? _logFlushTimer;
+  bool   _logDirty = false;
 
-  List<String> _log     = [];
-  bool         _loading = false;
+  /// Grouped rows, newest-changed counts included. Read straight from the
+  /// debugger on each flush — it owns the grouping, this only paints it.
+  List<LogGroup> _log = [];
+  /// Signatures whose sample list is expanded (the dropdown).
+  final Set<String> _expanded = {};
+  /// null = everything; otherwise only rows at or above this severity.
+  LogLevel? _filter;
+  bool _autoScroll = true;
+  bool _loading = false;
 
   // Status
   String? _peerId;
@@ -36,26 +43,34 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
   @override
   void initState() {
     super.initState();
-    _log = List.of(TransportDebugger.instance.entries);
-    _logSub = TransportDebugger.instance.stream.listen(_onLogLine);
+    _log = TransportDebugger.instance.groups;
+    _logSub = TransportDebugger.instance.stream.listen(_onLogEvent);
     _runAutoStatus();
   }
 
-  void _onLogLine(String line) {
-    _pendingLines.add(line);
+  void _onLogEvent(LogGroup _) {
+    _logDirty = true;
     if (_logFlushTimer != null) return;
-    // Flush at most ~10 times/s regardless of log volume.
+    // Flush at most ~10 times/s regardless of log volume. A repeat only moves
+    // a counter, so this is now a repaint of one row's badge rather than a
+    // list that grows without bound.
     _logFlushTimer = Timer(const Duration(milliseconds: 100), () {
       _logFlushTimer = null;
-      if (!mounted) return;
-      setState(() => _log.addAll(_pendingLines));
-      _pendingLines = [];
+      if (!mounted || !_logDirty) return;
+      _logDirty = false;
+      setState(() => _log = TransportDebugger.instance.groups);
+      if (!_autoScroll) return;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (_logScroll.hasClients) {
           _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
         }
       });
     });
+  }
+
+  List<LogGroup> get _visibleLog {
+    if (_filter == null) return _log;
+    return _log.where((g) => g.level.index <= _filter!.index).toList();
   }
 
   @override
@@ -267,15 +282,72 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
   }
 
   void _copyLog() {
-    Clipboard.setData(ClipboardData(text: _log.join('\n')));
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Log copied to clipboard'), duration: Duration(seconds: 2)),
-    );
+    final dbg = TransportDebugger.instance;
+    final text = dbg.groups
+        .map((g) => '${g.count > 1 ? "x${g.count} " : ""}${g.message}')
+        .join('\n');
+    Clipboard.setData(ClipboardData(text: text));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('${dbg.groups.length} rows copied '
+          '(${dbg.totalLines} lines collapsed)'),
+      duration: const Duration(seconds: 2),
+    ));
   }
 
   void _clearLog() {
     TransportDebugger.instance.clear();
-    setState(() => _log.clear());
+    setState(() {
+      _log = const [];
+      _expanded.clear();
+    });
+  }
+
+  /// Facts about the device and the stack that a log line alone never carries,
+  /// and that are the first thing anyone reading a report asks for.
+  Future<Map<String, String>> _environment() async {
+    final env = <String, String>{};
+    try {
+      final info = await PackageInfo.fromPlatform();
+      env['app'] = '${info.version} (build ${info.buildNumber})';
+    } catch (_) {}
+    env['platform'] = Platform.operatingSystemVersion;
+
+    final core = widget.core;
+    if (core != null) {
+      final i2p = core.transport.transports.whereType<I2PTransport>().firstOrNull;
+      env['i2p'] = i2p == null
+          ? 'not instantiated'
+          : i2p.isSessionReady
+              ? 'session ready'
+              : i2p.isSamReachable
+                  ? 'SAM up, session not ready '
+                      '(${i2p.sessionAttemptFailures} failed attempts)'
+                  : 'SAM unreachable';
+      final ygg = core.transport.transports.whereType<YggdrasilTransport>().firstOrNull;
+      env['ygg'] = ygg?.address == null ? 'off' : 'up';
+      env['transports'] = core.transport.activeTransportNames.join(', ');
+      env['contacts'] = '${(await core.getContacts()).length}';
+    }
+    env['ipfs'] = _peerId == null || _peerId == '(error)'
+        ? 'API unreachable'
+        : 'API ok, swarm $_swarmPeers, ${_topics.length} topics';
+    env['waku'] = _wakuBinaryMissing
+        ? 'libgowaku.so missing'
+        : _wakuRunning
+            ? 'running, $_wakuPeers peers'
+            : 'stopped';
+    return env;
+  }
+
+  Future<void> _openReport() async {
+    final env = await _environment();
+    if (!mounted) return;
+    final report = DiagnosticReport.fromDebugger(
+      TransportDebugger.instance,
+      environment: env,
+    );
+    await Navigator.push(context,
+        _AppRoute(builder: (_) => _DiagnosticReportScreen(report: report)));
   }
 
   Future<void> _restartDaemon() async {
@@ -349,6 +421,11 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
             style: TextStyle(fontFamily: 'monospace', fontSize: 14, color: t.textPrimary)),
         actions: [
           IconButton(
+            icon: Icon(Icons.summarize_outlined, size: 18, color: t.accentLight),
+            tooltip: 'diagnostic report',
+            onPressed: _openReport,
+          ),
+          IconButton(
             icon: Icon(Icons.copy_outlined, size: 18, color: t.textSecondary),
             tooltip: 'copy log',
             onPressed: _copyLog,
@@ -368,7 +445,9 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
           // ── Action buttons ────────────────────────────────────────────────
           _buildActions(t),
           const Divider(height: 1),
-          // ── Live log ──────────────────────────────────────────────────────
+          // ── Live log (grouped: one row per distinct message) ───────────────
+          _buildLogBar(t),
+          const Divider(height: 1),
           Expanded(child: _buildLog(t)),
         ],
       ),
@@ -481,36 +560,252 @@ class _TransportDebugScreenState extends State<_TransportDebugScreen> {
   }
 
   Widget _buildLog(PhantomTokens t) {
-    if (_log.isEmpty) {
+    final rows = _visibleLog;
+    if (rows.isEmpty) {
       return Center(
-        child: Text('no log entries yet',
-            style: TextStyle(color: t.textDisabled, fontFamily: 'monospace', fontSize: 12)),
+        child: Text(
+            _log.isEmpty ? 'no log entries yet' : 'nothing at this level',
+            style: TextStyle(
+                color: t.textDisabled, fontFamily: 'monospace', fontSize: 12)),
       );
     }
     return Scrollbar(
       controller: _logScroll,
       child: ListView.builder(
         controller: _logScroll,
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        itemCount: _log.length,
-        itemBuilder: (_, i) {
-          final line = _log[i];
-          final isErr  = line.contains('FAIL') || line.contains('ERR') || line.contains('✗');
-          final isWarn = line.contains('⚠') || line.contains('no peers');
-          final isOk   = line.contains('✓') || line.contains('OK') || line.contains('ready');
-          final isHandshake = line.contains('handshake') || line.contains('PREWARM');
-          final isMesh = line.contains('gossipsub mesh') || line.contains('waiting for');
-          final color  = isErr  ? const Color(0xFFCF6679)
-                       : isWarn ? const Color(0xFFFFB74D)
-                       : isOk   ? const Color(0xFF4CAF50)
-                       : isHandshake ? const Color(0xFF81D4FA)
-                       : isMesh ? const Color(0xFFCE93D8)
-                       : t.textSecondary;
-          return Text(
-            line,
-            style: TextStyle(fontFamily: 'monospace', fontSize: 10, color: color, height: 1.5),
-          );
-        },
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        itemCount: rows.length,
+        itemBuilder: (_, i) => _LogRow(
+          group: rows[i],
+          tokens: t,
+          expanded: _expanded.contains(rows[i].signature),
+          onTap: () {
+            final sig = rows[i].signature;
+            setState(() {
+              if (!_expanded.remove(sig)) _expanded.add(sig);
+              // Reading a specific row means you no longer want the list
+              // yanked to the bottom every 100ms.
+              _autoScroll = false;
+            });
+          },
+        ),
+      ),
+    );
+  }
+
+  /// Severity filter + the "N lines collapsed into M rows" counter, which is
+  /// the number that tells you whether the log is busy or actually broken.
+  Widget _buildLogBar(PhantomTokens t) {
+    final dbg = TransportDebugger.instance;
+    final errs = _log.where((g) => g.level == LogLevel.error).length;
+    final warns = _log.where((g) => g.level == LogLevel.warn).length;
+    return Container(
+      color: t.bgSurface,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      child: Row(
+        children: [
+          _FilterChip(
+              label: 'all ${_log.length}',
+              selected: _filter == null,
+              tokens: t,
+              onTap: () => setState(() => _filter = null)),
+          _FilterChip(
+              label: 'err $errs',
+              color: _levelColor(LogLevel.error),
+              selected: _filter == LogLevel.error,
+              tokens: t,
+              onTap: () => setState(() => _filter = LogLevel.error)),
+          _FilterChip(
+              label: 'warn ${errs + warns}',
+              color: _levelColor(LogLevel.warn),
+              selected: _filter == LogLevel.warn,
+              tokens: t,
+              onTap: () => setState(() => _filter = LogLevel.warn)),
+          const Spacer(),
+          Text('${dbg.totalLines} lines',
+              style: TextStyle(
+                  color: t.textDisabled, fontFamily: 'monospace', fontSize: 10)),
+          const SizedBox(width: 8),
+          GestureDetector(
+            onTap: () => setState(() => _autoScroll = !_autoScroll),
+            child: Icon(
+                _autoScroll
+                    ? Icons.vertical_align_bottom
+                    : Icons.pause_circle_outline,
+                size: 16,
+                color: _autoScroll ? t.accentLight : t.textDisabled),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+Color _levelColor(LogLevel l) => switch (l) {
+      LogLevel.error => const Color(0xFFCF6679),
+      LogLevel.warn => const Color(0xFFFFB74D),
+      LogLevel.ok => const Color(0xFF4CAF50),
+      LogLevel.info => const Color(0xFF90A4AE),
+    };
+
+/// One collapsed message: a severity dot, the text, and a repeat counter that
+/// opens the raw samples. Modelled on a browser console — the counter is the
+/// whole point, because the same line firing 200 times is one fact, not 200.
+class _LogRow extends StatelessWidget {
+  final LogGroup group;
+  final PhantomTokens tokens;
+  final bool expanded;
+  final VoidCallback onTap;
+  const _LogRow({
+    required this.group,
+    required this.tokens,
+    required this.expanded,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = _levelColor(group.level);
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 2),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(top: 4, right: 6),
+                  child: Container(
+                    width: 5,
+                    height: 5,
+                    decoration:
+                        BoxDecoration(color: color, shape: BoxShape.circle),
+                  ),
+                ),
+                Expanded(
+                  child: Text(
+                    group.message,
+                    maxLines: expanded ? null : 3,
+                    overflow: expanded ? null : TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 10,
+                        height: 1.45,
+                        color: color),
+                  ),
+                ),
+                if (group.isRepeated) ...[
+                  const SizedBox(width: 6),
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: color.withValues(alpha: 0.18),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text('x${group.count}',
+                        style: TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 9,
+                            fontWeight: FontWeight.w600,
+                            color: color)),
+                  ),
+                ],
+                Icon(
+                    expanded
+                        ? Icons.keyboard_arrow_down
+                        : Icons.keyboard_arrow_right,
+                    size: 13,
+                    color: tokens.textDisabled),
+              ],
+            ),
+            if (expanded)
+              Padding(
+                padding: const EdgeInsets.only(left: 11, top: 4, bottom: 4),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      group.isRepeated
+                          ? '${group.count}x  ${_hms(group.firstAt)} → '
+                              '${_hms(group.lastAt)}'
+                          : _hms(group.firstAt),
+                      style: TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 9,
+                          color: tokens.textDisabled),
+                    ),
+                    const SizedBox(height: 3),
+                    for (final sample in group.samples)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 2),
+                        child: Text(sample,
+                            style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 9,
+                                height: 1.4,
+                                color: tokens.textDisabled)),
+                      ),
+                    if (group.count > group.samples.length)
+                      Text(
+                          '(${group.count - group.samples.length} more '
+                          'occurrences not kept)',
+                          style: TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 9,
+                              fontStyle: FontStyle.italic,
+                              color: tokens.textDisabled)),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  static String _hms(DateTime d) =>
+      '${d.hour.toString().padLeft(2, '0')}:'
+      '${d.minute.toString().padLeft(2, '0')}:'
+      '${d.second.toString().padLeft(2, '0')}';
+}
+
+class _FilterChip extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final Color? color;
+  final PhantomTokens tokens;
+  final VoidCallback onTap;
+  const _FilterChip({
+    required this.label,
+    required this.selected,
+    required this.tokens,
+    required this.onTap,
+    this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = color ?? tokens.textSecondary;
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        margin: const EdgeInsets.only(right: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: c.withValues(alpha: selected ? 0.20 : 0.06),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+              color: c.withValues(alpha: selected ? 0.6 : 0.2), width: 0.5),
+        ),
+        child: Text(label,
+            style: TextStyle(
+                color: selected ? c : c.withValues(alpha: 0.6),
+                fontFamily: 'monospace',
+                fontSize: 10)),
       ),
     );
   }
@@ -583,6 +878,171 @@ class _DbgButton extends StatelessWidget {
             fontSize: 11,
           ),
         ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DIAGNOSTIC REPORT
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The report as a screen: read it, copy it, or drop it in a file to attach.
+///
+/// There is deliberately no "upload" button. These logs are the reason the
+/// logcat sink is compiled out of release builds; shipping them to a server by
+/// default would hand a third party the metadata the whole app exists to
+/// withhold. The report is redacted and small enough to paste by hand, and
+/// where it goes stays the user's decision.
+class _DiagnosticReportScreen extends StatefulWidget {
+  final DiagnosticReport report;
+  const _DiagnosticReportScreen({required this.report});
+
+  @override
+  State<_DiagnosticReportScreen> createState() =>
+      _DiagnosticReportScreenState();
+}
+
+class _DiagnosticReportScreenState extends State<_DiagnosticReportScreen> {
+  bool _includeTail = true;
+  String? _savedPath;
+
+  String get _text =>
+      widget.report.build(tailLines: _includeTail ? 40 : 0);
+
+  void _copy() {
+    Clipboard.setData(ClipboardData(text: _text));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('report copied (${_text.length} chars)'),
+      duration: const Duration(seconds: 2),
+    ));
+  }
+
+  Future<void> _save() async {
+    try {
+      Directory dir;
+      try {
+        dir = await getExternalStorageDirectory() ??
+            await getApplicationDocumentsDirectory();
+      } catch (_) {
+        dir = await getApplicationDocumentsDirectory();
+      }
+      final now = widget.report.generatedAt;
+      String p(int n) => n.toString().padLeft(2, '0');
+      final name = 'phantom-diagnostic-${now.year}${p(now.month)}${p(now.day)}'
+          '-${p(now.hour)}${p(now.minute)}${p(now.second)}.txt';
+      final file = File('${dir.path}/$name');
+      await file.writeAsString(_text);
+      if (!mounted) return;
+      setState(() => _savedPath = file.path);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('saved to ${file.path}'),
+        duration: const Duration(seconds: 4),
+      ));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('save failed: $e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = PhantomTheme.tokensOf(context);
+    final r = widget.report;
+    return Scaffold(
+      backgroundColor: t.bgBase,
+      appBar: AppBar(
+        backgroundColor: t.bgBase,
+        foregroundColor: t.textPrimary,
+        title: Text('diagnostic report',
+            style: TextStyle(
+                fontFamily: 'monospace', fontSize: 14, color: t.textPrimary)),
+        actions: [
+          IconButton(
+            icon: Icon(Icons.copy_outlined, size: 18, color: t.accentLight),
+            tooltip: 'copy',
+            onPressed: _copy,
+          ),
+          IconButton(
+            icon: Icon(Icons.save_alt_outlined, size: 18, color: t.textSecondary),
+            tooltip: 'save to file',
+            onPressed: _save,
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Container(
+            width: double.infinity,
+            color: t.bgSurface,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${r.totalLines} log lines → ${r.groups.length} distinct '
+                  '(${r.errorCount} error, ${r.warnCount} warn)',
+                  style: TextStyle(
+                      color: t.textSecondary,
+                      fontFamily: 'monospace',
+                      fontSize: 11),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  'IDs, I2P destinations and public addresses are stripped.',
+                  style: TextStyle(
+                      color: t.textDisabled,
+                      fontFamily: 'monospace',
+                      fontSize: 10),
+                ),
+                if (_savedPath != null) ...[
+                  const SizedBox(height: 4),
+                  SelectableText(_savedPath!,
+                      style: TextStyle(
+                          color: t.accentLight,
+                          fontFamily: 'monospace',
+                          fontSize: 9)),
+                ],
+                const SizedBox(height: 6),
+                GestureDetector(
+                  onTap: () => setState(() => _includeTail = !_includeTail),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                          _includeTail
+                              ? Icons.check_box_outlined
+                              : Icons.check_box_outline_blank,
+                          size: 15,
+                          color: t.textSecondary),
+                      const SizedBox(width: 6),
+                      Text('include the last 40 lines verbatim',
+                          style: TextStyle(
+                              color: t.textSecondary,
+                              fontFamily: 'monospace',
+                              fontSize: 10)),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(10),
+              child: SelectableText(
+                _text,
+                style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 10,
+                    height: 1.45,
+                    color: t.textSecondary),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
