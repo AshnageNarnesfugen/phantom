@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:cryptography/cryptography.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter/foundation.dart';
+import '../core/power_state.dart';
 import '../core/transport_debugger.dart';
 import '../core/waku_daemon.dart';
 import '../core/ipfs_daemon.dart';
@@ -356,8 +357,12 @@ class TransportManager {
   /// frame; in the field the IPFS side is routinely dead, so it reports
   /// "offline" for a contact whose messages are arriving over I2P. Gating a
   /// live-only chat on that signal locked people out of working chats.
+  // 12s, not 8: the first datagram to a destination pays for a lease-set
+  // lookup on top of the round trip. A field capture had a probe give up at
+  // 8s and the peer's I2P session come up 4 seconds later — a "no" that was
+  // only ever a "not yet".
   Future<SecretPathStatus> probeSecretPath(String recipientId,
-      {Duration timeout = const Duration(seconds: 8)}) async {
+      {Duration timeout = const Duration(seconds: 12)}) async {
     if (_activeTransports.isEmpty) await _activateLateTransports();
     final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
     if (i2p == null || !i2p.isAvailable) return SecretPathStatus.i2pNotReady;
@@ -936,11 +941,24 @@ class IpfsTransport implements PhantomTransport {
           }
         }
         dbg.log('IPFS: subscription stream closed — reconnecting in 5s');
-        if (!_disposed) await Future.delayed(const Duration(seconds: 5));
+        if (!_disposed) await _pauseBeforeResubscribe(const Duration(seconds: 5));
       } catch (e) {
         dbg.log('IPFS: subscription error: $e — retrying in 10s');
-        if (!_disposed) await Future.delayed(const Duration(seconds: 10));
+        if (!_disposed) await _pauseBeforeResubscribe(const Duration(seconds: 10));
       }
+    }
+  }
+
+  /// Waits [normal] before the next subscribe attempt — unless the daemon is
+  /// stopped for power save, in which case it waits for the daemon to come
+  /// back. Retrying an intentionally dead API on a 10s cadence for the length
+  /// of a sleep is pure battery: 157 doomed attempts in one 32-minute field
+  /// capture, and the subscription could not have succeeded in any of them.
+  Future<void> _pauseBeforeResubscribe(Duration normal) async {
+    if (PowerState.instance.isSaving) {
+      await PowerState.instance.awaitAwake();
+    } else {
+      await Future.delayed(normal);
     }
   }
 
@@ -1709,7 +1727,7 @@ class I2PTransport implements PhantomTransport {
   /// hold a destination that resolves, and that someone is listening behind it.
   Future<bool> probeReachable({
     required String dest,
-    Duration timeout = const Duration(seconds: 8),
+    Duration timeout = const Duration(seconds: 12),
   }) async {
     if (!await _ensureSession()) return false;
     final period = const Duration(seconds: 2);

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
+import 'power_state.dart';
 import 'transport_debugger.dart';
 
 /// Manages the bundled go-waku daemon on Android for message relay/store.
@@ -280,7 +281,15 @@ class WakuDaemon {
       final encodedPubsub = Uri.encodeComponent(pubsubTopic);
       while (running && !controller.isClosed) {
         if (!subscribed) {
-          await Future.delayed(const Duration(seconds: 3));
+          // In power save the daemon is duty-cycled on purpose and this port
+          // is meant to refuse; park until it is back instead of proving that
+          // every three seconds. Delivery during the sleep is the store drain
+          // in the sync window, not this poll.
+          if (PowerState.instance.isSaving) {
+            await PowerState.instance.awaitAwake();
+          } else {
+            await Future.delayed(const Duration(seconds: 3));
+          }
           if (!running || controller.isClosed) break;
           subscribed = await register();
           continue;
@@ -314,7 +323,13 @@ class WakuDaemon {
           debugPrint('[WakuDaemon] poll error: $e');
           subscribed = false;
         }
-        await Future.delayed(Duration(milliseconds: intervalMs));
+        // Same reason: a 500ms poll against a stopped daemon is the most
+        // expensive way possible to learn nothing.
+        if (PowerState.instance.isSaving) {
+          await PowerState.instance.awaitAwake();
+        } else {
+          await Future.delayed(Duration(milliseconds: intervalMs));
+        }
       }
       await controller.close();
     }();

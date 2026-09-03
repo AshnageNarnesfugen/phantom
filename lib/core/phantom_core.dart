@@ -28,6 +28,7 @@ import 'notification_service.dart';
 import 'ipfs_daemon.dart';
 import 'i2pd_daemon.dart';
 import 'waku_daemon.dart';
+import 'power_state.dart';
 import 'transport_debugger.dart';
 import '../transport/transport.dart';
 import '../transport/transport_manager_v2.dart' hide IncomingEnvelope;
@@ -2595,7 +2596,7 @@ class PhantomCore {
   /// [TransportManager.probeSecretPath]). The UI gates the composer and the
   /// "start secret chat" action on this instead of on presence, which lies.
   Future<SecretPathStatus> probeSecretChannel(String contactId,
-          {Duration timeout = const Duration(seconds: 8)}) =>
+          {Duration timeout = const Duration(seconds: 12)}) =>
       transport.probeSecretPath(contactId, timeout: timeout);
 
   /// Sends a text into the secret conversation with [contactId]: wrapped in a
@@ -3825,6 +3826,9 @@ class PhantomCore {
 
   Future<void> _enterPowerSave() async {
     _powerSaveActive = true;
+    // Tell the reconnect loops the daemons are going away on purpose, so they
+    // stop dialling ports that are meant to be refusing.
+    PowerState.instance.enterPowerSave();
     TransportDebugger.instance.log('POWER: entering power save '
         '(Waku duty-cycle, IPFS/i2pd stopped)');
     await WakuDaemon.instance.enterBackgroundMode();
@@ -3834,6 +3838,9 @@ class PhantomCore {
 
   Future<void> _exitPowerSave() async {
     _powerSaveActive = false;
+    // Releases every parked reconnect loop at once — they retry immediately
+    // instead of waiting out a backoff.
+    PowerState.instance.exitPowerSave();
     TransportDebugger.instance.log('POWER: exiting power save — hot mode');
     await WakuDaemon.instance.enterForegroundMode();
     unawaited(IpfsDaemon.instance.ensure());

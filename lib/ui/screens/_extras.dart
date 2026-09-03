@@ -1089,11 +1089,23 @@ Future<void> openSecretChat(
   navigator.pop(); // the probe dialog
 
   if (!status.isReady) {
+    // Offer the retry rather than making them find the menu again. Both sides
+    // are often seconds from ready — i2pd needs ~25s from launch to build
+    // tunnels, and a probe that lands inside that window is a "not yet", not
+    // a "no".
     messenger.showSnackBar(SnackBar(
-      duration: const Duration(seconds: 5),
+      duration: const Duration(seconds: 8),
       content: Text(
         'no secret chat with $contactName — ${status.reason}',
         style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+      ),
+      action: SnackBarAction(
+        label: 'retry',
+        onPressed: () {
+          if (!context.mounted) return;
+          unawaited(openSecretChat(context,
+              core: core, contactId: contactId, contactName: contactName));
+        },
       ),
     ));
     return;
