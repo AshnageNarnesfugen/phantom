@@ -156,6 +156,38 @@ void main() {
       expect(out, isNot(contains('ubXNnM2hSR21GdGdNV2hw')));
     });
 
+    test('a pubsub topic name carries a contact id — and did leak one', () {
+      // Straight out of a field report: the debugger's own /pubsub/ls dump.
+      // \b does not anchor between the "g" of msg and the "3" of the id, so
+      // the phantom-id rule never fired on these.
+      for (final line in const [
+        'DBG:   msg3hRGmFtgMWhpZF4RVfALwAcZXK35SV3cBXp5d54mgtG5MphekUf',
+        'DBG:   prs3h3E19U8e12HKHEByyniwzeEGaDSJHMCskkcSRqePymE4CeaEEj',
+      ]) {
+        final out = DiagnosticReport.redact(line);
+        expect(out, isNot(contains('3hRGmFtg')));
+        expect(out, isNot(contains('3h3E19U8')));
+        expect(out, contains('<id>'));
+      }
+    });
+
+    test('a truncated id shown at both ends does not slip through', () {
+      final out =
+          DiagnosticReport.redact('DBG: checking peers for 3hRGmF…ekUf (x)');
+      expect(out, isNot(contains('3hRGmF')));
+      expect(out, isNot(contains('ekUf')));
+    });
+
+    test('the relay a device sits behind is not part of the report', () {
+      // The IPNS name and the relay IPv4 dash-encoded into the domain — the
+      // dotted-quad rule cannot see the latter.
+      final out = DiagnosticReport.redact(
+          'DBG: addrs = /dns4/157-90-32-77.k51qzi5uqu5dimlh6bxx6ohmko3j7l885'
+          'gxstto4dtlr0esy1fvhf36cs85wga.libp2p.direct/tcp/4001/tls/ws');
+      expect(out, isNot(contains('157-90-32-77')));
+      expect(out, isNot(contains('k51qzi5uqu5')));
+    });
+
     test('loopback stays — it is the meaning of the error, and names nobody', () {
       final out = DiagnosticReport.redact(_ipfsRetryA);
       expect(out, contains('127.0.0.1'));

@@ -131,8 +131,22 @@ class DiagnosticReport {
   // recognises.
   static final _i2pDest = RegExp(r'[A-Za-z0-9~-]{80,}={0,2}');
   static final _peerId = RegExp(r'\b(?:12D3Koo|16Uiu2|Qm)[A-Za-z0-9]{20,}');
+  // An IPNS name in a libp2p.direct relay domain, and the relay's own IPv4
+  // dash-encoded into that domain — both say which relay this device sits
+  // behind, which the dotted-quad rule below never sees.
+  static final _ipnsName = RegExp(r'\bk51[a-z0-9]{20,}');
+  static final _dashedIp = RegExp(r'(?<![\d-])\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3}(?![\d-])');
   static final _multibaseTopic = RegExp(r'\bu[A-Za-z0-9_-]{24,}');
-  static final _phantomId = RegExp(r'\b3[A-HJ-NP-Za-km-z1-9]{7,}');
+  // The optional lowercase prefix is the whole point: pubsub topics are
+  // `msg<phantomId>` / `prs<phantomId>`, and \b does not anchor between the
+  // `g` of "msg" and the `3` that starts the id — so every /pubsub/ls dump the
+  // debugger printed carried a full contact id straight through redaction.
+  static final _phantomId =
+      RegExp(r'(?<![A-Za-z0-9])[a-z]{0,4}3[A-HJ-NP-Za-km-z1-9]{7,}');
+  // Truncated display forms: `3hRGmF…ekUf` is short at both ends and slipped
+  // under both the id rule's length floor and the generic elision rule's.
+  static final _elidedShort =
+      RegExp(r'(?<![A-Za-z0-9])3[A-HJ-NP-Za-km-z1-9]{3,}…(?:[A-Za-z0-9]{2,8})?');
   static final _elided = RegExp(r'[A-Za-z0-9~+/_-]{8,}…');
   static final _ipv4 = RegExp(r'\b\d{1,3}(?:\.\d{1,3}){3}\b');
 
@@ -146,7 +160,10 @@ class DiagnosticReport {
     var out = s;
     out = out.replaceAll(_i2pDest, '<i2p-dest>');
     out = out.replaceAll(_peerId, '<peer-id>');
+    out = out.replaceAll(_ipnsName, '<peer-id>');
+    out = out.replaceAll(_dashedIp, '<ip>');
     out = out.replaceAll(_multibaseTopic, '<topic>');
+    out = out.replaceAll(_elidedShort, '<id>');
     out = out.replaceAll(_phantomId, '<id>');
     out = out.replaceAll(_elided, '<id>…');
     out = out.replaceAllMapped(
