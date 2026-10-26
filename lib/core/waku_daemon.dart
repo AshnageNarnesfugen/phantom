@@ -425,6 +425,16 @@ class WakuDaemon {
     );
   }
 
+  /// The store's WakuMessage is serialized protojson-style: camelCase keys and
+  /// 64-bit integers as STRINGS ("timestamp": "1793047090019554000", seen on
+  /// the phones) — while the envelope (status_code) is a plain number. Accept
+  /// either for every integer field.
+  static int _int64(Object? v) => switch (v) {
+        num n => n.toInt(),
+        String s => int.tryParse(s) ?? 0,
+        _ => 0,
+      };
+
   /// Whether the running daemon serves /store/v3/messages. Null until a query
   /// finds out; reset when the daemon is restarted (it may be a new binary).
   bool? _storeV3Route;
@@ -459,10 +469,18 @@ class WakuDaemon {
       };
       final uri = Uri.parse('$apiUrl/store/v3/messages')
           .replace(queryParameters: params);
-      final req = await client.getUrl(uri);
-      final resp = await req.close();
-      final body = await resp.transform(utf8.decoder).join();
-      client.close(force: true);
+      // Bounded: a query naming an unreachable store node sat for up to two
+      // minutes on the phones, and the publish confirmation waits on it.
+      final String body;
+      final HttpClientResponse resp;
+      try {
+        final req = await client.getUrl(uri);
+        resp = await req.close().timeout(const Duration(seconds: 20));
+        body = await resp.transform(utf8.decoder).join()
+            .timeout(const Duration(seconds: 20));
+      } finally {
+        client.close(force: true);
+      }
 
       // The router's own 404 is plain text; a v3 error is a JSON body.
       if (resp.statusCode == 404 && !body.trimLeft().startsWith('{')) {
@@ -472,7 +490,9 @@ class WakuDaemon {
       final json = resp.statusCode == 200 || body.trimLeft().startsWith('{')
           ? jsonDecode(body) as Map<String, dynamic>
           : const <String, dynamic>{};
-      final code = (json['status_code'] as num?)?.toInt() ?? resp.statusCode;
+      final code = json.containsKey('status_code') || json.containsKey('statusCode')
+          ? _int64(json['status_code'] ?? json['statusCode'])
+          : resp.statusCode;
       if (resp.statusCode != 200 || code != 200) {
         final desc = json['status_desc'] ?? json['error_message'] ?? body;
         final preview = '$desc'.length > 200 ? '${'$desc'.substring(0, 200)}…' : '$desc';
@@ -490,7 +510,7 @@ class WakuDaemon {
         if (p == null || p.isEmpty) continue;
         out.add((
           payload: base64Decode(p),
-          timestampNs: (m['timestamp'] as num?)?.toInt() ?? 0,
+          timestampNs: _int64(m['timestamp']),
         ));
       }
       return (routeMissing: false, messages: out);

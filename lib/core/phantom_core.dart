@@ -1631,12 +1631,20 @@ class PhantomCore {
     notifyContactChanged(p.conversationId);
   }
 
-  /// Per-recipient send locks. Encrypting mutates the ratchet session and
-  /// persists it — two concurrent sends to the same contact (e.g. a text
-  /// racing the automatic connectivityInfo/preKeyShare after a handshake)
-  /// would both advance the chain from the same snapshot and emit frames
-  /// the receiver can only partially decrypt.
-  final Map<String, _SerialLock> _sendLocks = {};
+  /// Sends still running, so [dispose] can let them record their outcome
+  /// before storage closes.
+  ///
+  /// There used to be a per-recipient lock around the WHOLE send. The ratchet
+  /// half of it (two sends advancing the chain from one snapshot) is the
+  /// encrypt+persist phase, which [_sessionLock] serializes on its own; what
+  /// the outer lock added was holding the contact's queue through the network
+  /// phase. On the phones (2026-10-26) a read receipt sat ~6 min in Waku's
+  /// store confirmation with that lock taken: every message typed after it —
+  /// its bubble included, since the bubble is saved inside the send — waited
+  /// behind it. The user saw nothing, typed it again, and both went out.
+  /// Delivery order was never guaranteed anyway (several transports race; the
+  /// ratchet takes frames out of order).
+  final Set<Future<void>> _inFlightSends = {};
 
   /// [resend] re-encrypts a message already in the chat (same id) for the
   /// delivery-receipt retry: no new bubble, and the stored status is left to
@@ -1647,10 +1655,13 @@ class PhantomCore {
     bool secret = false,
     bool resend = false,
   }) async {
-    final lock = _sendLocks.putIfAbsent(recipientId, () => _SerialLock());
-    final sent = await lock.guard(() => _sendPhantomMessageInner(
+    final run = _sendPhantomMessageInner(
         recipientId: recipientId, message: message, secret: secret,
-        resend: resend));
+        resend: resend);
+    final tracked = run.then<void>((_) {}, onError: (_) {});
+    _inFlightSends.add(tracked);
+    unawaited(tracked.whenComplete(() => _inFlightSends.remove(tracked)));
+    final sent = await run;
     // Secret chats confirm per frame over I2P's own ACK layer.
     if (!resend && !secret && _deliveryTrackedTypes.contains(message.type)) {
       _trackPendingDelivery(recipientId, message.id);
@@ -4219,18 +4230,15 @@ class PhantomCore {
     await _meshDeliveredSub?.cancel();
     await _meshRangeSub?.cancel();
     await _presenceMediaSub?.cancel();
-    // Transports go down BEFORE the send-lock drain: a send lock is held
-    // through the network phase, and an I2P send now waits for the peer's
-    // ACK (up to its whole retransmit budget, then the handshake re-attempts).
-    // Draining first held dispose hostage to an unanswering peer for minutes,
-    // and a send that finished after storage.close() wrote its status into a
-    // closed box. Disposing the transports fails those sends fast, and they
-    // record their outcome while storage is still open.
+    // Transports go down BEFORE waiting on in-flight sends: an I2P send waits
+    // for the peer's ACK (its whole retransmit budget, then the handshake
+    // re-attempts). Waiting first held dispose hostage to an unanswering peer
+    // for minutes, and a send that finished after storage.close() wrote its
+    // status into a closed box. Disposing the transports fails those sends
+    // fast, and they record their outcome while storage is still open.
     await transport.dispose();
     await _transportV2?.dispose();
-    for (final lock in _sendLocks.values.toList()) {
-      await lock.guard(() async {});
-    }
+    await Future.wait(_inFlightSends.toList());
     _presence?.dispose();
     await storage.close();
     await _incomingController.close();
@@ -4265,7 +4273,7 @@ class PhantomCoreException implements Exception {
 /// FIFO async mutex: `guard` runs [fn] after every previously guarded call
 /// has finished, propagating its result/error to the caller. Ratchet
 /// sessions are read-modify-write state, so both send and receive paths
-/// must be serialized (see [_inboundLock] / [_sendLocks]).
+/// must be serialized (see [_sessionLock]).
 class _SerialLock {
   Future<void> _tail = Future.value();
   Future<T> guard<T>(Future<T> Function() fn) {

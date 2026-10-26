@@ -5,10 +5,12 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:phantom_messenger/core/waku_daemon.dart';
 
-/// Store v3 contra un REST falso con la forma exacta de go-waku master
-/// (cmd/waku/server/rest/store.go): `GET /store/v3/messages`, respuesta
-/// StoreQueryResponse serializada con encoding/json — campos snake_case,
-/// `[]byte` en base64 estándar, el payload anidado en `message`.
+/// Store v3 contra un REST falso con la forma EXACTA que devolvió el daemon
+/// de go-waku master en el teléfono (capturada con `adb forward` el
+/// 2026-10-26): sobre snake_case con status_code numérico, pero el
+/// WakuMessage anidado en estilo protojson — camelCase y `timestamp` como
+/// STRING. Un fixture con timestamp numérico (el primero que escribí) pasaba
+/// mientras cada consulta real tronaba con "String is not a subtype of num?".
 ///
 /// Motivo: status.prod dejó de montar el store legacy
 /// (/vac/waku/store/2.0.0-beta4) y go-waku v0.9.0 solo habla ese. En campo
@@ -53,8 +55,12 @@ void main() {
             'message_hash': base64Encode(List.filled(32, 1)),
             'message': {
               'payload': base64Encode(payloadA),
-              'content_topic': '/phantom/1/abc/proto',
-              'timestamp': 1700000000000000000,
+              'contentTopic': '/phantom/1/abc/proto',
+              'version': 0,
+              'timestamp': '1700000000000000000',
+              'meta': '',
+              'ephemeral': false,
+              'rateLimitProof': '',
             },
             'pubsub_topic': '/waku/2/rs/16/32',
           },
@@ -62,8 +68,8 @@ void main() {
             'message_hash': base64Encode(List.filled(32, 2)),
             'message': {
               'payload': base64Encode(payloadB),
-              'content_topic': '/phantom/1/abc/proto',
-              'timestamp': 1700000000000000001,
+              'contentTopic': '/phantom/1/abc/proto',
+              'timestamp': '1700000000000000001',
             },
           },
           // Sin data (includeData olvidado o hash-only): se ignora.

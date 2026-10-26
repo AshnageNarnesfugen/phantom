@@ -1,6 +1,7 @@
 @Timeout(Duration(minutes: 3))
 library;
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -113,6 +114,29 @@ void main() {
     hub.returnDelay = null;
     await Future<void>.delayed(const Duration(milliseconds: 300));
     expect(await statusOf(alice, bob.myId, got.id), MessageStatus.delivered);
+  });
+
+  test('un envío lento no retiene los siguientes (ni su burbuja)', () async {
+    // Campo, 2026-10-26: un read receipt del Thor esperó ~6 min la
+    // confirmación de Waku con el lock de envío del contacto tomado; todo lo
+    // escrito después — burbuja incluida — quedó encolado detrás, el
+    // usuario creyó perdido su mensaje, lo reescribió y salieron dos.
+    final warm = nextText(bob);
+    await alice.sendMessage(recipientId: bob.myId, text: 'calentar');
+    await warm;
+    hub.returnDelay =
+        (to) => to == bob.myId ? const Duration(seconds: 6) : null;
+    unawaited(alice.sendReadReceipts(bob.myId, ['x']));
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+
+    final got = nextText(bob, timeout: const Duration(seconds: 3));
+    unawaited(alice.sendMessage(recipientId: bob.myId, text: 'no me esperes'));
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    final mine = await alice.storage.getMessages(bob.myId, limit: 100);
+    expect(mine.map((m) => m.textContent), contains('no me esperes'),
+        reason: 'la burbuja debe aparecer al instante, no tras el envío lento');
+    expect((await got).textContent, 'no me esperes');
+    hub.returnDelay = null;
   });
 
   test('el primer mensaje (INIT) perdido en la red se reenvía y llega',
