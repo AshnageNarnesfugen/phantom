@@ -214,8 +214,30 @@ class _ConversationsScreenState extends State<ConversationsScreen> {
     super.dispose();
   }
 
+  static const _systemChannel = MethodChannel('phantom/system');
+
+  // Back on this, the root screen, sends the app to the background like Home
+  // instead of finishing the activity. Finishing destroys the Flutter engine
+  // and PhantomCore with it — nothing decrypted, no retry, receipt or
+  // notification until the app is reopened, while the foreground service
+  // keeps the daemons up for nobody. Android 16 with predictive back hands an
+  // unclaimed root back to the activity's default handler, which finishes it
+  // (seen on the Nothing, 2026-10-26: CLOSE transition, numActivities=0,
+  // FlutterJNI detached). Claiming it here keeps the decision in our hands.
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop) {
+            unawaited(_systemChannel
+                .invokeMethod<void>('moveTaskToBack')
+                .catchError((_) {}));
+          }
+        },
+        child: _buildScreen(context),
+      );
+
+  Widget _buildScreen(BuildContext context) {
     final t    = PhantomTheme.tokensOf(context);
     final core = CoreProvider.of(context).core;
 
