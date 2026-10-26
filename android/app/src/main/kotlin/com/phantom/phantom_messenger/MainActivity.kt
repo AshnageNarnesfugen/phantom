@@ -22,6 +22,18 @@ import java.io.FileOutputStream
 class MainActivity : FlutterActivity() {
     private var gattServer: PhantomGattServer? = null
 
+    // Back on the root route: go to the background, like Home — what Android
+    // 12+ does for any root launcher activity. Flutter's default finishes the
+    // activity instead, which destroys the engine and PhantomCore with it: no
+    // frame decrypted, no retry or receipt sent, no notification, until the
+    // user reopens the app — while the foreground service keeps the daemons
+    // running for nobody (field, 2026-10-26: a pending handshake retry and an
+    // undelivered first message died exactly this way).
+    override fun popSystemNavigator(): Boolean {
+        moveTaskToBack(true)
+        return true
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Block screenshots and Recents thumbnail for privacy.

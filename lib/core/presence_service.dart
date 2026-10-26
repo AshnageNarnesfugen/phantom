@@ -201,6 +201,11 @@ class PresenceService {
   void _streamContact(String contactId) {
     _presenceStream(contactId).listen(
       (event) {
+        // Our own topic is subscribed only to help the gossipsub mesh form.
+        // Hearing our own heartbeat there used to announce US as a contact
+        // coming online — retrying "their" media downloads and answering
+        // ourselves with yet another heartbeat.
+        if (contactId == _myId) return;
         final wasOnline = isOnline(contactId);
         if (event.online) {
           _lastSeen[contactId] = event.at;
