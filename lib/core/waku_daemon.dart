@@ -679,7 +679,9 @@ class WakuDaemon {
         // actual bound port).
         '--rest-port=$restPort',
         '--key-file=$dataDir/nodekey',
-        '--store-message-db-url=sqlite3://$dataDir/store.db',
+        // Not store.db: the v0.9.0 schema can't be migrated by current
+        // go-waku ("Dirty database version 3" → crash loop on upgrade).
+        '--store-message-db-url=sqlite3://$dataDir/store-v3.db',
         '--cluster-id=16',
         '--pubsub-topic=/waku/2/rs/16/32',
         '--store-message-retention-time=72h',
@@ -793,6 +795,11 @@ class WakuDaemon {
   Future<void> _spawnDirectly(String binary, String dataDir) async {
     final env = Map<String, String>.from(Platform.environment)
       ..['HOME'] = dataDir;
+
+    // See launchArgs: the legacy local DB crash-loops current go-waku.
+    for (final legacy in const ['store.db', 'store.db-shm', 'store.db-wal', 'store.db-journal']) {
+      try { File('$dataDir/$legacy').deleteSync(); } catch (_) {}
+    }
 
     _logBuf.clear();
     _logBuf.writeln('[spawn] binary: $binary');

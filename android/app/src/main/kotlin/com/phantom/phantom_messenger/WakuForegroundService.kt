@@ -326,6 +326,14 @@ class WakuForegroundService : Service() {
         Thread {
             try {
                 Log.i(TAG, "Spawning Waku: $binary (data: $dataDir)")
+                // The v0.9.0 binary's local message DB is a schema the current
+                // go-waku can't migrate ("Dirty database version 3") — the
+                // daemon crash-looped on every phone that upgraded. It is only
+                // this node's own cache (we read the fleet's store), so start
+                // a fresh file and drop the old one. Mirrors WakuDaemon.dart.
+                for (legacy in listOf("store.db", "store.db-shm", "store.db-wal", "store.db-journal")) {
+                    java.io.File(dataDir, legacy).delete()
+                }
 
                 // go-waku CLI: start with relay + store + REST API on random port.
                 // Flag names verified from the daemon's own --help output —
@@ -339,7 +347,7 @@ class WakuForegroundService : Service() {
                     "--rest-address=127.0.0.1",
                     "--rest-port=8645",         // pin so Dart can reach it
                     "--key-file=$dataDir/nodekey",
-                    "--store-message-db-url=sqlite3://$dataDir/store.db",
+                    "--store-message-db-url=sqlite3://$dataDir/store-v3.db",
                     // status.prod fleet: cluster 16, shard 32 (status-go's
                     // 1:1 shard). The old wakuv2.prod fleet (cluster 0,
                     // /waku/2/default-waku/proto) was retired — its nodes
