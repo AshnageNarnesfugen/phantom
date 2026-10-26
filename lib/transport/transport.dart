@@ -1520,6 +1520,60 @@ class I2PTransport implements PhantomTransport {
     maxRetries: 6,
   );
 
+  // ── Deaf-session safety net ─────────────────────────────────────────────
+  // i2pd can keep a SAM session registered after losing its datagram
+  // destination (seen on the Thor after a Doze wake, 2026-10-26: "SAM:
+  // Datagram destination is not set for session …" for every datagram). The
+  // client can't observe that — sends are UDP, the control socket stays up —
+  // so it sent into the void indefinitely. When several reliable sends in a
+  // row go unanswered and nothing at all has come in, replace the session.
+  // Harmless when it's the PEER that is gone: a fresh session with the same
+  // key is the same destination.
+  @visibleForTesting
+  static Duration recycleMinGap = const Duration(minutes: 2);
+  /// A fresh session is legitimately silent while its tunnels build.
+  @visibleForTesting
+  static Duration recycleWarmup = const Duration(minutes: 2);
+  static const _recycleAfterUnanswered = 3;
+  int _unansweredStreak = 0;
+
+  /// Completed when the current SAM session is over — the router hung up,
+  /// or we gave up on it. The maintainer waits on this rather than on
+  /// Socket.done alone, which a local destroy() did not reliably complete:
+  /// the first recycle left the maintainer waiting forever on a dead socket.
+  Completer<void> _sessionEnded = Completer<void>();
+
+  void _endSession() {
+    _ready = false;
+    if (!_sessionEnded.isCompleted) _sessionEnded.complete();
+    _control?.destroy();
+  }
+  int _recycles = 0;
+  DateTime? _lastRecycleAt;
+
+  void _noteAnswered() {
+    _unansweredStreak = 0;
+    _recycles = 0;
+  }
+
+  /// Any inbound datagram resets the streak (see _onUdpEvent): a session
+  /// that hears anything at all is not the deaf one.
+  void _noteUnanswered() {
+    if (++_unansweredStreak < _recycleAfterUnanswered) return;
+    if ((sessionAge ?? Duration.zero) < recycleWarmup) return;
+    final now = DateTime.now();
+    // Back off while the peer stays away: 2, 4, 8 … 32 min.
+    final gap = recycleMinGap * (1 << _recycles.clamp(0, 4));
+    if (_lastRecycleAt != null && now.difference(_lastRecycleAt!) < gap) return;
+    _lastRecycleAt = now;
+    _recycles++;
+    _unansweredStreak = 0;
+    TransportDebugger.instance.log('I2P: reliable sends keep going unanswered '
+        'and nothing comes in — recycling the SAM session '
+        '(router may have lost its datagram destination)');
+    _endSession(); // the maintainer re-creates it under a new id
+  }
+
   /// SAM session identifier. Regenerated on every connection attempt to
   /// avoid DUPLICATED_ID when a previous SESSION CREATE was accepted by
   /// SAM but its reply timed out on our side (cold-start i2pd can take
@@ -1663,12 +1717,14 @@ class I2PTransport implements PhantomTransport {
           'SESSION CREATE STYLE=DATAGRAM ID=$_sessionId DESTINATION=$destArg '
           'PORT=$myUdp HOST=127.0.0.1\n';
       s.add(utf8.encode(createCmd));
-      // Shorter timeout per attempt so a stuck SESSION CREATE doesn't
-      // block the maintainer for 90 s. The maintainer keeps retrying
-      // indefinitely with backoff, so giving each individual attempt 30 s
-      // lets i2pd's bootstrap progress get a fresh chance every minute or
-      // so without piling up zombie sessions.
-      final status = await next(const Duration(seconds: 30));
+      // 90 s. This was cut to 30 s on the theory that retrying sooner piles
+      // up fewer zombie sessions — it is the other way round. A router fresh
+      // from a cold start (power-save restarts it on every resume) can take
+      // longer than 30 s to answer; giving up then abandons a CREATE that
+      // completes anyway, and when its socket closes i2pd tears down the
+      // destination the NEXT session (same key) shares, leaving that one deaf
+      // (the Thor, 2026-10-26). The deaf-session safety net covers the rest.
+      final status = await next(const Duration(seconds: 90));
       if (!status.contains('RESULT=OK')) {
         dbg.log('I2P: SESSION CREATE rejected: $status');
         _consecutiveFailures++;
@@ -1709,11 +1765,11 @@ class I2PTransport implements PhantomTransport {
       // Destroying our end completes done, and the maintainer re-creates it.
       void hangUp() {
         if (!identical(_control, s)) return; // a newer session already
-        _ready = false;
-        s.destroy();
+        _endSession();
       }
       lines.listen((_) {}, onError: (_) => hangUp(), onDone: hangUp);
 
+      _sessionEnded = Completer<void>();
       _ready = true;
       _sessionReadyAt = DateTime.now();
       _consecutiveFailures = 0;
@@ -1760,6 +1816,7 @@ class I2PTransport implements PhantomTransport {
     // Anything arriving at all is proof our tunnels are up, ACKs included —
     // record it before the reliability layer swallows them.
     _lastInboundAt = DateTime.now();
+    _unansweredStreak = 0;
     final delivered = _reliable.onDatagram(
         sourceDest.isEmpty ? '?' : sourceDest, payload);
     if (delivered == null || delivered.isEmpty) return;
@@ -1789,7 +1846,13 @@ class I2PTransport implements PhantomTransport {
     if (!await _ensureSession()) {
       throw const TransportException('I2P session unavailable');
     }
-    await _reliable.sendReliable(dest, data);
+    try {
+      await _reliable.sendReliable(dest, data);
+    } catch (_) {
+      _noteUnanswered();
+      rethrow;
+    }
+    _noteAnswered();
   }
 
   /// Is [dest] answering RIGHT NOW?
@@ -1812,8 +1875,10 @@ class I2PTransport implements PhantomTransport {
     try {
       await _reliable.sendReliable(dest, Uint8List(0),
           every: period, tries: tries);
+      _noteAnswered();
       return true;
     } catch (_) {
+      _noteUnanswered();
       return false;
     }
   }
@@ -1873,8 +1938,9 @@ class I2PTransport implements PhantomTransport {
         await Future.delayed(const Duration(seconds: 5));
         continue;
       }
+      final ended = _sessionEnded.future;
       try {
-        await ctrl.done;
+        await Future.any([ctrl.done, ended]);
       } catch (_) {}
       if (!_disposed) {
         TransportDebugger.instance.log('I2P: control socket closed — reconnecting');

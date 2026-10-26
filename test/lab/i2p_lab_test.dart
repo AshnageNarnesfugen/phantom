@@ -183,6 +183,41 @@ void main() {
     expect((await bobGets).textContent, 'after the restart');
   });
 
+  test('a session the router quietly lost is recycled — not kept forever',
+      () async {
+    // Field, 2026-10-26 (Thor): after the phone woke up, i2pd kept the SAM
+    // session registered but had dropped its datagram destination — "SAM:
+    // Datagram destination is not set for session …" on every datagram. The
+    // client can't see that (it's UDP), so it sent into the void and the
+    // secret chat said "not answering" on BOTH phones indefinitely.
+    I2PTransport.recycleMinGap = const Duration(seconds: 1);
+    I2PTransport.recycleWarmup = Duration.zero;
+    addTearDown(() {
+      I2PTransport.recycleMinGap = const Duration(minutes: 2);
+      I2PTransport.recycleWarmup = const Duration(minutes: 2);
+    });
+    await introduce();
+    final bobId = await _idOf(bob);
+    bridge.wedgeSessionsOf(i2pOf(alice).myDestination!);
+
+    final deadline = DateTime.now().add(const Duration(seconds: 60));
+    var verdict = SecretPathStatus.peerUnreachable;
+    while (verdict != SecretPathStatus.ready) {
+      if (DateTime.now().isAfter(deadline)) {
+        fail('still unanswered after 60 s — the deaf session was never '
+            'replaced (${bridge.wedgedDrops} datagrams swallowed)');
+      }
+      verdict = await alice.probeSecretChannel(bobId,
+          timeout: const Duration(seconds: 3));
+      // i2pNotReady comes back synchronously while the session is being
+      // replaced; without a real pause this loop would starve the timers
+      // the maintainer reconnects on. (The chat screen probes every 30 s.)
+      await Future.delayed(const Duration(milliseconds: 200));
+    }
+    expect(bridge.wedgedDrops, greaterThan(0),
+        reason: 'the wedge must actually have bitten first');
+  });
+
   test('secret chat: delivered live, I2P-only, filed under its own history',
       () async {
     await introduce();

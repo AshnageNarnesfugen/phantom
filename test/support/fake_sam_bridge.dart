@@ -56,6 +56,13 @@ class FakeSamBridge {
   RawDatagramSocket? _udp;
 
   final Map<String, _SamSession> _byId = {};
+
+  /// Session ids the router has lost the datagram destination of — see
+  /// [wedgeSessionsOf].
+  final Set<String> _wedged = {};
+
+  /// Datagrams swallowed by a wedged session, in either direction.
+  int wedgedDrops = 0;
   final Map<String, _SamSession> _byDest = {};
   final List<Socket> _clients = [];
 
@@ -121,6 +128,18 @@ class FakeSamBridge {
     _clients.clear();
     _byId.clear();
     _byDest.clear();
+    _wedged.clear();
+  }
+
+  /// The current session(s) holding [dest] go deaf in both directions while
+  /// staying registered: what i2pd did on the Thor (2026-10-26), logging
+  /// "SAM: Datagram destination is not set for session …" for every datagram
+  /// while the session looked perfectly alive to the client. Only a NEW
+  /// session (a fresh SESSION CREATE) works again.
+  void wedgeSessionsOf(String dest) {
+    for (final e in _byId.entries) {
+      if (e.value.dest == dest) _wedged.add(e.key);
+    }
   }
 
   /// The public destination the session named [sessionIdPrefix] ended up with.
@@ -229,6 +248,10 @@ class FakeSamBridge {
       droppedSends.add('<unknown session $sessionId>');
       return;
     }
+    if (_wedged.contains(sessionId)) {
+      wedgedDrops++;
+      return;
+    }
 
     // A tolerant bridge parses trailing options; a strict one treats the whole
     // remainder as the destination. Either way the destination itself must be
@@ -250,6 +273,10 @@ class FakeSamBridge {
     required _SamSession to,
     required Uint8List payload,
   }) {
+    if (_wedged.contains(to.id)) {
+      wedgedDrops++;
+      return;
+    }
     if (lossRate > 0 && _rng.nextDouble() < lossRate) {
       lostCount++;
       return;
