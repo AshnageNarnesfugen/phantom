@@ -32,12 +32,21 @@ JNILIBS_DIR="${1:-$(pwd)/android/app/src/main/jniLibs}"
 # "compiled OK yet NOT bundled" symptom we hit).
 mkdir -p "$JNILIBS_DIR"
 JNILIBS_DIR="$(cd "$JNILIBS_DIR" && pwd)"
-WAKU_VERSION="${WAKU_VERSION:-v0.9.0}"
+# Pinned master commit, NOT the v0.9.0 release. v0.9.0 (2023) only speaks the
+# legacy store protocol /vac/waku/store/2.0.0-beta4, which status.prod no
+# longer mounts: every query answers "protocols not supported", so the offline
+# mailbox is gone AND every publish fails its store confirmation (field,
+# 2026-10-26). Master serves store v3 at GET /store/v3/messages; the Dart
+# client tries v3 first and falls back to v1, so either binary still runs.
+WAKU_VERSION="${WAKU_VERSION:-b0ddae443a58443fb634982d578055cb5c27af77}"
+# Built instead when the pinned commit fails to compile, so a broken upstream
+# costs store v3, not the whole Waku transport.
+WAKU_FALLBACK_VERSION="${WAKU_FALLBACK_VERSION:-v0.9.0}"
 WORKDIR="${WORKDIR:-/tmp/gowaku-build}"
 ANDROID_TARGET="${ANDROID_TARGET:-23}"
 
 echo "▶ jniLibs dir:        $JNILIBS_DIR"
-echo "▶ go-waku version:    $WAKU_VERSION"
+echo "▶ go-waku version:    $WAKU_VERSION (fallback $WAKU_FALLBACK_VERSION)"
 echo "▶ android target API: $ANDROID_TARGET"
 echo "▶ workdir:            $WORKDIR"
 
@@ -57,31 +66,21 @@ if [ -z "$ANDROID_NDK_HOME" ]; then
 fi
 echo "▶ NDK: $ANDROID_NDK_HOME"
 
-# 2. Pin a Go 1.20 toolchain just for this build.
-#    go-waku v0.9.0 fixes quic-go v0.36.4, which has a hard build guard
-#    refusing Go >= 1.21 (internal/qtls/go121.go). The workflow's Go 1.22
-#    (needed by kubo/yggdrasil) therefore can't compile go-waku. Fetch a
-#    private Go 1.20 here and leave the rest of CI untouched.
-GO_PIN="${GO_PIN:-1.20.14}"
-GO_ROOT="/tmp/go-${GO_PIN}"
-GO_BIN="$GO_ROOT/bin/go"
-if [ ! -x "$GO_BIN" ]; then
-  echo "▶ fetching Go $GO_PIN toolchain for the go-waku build…"
-  curl -fsSL "https://go.dev/dl/go${GO_PIN}.linux-amd64.tar.gz" -o /tmp/go-pin.tgz
-  rm -rf "$GO_ROOT" && mkdir -p "$GO_ROOT"
-  tar -C "$GO_ROOT" --strip-components=1 -xzf /tmp/go-pin.tgz
-fi
-export GOROOT="$GO_ROOT"
-echo "▶ go-waku toolchain: $("$GO_BIN" version)"
+# 2. A private Go toolchain per go-waku version, leaving the rest of CI on
+#    its own Go. v0.9.0 pins quic-go v0.36.4, whose build guard refuses
+#    Go >= 1.21; master needs Go 1.23.
+fetch_go() {
+  local pin="$1" root="/tmp/go-$1"
+  if [ ! -x "$root/bin/go" ]; then
+    echo "▶ fetching Go $pin toolchain for the go-waku build…" >&2
+    curl -fsSL "https://go.dev/dl/go${pin}.linux-amd64.tar.gz" -o "/tmp/go-pin-$pin.tgz" || return 1
+    rm -rf "$root" && mkdir -p "$root"
+    tar -C "$root" --strip-components=1 -xzf "/tmp/go-pin-$pin.tgz" || return 1
+  fi
+  echo "$root/bin/go"
+}
 
-# 3. Clone go-waku (shallow).
-rm -rf "$WORKDIR"
-git clone --depth=1 --branch "$WAKU_VERSION" \
-  https://github.com/waku-org/go-waku.git "$WORKDIR"
-cd "$WORKDIR"
-"$GO_BIN" mod download
-
-# 4. Cross-compile cmd/waku as a PIE executable for each target ABI.
+# 3. Cross-compile cmd/waku as a PIE executable for each target ABI.
 #  - gowaku_no_rln: skip RLN (on-chain rate-limit nullifiers) — a private
 #    messenger doesn't need zkSNARK spam protection, and RLN drags in zerokit
 #    (Rust) which complicates the cross-build enormously.
@@ -108,10 +107,31 @@ build_for_abi() {
       -tags="gowaku_no_rln" \
       -ldflags="-s -w" \
       -o "$out_so" \
-      ./cmd/waku
+      ./cmd/waku || return 1
   echo "✓ wrote $out_so ($(du -h "$out_so" | cut -f1))"
   file "$out_so" || true
 }
 
-build_for_abi arm64-v8a arm64 aarch64-linux-android
-build_for_abi x86_64    amd64 x86_64-linux-android
+# 4. Fetch one exact go-waku revision (tag or commit SHA) and build both ABIs.
+#    Every step returns explicitly: `set -e` does not apply inside the `if`
+#    that decides whether to fall back.
+build_version() {
+  local version="$1" go_pin="$2"
+  GO_BIN=$(fetch_go "$go_pin") || return 1
+  export GOROOT="${GO_BIN%/bin/go}"
+  export GOTOOLCHAIN=local
+  echo "▶ go-waku $version with $("$GO_BIN" version)"
+  rm -rf "$WORKDIR" && git init -q "$WORKDIR" || return 1
+  cd "$WORKDIR" || return 1
+  git fetch -q --depth=1 https://github.com/waku-org/go-waku.git "$version" || return 1
+  git checkout -q FETCH_HEAD || return 1
+  "$GO_BIN" mod download || return 1
+  build_for_abi arm64-v8a arm64 aarch64-linux-android || return 1
+  build_for_abi x86_64    amd64 x86_64-linux-android || return 1
+}
+
+if ! build_version "$WAKU_VERSION" "${GO_PIN:-1.23.11}"; then
+  echo "⚠ go-waku $WAKU_VERSION failed to build — falling back to $WAKU_FALLBACK_VERSION (legacy store only)"
+  rm -f "$JNILIBS_DIR"/*/libgowaku.so
+  build_version "$WAKU_FALLBACK_VERSION" "${GO_PIN_FALLBACK:-1.20.14}"
+fi

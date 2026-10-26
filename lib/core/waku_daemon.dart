@@ -382,9 +382,13 @@ class WakuDaemon {
   /// is offline, the Status fleet's store nodes persist the message (≤25GB
   /// total, ~days in practice), and Alice's app on next launch fetches it.
   ///
-  /// Uses legacy /store/v1/messages — go-waku auto-selects a connected store
-  /// peer (no need to pass peerAddr like v3 requires), as long as DNS
-  /// discovery has populated our peer store with store-capable nodes.
+  /// Store v3 first, legacy v1 as fallback. status.prod dropped the legacy
+  /// protocol (/vac/waku/store/2.0.0-beta4): against it v1 answers HTTP 500
+  /// "protocols not supported" on every query (field, 2026-10-26), which took
+  /// down the offline mailbox AND every publish's store confirmation. A
+  /// daemon built from go-waku master serves v3 at /store/v3/messages; the
+  /// v0.9.0 release doesn't have the route (404), and then v1 is all there is.
+  ///
   /// Returns null on failure (daemon unreachable, no store peers yet, HTTP
   /// error) so the caller can retry later WITHOUT advancing its cursor — a
   /// failed query is not the same as "no offline messages".
@@ -400,6 +404,108 @@ class WakuDaemon {
     DateTime? startTime,
     int pageSize = 100,
     String pubsubTopic = defaultPubsubTopic,
+  }) async {
+    if (_storeV3Route != false) {
+      final v3 = await _storeQueryV3(
+        contentTopic: contentTopic,
+        startTime: startTime,
+        pageSize: pageSize,
+        pubsubTopic: pubsubTopic,
+      );
+      if (!v3.routeMissing) return v3.messages;
+      _storeV3Route = false;
+      TransportDebugger.instance
+          .log('Waku: daemon has no store v3 route — using legacy store v1');
+    }
+    return _storeQueryV1(
+      contentTopic: contentTopic,
+      startTime: startTime,
+      pageSize: pageSize,
+      pubsubTopic: pubsubTopic,
+    );
+  }
+
+  /// Whether the running daemon serves /store/v3/messages. Null until a query
+  /// finds out; reset when the daemon is restarted (it may be a new binary).
+  bool? _storeV3Route;
+
+  /// Which pinned store node the next v3 query names. v3 lets us dial a node
+  /// directly instead of trusting the peer manager to have one tagged with
+  /// the right protocol (its "no suitable peers found" was the v1 failure);
+  /// on a failed query we move to the next region.
+  int _storeNodeIdx = 0;
+
+  Future<({bool routeMissing, List<({Uint8List payload, int timestampNs})>? messages})>
+      _storeQueryV3({
+    required String contentTopic,
+    DateTime? startTime,
+    required int pageSize,
+    required String pubsubTopic,
+  }) async {
+    final dbg = TransportDebugger.instance;
+    final peer = pinnedStoreNodes[_storeNodeIdx % pinnedStoreNodes.length];
+    try {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+      final params = <String, String>{
+        'peerAddr': peer,
+        'pubsubTopic': pubsubTopic,
+        'contentTopics': contentTopic,
+        // Without it v3 returns only message hashes.
+        'includeData': 'true',
+        'pageSize': '$pageSize',
+        'ascending': 'true',
+        if (startTime != null)
+          'startTime': '${startTime.microsecondsSinceEpoch * 1000}',
+      };
+      final uri = Uri.parse('$apiUrl/store/v3/messages')
+          .replace(queryParameters: params);
+      final req = await client.getUrl(uri);
+      final resp = await req.close();
+      final body = await resp.transform(utf8.decoder).join();
+      client.close(force: true);
+
+      // The router's own 404 is plain text; a v3 error is a JSON body.
+      if (resp.statusCode == 404 && !body.trimLeft().startsWith('{')) {
+        return (routeMissing: true, messages: null);
+      }
+      _storeV3Route = true;
+      final json = resp.statusCode == 200 || body.trimLeft().startsWith('{')
+          ? jsonDecode(body) as Map<String, dynamic>
+          : const <String, dynamic>{};
+      final code = (json['status_code'] as num?)?.toInt() ?? resp.statusCode;
+      if (resp.statusCode != 200 || code != 200) {
+        final desc = json['status_desc'] ?? json['error_message'] ?? body;
+        final preview = '$desc'.length > 200 ? '${'$desc'.substring(0, 200)}…' : '$desc';
+        dbg.log('Waku: store v3 HTTP ${resp.statusCode}/$code via '
+            '${peer.split('/p2p/').last.substring(0, 12)}… "$preview"');
+        _storeNodeIdx++;
+        return (routeMissing: false, messages: null);
+      }
+      final out = <({Uint8List payload, int timestampNs})>[];
+      for (final kv in (json['messages'] as List<dynamic>? ?? const [])) {
+        if (kv is! Map) continue;
+        final m = kv['message'];
+        if (m is! Map) continue;
+        final p = m['payload'] as String?;
+        if (p == null || p.isEmpty) continue;
+        out.add((
+          payload: base64Decode(p),
+          timestampNs: (m['timestamp'] as num?)?.toInt() ?? 0,
+        ));
+      }
+      return (routeMissing: false, messages: out);
+    } catch (e) {
+      dbg.log('Waku: store v3 exception $e');
+      _storeNodeIdx++;
+      return (routeMissing: false, messages: null);
+    }
+  }
+
+  Future<List<({Uint8List payload, int timestampNs})>?> _storeQueryV1({
+    required String contentTopic,
+    DateTime? startTime,
+    required int pageSize,
+    required String pubsubTopic,
   }) async {
     final dbg = TransportDebugger.instance;
     try {
@@ -630,6 +736,7 @@ class WakuDaemon {
     try {
       debugPrint('[WakuDaemon] restarting daemon');
       await stop();
+      _storeV3Route = null;
       // Let the OS release the REST port and the old process fully exit before
       // the new daemon tries to bind — a back-to-back stop/start races the
       // port and the new bind can fail.
@@ -666,6 +773,7 @@ class WakuDaemon {
           'multiaddr': node,
           'shards': [32],
           'protocols': [
+            '/vac/waku/store-query/3.0.0',
             '/vac/waku/store/2.0.0-beta4',
             '/vac/waku/lightpush/2.0.0-beta1',
           ],
