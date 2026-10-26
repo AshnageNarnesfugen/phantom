@@ -219,7 +219,8 @@ class PhantomCore {
   // Auto-retry schedules a fresh INIT with exponential backoff until the
   // session's pendingX3dhEphemeralKey flips to null (which only happens
   // when the DH ratchet fires — i.e. the ack landed and we decrypted it).
-  static const _handshakeRetryBase = Duration(seconds: 60);
+  @visibleForTesting
+  static Duration handshakeRetryBase = const Duration(seconds: 60);
   static const _handshakeRetryCap  = Duration(minutes: 8);
   final Map<String, Timer> _handshakeRetryTimers = {};
   final Map<String, int>   _handshakeRetryAttempts = {};
@@ -245,11 +246,8 @@ class PhantomCore {
     _handshakeRetryTimers[contactId]?.cancel();
     final attempt = (_handshakeRetryAttempts[contactId] ?? 0) + 1;
     _handshakeRetryAttempts[contactId] = attempt;
-    final shift = (attempt - 1).clamp(0, 6);
-    final delaySecs =
-        (_handshakeRetryBase.inSeconds * (1 << shift)).clamp(
-            _handshakeRetryBase.inSeconds, _handshakeRetryCap.inSeconds);
-    _handshakeRetryTimers[contactId] = Timer(Duration(seconds: delaySecs), () {
+    _handshakeRetryTimers[contactId] = Timer(
+        _backoff(handshakeRetryBase, _handshakeRetryCap, attempt), () {
       unawaited(_runHandshakeRetry(contactId));
     });
     if (!_handshakeStateController.isClosed) {
@@ -302,6 +300,221 @@ class PhantomCore {
     _handshakeRetryAttempts.remove(contactId);
     if (!_handshakeStateController.isClosed) {
       _handshakeStateController.add(contactId);
+    }
+  }
+
+  /// `base · 2^(attempt-1)`, capped. [attempt] is 1-based.
+  static Duration _backoff(Duration base, Duration cap, int attempt) {
+    final baseMs = base.inMilliseconds;
+    final capMs  = cap.inMilliseconds < baseMs ? baseMs : cap.inMilliseconds;
+    final ms = baseMs * (1 << (attempt - 1).clamp(0, 10));
+    return Duration(milliseconds: ms > capMs ? capMs : ms);
+  }
+
+  /// The peer is still wrapping its frames as INIT with an ephemeral key we
+  /// already answered: it never saw our handshakeAck. Its auto-retry keeps
+  /// nudging, but before this nothing on our side answered a known-EK INIT,
+  /// so a single lost ack left the peer on "waiting for first response"
+  /// until we happened to type something. Throttled so a burst of its
+  /// queued frames costs one ack, not one each.
+  final Map<String, DateTime> _lastReAckAt = {};
+
+  void _reAckHandshake(String contactId) {
+    final now  = DateTime.now();
+    final last = _lastReAckAt[contactId];
+    if (last != null && now.difference(last) < handshakeRetryBase ~/ 2) return;
+    _lastReAckAt[contactId] = now;
+    TransportDebugger.instance.log('HANDSHAKE: ${contactId.substring(0, 8)} '
+        'still sends our answered INIT key — re-acking (their ack was lost)');
+    unawaited(_sendPhantomMessage(
+      recipientId: contactId,
+      message: PhantomMessage(type: MessageType.handshakeAck, content: Uint8List(0)),
+    ).then((_) {}, onError: (_) {}));
+  }
+
+  // ── Delivery receipts: re-send until the peer confirms ────────────────────
+  // "Sent" only ever meant a transport accepted the frame: an I2P datagram
+  // the local SAM bridge took, an IPFS publish into a topic with no mesh
+  // peers, a Waku relay 200 before the GRAFT. None of that says the peer got
+  // it, and nothing retried — a message lost in transit stayed ✓ forever.
+  // Field, 2026-10-26: the first message of a new chat vanished while the
+  // handshake itself completed (a later frame with the same EK carried it).
+  // The receiver now acknowledges every chat message it stores, and the
+  // sender re-sends until that acknowledgement arrives.
+  //
+  // A re-send RE-ENCRYPTS the same message (same id) as a fresh ratchet frame
+  // instead of replaying the old bytes: a replayed frame whose key the
+  // receiver already consumed is undecryptable, and an undecryptable live
+  // frame is exactly what trips auto-revive and resets a healthy session.
+  // Messages are keyed by id on the receiving side, so a copy of something it
+  // already holds is acknowledged again and otherwise ignored.
+  //
+  // The acknowledgement rides readReceipt with a marker first line: a build
+  // that predates it marks the ids read, where an unknown type would fail to
+  // decode — which counts as a decrypt failure and can trigger auto-revive.
+  static const deliveredReceiptMarker = '@delivered';
+  static const _deliveryTrackedTypes = {MessageType.text, MessageType.linkPreview};
+  static const _receiptTypes = {
+    MessageType.text, MessageType.linkPreview, MessageType.image, MessageType.file,
+  };
+  @visibleForTesting
+  static Duration deliveryRetryBase = const Duration(seconds: 20);
+  static const _deliveryRetryCap = Duration(minutes: 15);
+  // 20s·2^n capped at 15 min: ~2.3 h of trying before the bubble turns red.
+  static const _deliveryMaxAttempts = 14;
+  static const _pendingDeliverySetting = 'pending_delivery_v1';
+
+  /// contactId → ids of our messages it hasn't confirmed. Persisted, so a
+  /// process restart (Android reclaiming the app, the user swiping it away)
+  /// resumes the re-sends instead of forgetting them.
+  final Map<String, Set<String>> _pendingDeliveries = {};
+  final Map<String, Timer> _deliveryRetryTimers = {}; // '<contact>|<msgId>'
+  final Map<String, int> _deliveryAttempts = {};
+  final Map<String, Set<String>> _queuedReceipts = {};
+  final Map<String, Timer> _receiptFlushTimers = {};
+
+  void _trackPendingDelivery(String contactId, String msgId) {
+    if (_disposed) return;
+    (_pendingDeliveries[contactId] ??= <String>{}).add(msgId);
+    unawaited(_persistPendingDeliveries());
+    _scheduleDeliveryRetry(contactId, msgId);
+  }
+
+  void _clearPendingDelivery(String contactId, String msgId) {
+    final key = '$contactId|$msgId';
+    _deliveryRetryTimers.remove(key)?.cancel();
+    _deliveryAttempts.remove(key);
+    final ids = _pendingDeliveries[contactId];
+    if (ids == null || !ids.remove(msgId)) return;
+    if (ids.isEmpty) _pendingDeliveries.remove(contactId);
+    unawaited(_persistPendingDeliveries());
+  }
+
+  Future<void> _persistPendingDeliveries() async {
+    if (_disposed) return;
+    try {
+      await storage.setSetting(_pendingDeliverySetting, {
+        for (final e in _pendingDeliveries.entries) e.key: e.value.toList(),
+      });
+    } catch (_) {}
+  }
+
+  void _scheduleDeliveryRetry(String contactId, String msgId,
+      {Duration? after}) {
+    if (_disposed) return;
+    final key = '$contactId|$msgId';
+    _deliveryRetryTimers[key]?.cancel();
+    final attempt = (_deliveryAttempts[key] ?? 0) + 1;
+    _deliveryAttempts[key] = attempt;
+    _deliveryRetryTimers[key] = Timer(
+        after ?? _backoff(deliveryRetryBase, _deliveryRetryCap, attempt),
+        () => unawaited(_runDeliveryRetry(contactId, msgId)));
+  }
+
+  Future<void> _runDeliveryRetry(String contactId, String msgId) async {
+    if (_disposed) return;
+    final key = '$contactId|$msgId';
+    _deliveryRetryTimers.remove(key);
+    final msg = await storage.getMessage(contactId, msgId);
+    if (msg == null ||
+        msg.status == MessageStatus.delivered ||
+        msg.status == MessageStatus.read) {
+      _clearPendingDelivery(contactId, msgId);
+      return;
+    }
+    final dbg = TransportDebugger.instance;
+    final attempt = _deliveryAttempts[key] ?? 1;
+    if (attempt > _deliveryMaxAttempts) {
+      dbg.log('DELIVERY: ✗ ${msgId.substring(0, 8)} → '
+          '${contactId.substring(0, 8)} never confirmed — giving up');
+      _clearPendingDelivery(contactId, msgId);
+      await storage.updateMessageStatus(contactId, msgId, MessageStatus.failed);
+      notifyContactChanged(contactId);
+      return;
+    }
+    dbg.log('DELIVERY: re-send #$attempt of ${msgId.substring(0, 8)} → '
+        '${contactId.substring(0, 8)} (no receipt yet)');
+    try {
+      final r = await _sendPhantomMessage(
+        recipientId: contactId,
+        message: PhantomMessage(
+          id: msg.id,
+          type: msg.type,
+          content: msg.content,
+          replyToId: msg.replyToId,
+          timestampUs: msg.timestampUs,
+        ),
+        resend: true,
+      );
+      // A message whose first send failed outright is red in the chat; once
+      // a re-send leaves the device it is merely unconfirmed again.
+      if (msg.status == MessageStatus.failed &&
+          r.status != MessageStatus.failed) {
+        await storage.updateMessageStatus(contactId, msgId, r.status);
+        notifyContactChanged(contactId);
+      }
+    } catch (e) {
+      dbg.log('DELIVERY: re-send of ${msgId.substring(0, 8)} failed: $e');
+    }
+    if (_pendingDeliveries[contactId]?.contains(msgId) ?? false) {
+      _scheduleDeliveryRetry(contactId, msgId);
+    }
+  }
+
+  /// The contact just showed up: whatever it hasn't confirmed has its best
+  /// chance now, not at the end of a 15-minute backoff.
+  void _kickDeliveryRetries(String contactId) {
+    final ids = _pendingDeliveries[contactId];
+    if (ids == null) return;
+    for (final id in ids.toList()) {
+      final key = '$contactId|$id';
+      _deliveryRetryTimers.remove(key)?.cancel();
+      _deliveryRetryTimers[key] = Timer(const Duration(seconds: 2),
+          () => unawaited(_runDeliveryRetry(contactId, id)));
+    }
+  }
+
+  /// Batches acknowledgements so a backlog drained from the store costs one
+  /// receipt per contact, not one per message.
+  void _queueDeliveryReceipt(String contactId, String msgId) {
+    (_queuedReceipts[contactId] ??= <String>{}).add(msgId);
+    _receiptFlushTimers[contactId] ??=
+        Timer(const Duration(milliseconds: 800), () {
+      _receiptFlushTimers.remove(contactId);
+      final ids = _queuedReceipts.remove(contactId);
+      if (ids == null || ids.isEmpty || _disposed) return;
+      unawaited(_sendPhantomMessage(
+        recipientId: contactId,
+        message: PhantomMessage(
+          type: MessageType.readReceipt,
+          content: Uint8List.fromList(
+              utf8.encode([deliveredReceiptMarker, ...ids].join('\n'))),
+        ),
+      ).then((_) {}, onError: (_) {}));
+    });
+  }
+
+  /// Work the previous process left in flight, whose timers died with it.
+  Future<void> _resumePendingWork() async {
+    for (final e in _sessions.entries) {
+      if (e.value.pendingX3dhEphemeralKey != null) {
+        _scheduleHandshakeRetry(e.key);
+      }
+    }
+    final saved = await storage.getSetting<Map>(_pendingDeliverySetting);
+    if (saved == null) return;
+    for (final e in saved.entries) {
+      final ids = (e.value as List).map((v) => v.toString()).toSet();
+      if (ids.isEmpty) continue;
+      _pendingDeliveries[e.key.toString()] = ids;
+      for (final id in ids) {
+        _scheduleDeliveryRetry(e.key.toString(), id);
+      }
+    }
+    if (_pendingDeliveries.isNotEmpty) {
+      TransportDebugger.instance.log('DELIVERY: resuming '
+          '${_pendingDeliveries.values.fold<int>(0, (n, s) => n + s.length)} '
+          'unconfirmed message(s) from the previous run');
     }
   }
 
@@ -423,6 +636,7 @@ class PhantomCore {
 
     await core._startTransport();
     if (enablePresence) await core._startPresence();
+    await core._resumePendingWork();
     return core;
   }
 
@@ -1413,14 +1627,24 @@ class PhantomCore {
   /// the receiver can only partially decrypt.
   final Map<String, _SerialLock> _sendLocks = {};
 
+  /// [resend] re-encrypts a message already in the chat (same id) for the
+  /// delivery-receipt retry: no new bubble, and the stored status is left to
+  /// the receipt that will (eventually) confirm it.
   Future<StoredMessage> _sendPhantomMessage({
     required String recipientId,
     required PhantomMessage message,
     bool secret = false,
-  }) {
+    bool resend = false,
+  }) async {
     final lock = _sendLocks.putIfAbsent(recipientId, () => _SerialLock());
-    return lock.guard(() => _sendPhantomMessageInner(
-        recipientId: recipientId, message: message, secret: secret));
+    final sent = await lock.guard(() => _sendPhantomMessageInner(
+        recipientId: recipientId, message: message, secret: secret,
+        resend: resend));
+    // Secret chats confirm per frame over I2P's own ACK layer.
+    if (!resend && !secret && _deliveryTrackedTypes.contains(message.type)) {
+      _trackPendingDelivery(recipientId, message.id);
+    }
+    return sent;
   }
 
   /// Ratchet-mutating phase of a send: encrypt, wrap (INIT on first message)
@@ -1504,6 +1728,7 @@ class PhantomCore {
     required String recipientId,
     required PhantomMessage message,
     bool secret = false,
+    bool resend = false,
   }) async {
     // Queued (unawaited) sends may reach here after dispose(); writing to
     // storage at that point races teardown. No-op instead of throwing — the
@@ -1557,8 +1782,11 @@ class PhantomCore {
       // manifest (image/file type) is the visible bubble, not each slice.
       MessageType.mediaChunk,
     };
-    if (!systemTypes.contains(message.type)) {
+    if (!resend && !systemTypes.contains(message.type)) {
       await storage.saveMessage(stored);
+    }
+    Future<void> setStatus(MessageStatus s) async {
+      if (!resend) await storage.updateMessageStatus(recipientId, message.id, s);
     }
 
     // Classify the outbound frame so the transport layer can pick the right
@@ -1603,7 +1831,7 @@ class PhantomCore {
               : result.queued
                   ? MessageStatus.sending
                   : MessageStatus.sent;
-          await storage.updateMessageStatus(recipientId, message.id, status);
+          await setStatus(status);
 
           if (isHandshake && accepted &&
               message.type != MessageType.connectivityInfo &&
@@ -1627,7 +1855,7 @@ class PhantomCore {
             priority:    priority,
             secret:      secret,
           );
-          await storage.updateMessageStatus(recipientId, message.id, MessageStatus.sent);
+          await setStatus(MessageStatus.sent);
 
           if (isHandshake &&
               message.type != MessageType.connectivityInfo &&
@@ -1642,12 +1870,12 @@ class PhantomCore {
 
           return stored.copyWith(status: MessageStatus.sent);
         } else {
-          await storage.updateMessageStatus(recipientId, message.id, MessageStatus.failed);
+          await setStatus(MessageStatus.failed);
           return stored.copyWith(status: MessageStatus.failed);
         }
       } catch (e) {
         final dbg = TransportDebugger.instance;
-        if (isHandshake && attempt < maxAttempts) {
+        if (isHandshake && attempt < maxAttempts && !_disposed) {
           final delaySecs = 3 * attempt; // 3s, 6s, 9s
           dbg.log('MSG: handshake attempt $attempt/$maxAttempts failed, retrying in ${delaySecs}s…');
           await Future.delayed(Duration(seconds: delaySecs));
@@ -1658,7 +1886,7 @@ class PhantomCore {
     }
 
     // All attempts exhausted
-    await storage.updateMessageStatus(recipientId, message.id, MessageStatus.failed);
+    await setStatus(MessageStatus.failed);
     return stored.copyWith(status: MessageStatus.failed);
   }
 
@@ -2579,6 +2807,7 @@ class PhantomCore {
             'MEDIA: ${contactId.substring(0, contactId.length.clamp(0, 8))} '
             'came online — retrying any pending downloads');
         unawaited(resolvePendingMedia(contactId));
+        _kickDeliveryRetries(contactId);
       }
     });
   }
@@ -3147,6 +3376,9 @@ class PhantomCore {
       dbg.log(ok
           ? 'MSG: known-EK INIT payload decrypted via existing session'
           : 'MSG: replay (known EK) — dropping duplicate');
+      // A fresh frame still carrying the EK means the sender hasn't seen a
+      // single reply from us. A store replay is history and says nothing.
+      if (ok && !fromStore) _reAckHandshake(senderPhantomId);
       return;
     }
 
@@ -3341,8 +3573,14 @@ class PhantomCore {
       await _learnI2pDestFromIncoming(senderPhantomId, i2pSourceDest);
     }
 
-    await _dispatchIncoming(message, senderPhantomId);
-    dbg.log('MSG: ✓ dispatched to UI');
+    // The session is already established and saved; a failing handler must
+    // not skip the ack below and leave the sender waiting on us.
+    try {
+      await _dispatchIncoming(message, senderPhantomId);
+      dbg.log('MSG: ✓ dispatched to UI');
+    } catch (e) {
+      dbg.log('MSG: ✗ ${message.type.name} handler failed: $e');
+    }
 
     // If we burned an OPK on this INIT, retire it locally and push a fresh
     // batch back so the contact has material for the next session.
@@ -3468,25 +3706,10 @@ class PhantomCore {
       // secret state from being serialized to hex on every probe.
       final nativeBacked = entry.value.isNativeBacked;
       final snapshot = nativeBacked ? null : entry.value.takeSnapshot();
+      final PhantomMessage message;
       try {
-        final protocol = PhantomProtocol(entry.value);
-        final message  = await protocol.decode(frame.payload);
-
-        await _saveSession(entry.key, entry.value);
-        await _dispatchIncoming(message, entry.key);
-        dbg.log('MSG: ✓ MSG decrypted via session ${entry.key.substring(0, 8)}');
-        // Implicit presence: a live frame that decrypts is direct proof the
-        // contact is online right now. Store replays are historical and say
-        // nothing about the present, so they don't count.
-        if (!fromStore) _presence?.noteActivity(entry.key);
-        _lastSuccessfulDecryptAt[entry.key] = DateTime.now();
-        _autoReviveStreak.remove(entry.key);
-        _cancelHandshakeRetry(entry.key);
-        if (i2pSourceDest != null) {
-          await _learnI2pDestFromIncoming(entry.key, i2pSourceDest);
-        }
-        return true;
-      } catch (e) {
+        message = await PhantomProtocol(entry.value).decode(frame.payload);
+      } catch (_) {
         // Native-backed sessions weren't mutated (atomic decrypt) and have no
         // snapshot to restore; Dart-backed ones roll back to the pre-attempt state.
         if (snapshot != null) {
@@ -3494,6 +3717,31 @@ class PhantomCore {
         }
         continue;
       }
+
+      // Decrypted: the ratchet has moved, so it is persisted no matter what
+      // the handler does next. Handler errors used to share the decrypt's
+      // try — a throwing handler (addRemoteOpk on an unmodifiable list, for
+      // every preKeyShare) rolled the session back, logged the frame as an
+      // undecryptable replay, and on the MSG path counted as ratchet desync
+      // that can auto-revive a healthy session.
+      await _saveSession(entry.key, entry.value);
+      dbg.log('MSG: ✓ MSG decrypted via session ${entry.key.substring(0, 8)}');
+      try {
+        await _dispatchIncoming(message, entry.key);
+      } catch (e) {
+        dbg.log('MSG: ✗ ${message.type.name} handler failed: $e');
+      }
+      // Implicit presence: a live frame that decrypts is direct proof the
+      // contact is online right now. Store replays are historical and say
+      // nothing about the present, so they don't count.
+      if (!fromStore) _presence?.noteActivity(entry.key);
+      _lastSuccessfulDecryptAt[entry.key] = DateTime.now();
+      _autoReviveStreak.remove(entry.key);
+      _cancelHandshakeRetry(entry.key);
+      if (i2pSourceDest != null) {
+        await _learnI2pDestFromIncoming(entry.key, i2pSourceDest);
+      }
+      return true;
     }
     return false;
   }
@@ -3649,12 +3897,23 @@ class PhantomCore {
     }
 
     if (message.type == MessageType.readReceipt) {
-      final ids = utf8.decode(message.content)
+      final lines = utf8.decode(message.content)
           .split('\n')
           .where((s) => s.isNotEmpty)
           .toList();
-      for (final id in ids) {
-        await storage.updateMessageStatus(senderId, id, MessageStatus.read);
+      final deliveredOnly =
+          lines.isNotEmpty && lines.first == deliveredReceiptMarker;
+      for (final id in deliveredOnly ? lines.skip(1) : lines) {
+        _clearPendingDelivery(senderId, id);
+        if (!deliveredOnly) {
+          await storage.updateMessageStatus(senderId, id, MessageStatus.read);
+          continue;
+        }
+        // Never downgrade: the read receipt can overtake the delivery one.
+        final current = (await storage.getMessage(senderId, id))?.status;
+        if (current != null && current != MessageStatus.read) {
+          await storage.updateMessageStatus(senderId, id, MessageStatus.delivered);
+        }
       }
       // Emit so the sender's chat screen reloads and shows blue double ticks.
       _incomingController.add(StoredMessage.fromPhantomMessage(
@@ -3714,6 +3973,15 @@ class PhantomCore {
       }
       notifyContactChanged(senderId);
       return;
+    }
+
+    if (_receiptTypes.contains(message.type)) {
+      _queueDeliveryReceipt(senderId, message.id);
+      // A re-send of something we already hold: our receipt got lost on the
+      // way back. Re-acknowledge (above) and keep the copy we have — saving
+      // over it would undo a resolved media download, and a second
+      // notification for the same message is noise.
+      if (await storage.getMessage(senderId, message.id) != null) return;
     }
 
     final stored = StoredMessage.fromPhantomMessage(
@@ -3918,15 +4186,18 @@ class PhantomCore {
     // the caller tears down the storage directory underneath it. The lab's
     // temp-dir cleanup used to race a straggler saveSession and blow up
     // with PathNotFoundException attributed to a passing test.
-    await _sessionLock.guard(() async {});
-    for (final lock in _sendLocks.values.toList()) {
-      await lock.guard(() async {});
-    }
-    for (final t in _handshakeRetryTimers.values) {
+    for (final t in [
+      ..._handshakeRetryTimers.values,
+      ..._deliveryRetryTimers.values,
+      ..._receiptFlushTimers.values,
+    ]) {
       t.cancel();
     }
     _handshakeRetryTimers.clear();
     _handshakeRetryAttempts.clear();
+    _deliveryRetryTimers.clear();
+    _receiptFlushTimers.clear();
+    await _sessionLock.guard(() async {});
     await _handshakeStateController.close();
     await _transportSub?.cancel();
     await _transportV2Sub?.cancel();
@@ -3934,8 +4205,18 @@ class PhantomCore {
     await _meshDeliveredSub?.cancel();
     await _meshRangeSub?.cancel();
     await _presenceMediaSub?.cancel();
+    // Transports go down BEFORE the send-lock drain: a send lock is held
+    // through the network phase, and an I2P send now waits for the peer's
+    // ACK (up to its whole retransmit budget, then the handshake re-attempts).
+    // Draining first held dispose hostage to an unanswering peer for minutes,
+    // and a send that finished after storage.close() wrote its status into a
+    // closed box. Disposing the transports fails those sends fast, and they
+    // record their outcome while storage is still open.
     await transport.dispose();
     await _transportV2?.dispose();
+    for (final lock in _sendLocks.values.toList()) {
+      await lock.guard(() async {});
+    }
     _presence?.dispose();
     await storage.close();
     await _incomingController.close();

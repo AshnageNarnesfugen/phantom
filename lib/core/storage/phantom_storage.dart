@@ -58,6 +58,10 @@ class PhantomStorage {
   /// need distinct prefixes or they'd silently share boxes.
   String _boxPrefix = '';
 
+  /// Full names of the boxes this instance opened, so [close] can shut its
+  /// own and nobody else's.
+  final Set<String> _openedBoxes = {};
+
   /// Where this instance's boxes live on disk. Passed explicitly to every
   /// openBox so multiple instances don't depend on the global Hive.init
   /// home (last init call would win otherwise).
@@ -177,6 +181,15 @@ class PhantomStorage {
   Future<StoredMessage?> getLastMessage(String conversationId) async {
     final msgs = await getMessages(conversationId, limit: 1);
     return msgs.isEmpty ? null : msgs.last;
+  }
+
+  Future<StoredMessage?> getMessage(
+      String conversationId, String messageId) async {
+    _assertInitialized();
+    final box  = await _openBox(_messagesBoxName(conversationId));
+    final data = box.get(messageId);
+    if (data == null) return null;
+    return StoredMessageJson.fromJson(Map<String, dynamic>.from(data as Map));
   }
 
   Future<void> updateMessageStatus(
@@ -303,7 +316,11 @@ class PhantomStorage {
 
   Future<List<({int id, Uint8List pub, int rxAtUs})>> getRemoteOpks(String contactId) async {
     final raw = await getSetting<List<dynamic>>('opks_$contactId');
-    if (raw == null) return const [];
+    // Growable: addRemoteOpk/popRemoteOpk edit the result in place. A
+    // `const []` here made the FIRST addRemoteOpk throw, so nothing was ever
+    // saved and the cache stayed empty for good — the remote OPK pool never
+    // held a single key, and every handshake fell back to no-OPK X3DH.
+    if (raw == null) return [];
     return raw.map((e) {
       final m = Map<String, dynamic>.from(e as Map);
       return (
@@ -635,6 +652,7 @@ class PhantomStorage {
 
   Future<Box> _openBox(String name) async {
     final fullName = '$_boxPrefix$name';
+    _openedBoxes.add(fullName);
     if (Hive.isBoxOpen(fullName)) return Hive.box(fullName);
     return Hive.openBox(fullName, encryptionCipher: _cipher, path: _storagePath);
   }
@@ -660,7 +678,14 @@ class PhantomStorage {
   }
 
   Future<void> close() async {
-    await Hive.close();
+    // Only this instance's boxes. Hive.close() shuts every box in the
+    // process: in the labs, where two identities share one, disposing Alice
+    // closed Bob's storage under a send he still had in flight ("Box has
+    // already been closed").
+    for (final name in _openedBoxes.toList()) {
+      if (Hive.isBoxOpen(name)) await Hive.box(name).close();
+    }
+    _openedBoxes.clear();
     _initialized = false;
   }
 

@@ -511,18 +511,24 @@ class TransportManager {
     // often one-directional. I2P has proven reliable in both directions,
     // so we fire it for ALL message types as an additional delivery path.
     // The receiver deduplicates by message ID, so double delivery is safe.
+    //
+    // Through the ACK layer, not as a bare datagram. A bare send "succeeded"
+    // the moment the LOCAL SAM bridge took the UDP packet, so "I2P delivery
+    // OK" was logged for frames that never left a cold router (field,
+    // 2026-10-26: twelve of them, none received) — and that false success
+    // was enough for _firstSuccess to mark the message sent. Now success
+    // means the peer's transport ACKed it, and the retransmits ride out the
+    // lease-set lookup a fresh destination pays for on its first frames.
     final i2p = _activeTransports.whereType<I2PTransport>().firstOrNull;
     final dest = _i2pDests[recipientId];
     if (i2p != null && dest != null && i2p.isAvailable) {
       futures.add(() async {
-        dbg.log('TRANSPORT: firing I2P → ${dest.substring(0, 12)}…');
+        dbg.log('TRANSPORT: firing I2P → ${dest.substring(0, 12)}… (reliable)');
         try {
-          await i2p
-              .publishToDest(dest: dest, data: encryptedEnvelope)
-              .timeout(const Duration(seconds: 12));
-          dbg.log('TRANSPORT: I2P delivery OK');
+          await i2p.publishToDestReliable(dest: dest, data: encryptedEnvelope);
+          dbg.log('TRANSPORT: I2P delivery CONFIRMED (peer ACK)');
         } catch (e) {
-          dbg.log('TRANSPORT: I2P failed ($e)');
+          dbg.log('TRANSPORT: I2P unconfirmed ($e)');
           rethrow;
         }
       }());

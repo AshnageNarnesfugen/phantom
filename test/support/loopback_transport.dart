@@ -19,6 +19,16 @@ class LoopbackHub {
   /// hop would hide.
   Duration latency = Duration.zero;
 
+  /// Silent loss: when it returns true the publish SUCCEEDS but the frame
+  /// never arrives. That is the field failure `online = false` can't model —
+  /// an I2P datagram the local SAM bridge accepted, an IPFS publish into a
+  /// topic with zero mesh peers: the sender logs "delivery OK" and nothing
+  /// lands. Dropped frames are not added to [trace].
+  bool Function(String recipientId, Uint8List bytes)? dropIf;
+
+  /// How many frames [dropIf] swallowed.
+  int dropped = 0;
+
   /// Every frame that crossed the hub, in order — lets tests assert on wire
   /// traffic (how many frames a handshake produced, payload sizes, …).
   final List<({String recipientId, Uint8List bytes})> trace = [];
@@ -36,6 +46,10 @@ class LoopbackHub {
       throw const TransportException('loopback hub is offline');
     }
     if (latency > Duration.zero) await Future<void>.delayed(latency);
+    if (dropIf?.call(recipientId, bytes) ?? false) {
+      dropped++;
+      return;
+    }
     trace.add((recipientId: recipientId, bytes: Uint8List.fromList(bytes)));
     _inbox(recipientId).add(IncomingEnvelope(
       data: Uint8List.fromList(bytes),

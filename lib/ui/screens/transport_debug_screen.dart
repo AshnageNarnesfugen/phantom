@@ -932,7 +932,12 @@ class _DiagnosticReportScreenState extends State<_DiagnosticReportScreen> {
       final name = 'phantom-diagnostic-${now.year}${p(now.month)}${p(now.day)}'
           '-${p(now.hour)}${p(now.minute)}${p(now.second)}.txt';
       final file = File('${dir.path}/$name');
-      await file.writeAsString(_text);
+      // The file carries the whole raw timeline, not the 40-line tail the
+      // on-screen copy shows: correlating two phones means lining up exact
+      // timestamps of every frame in and out, and the 40 lines on either side
+      // rarely overlap.
+      await file.writeAsString(widget.report.build(
+          tailLines: _includeTail ? widget.report.rawTail.length : 0));
       if (!mounted) return;
       setState(() => _savedPath = file.path);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(

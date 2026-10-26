@@ -25,8 +25,28 @@ El hub permite simular condiciones de red:
 - `hub.replay(i)` — reinyecta un frame ya entregado (réplica del store).
 - `hub.trace` — todos los frames que cruzaron, en orden, para asertar sobre
   el tráfico de wire.
+- `hub.dropIf = (to, bytes) => …` — pérdida SILENCIOSA: el publish tiene
+  éxito y el frame no llega. Es la falla real de campo que `online = false`
+  no modela: un datagrama I2P que el SAM local aceptó, un publish IPFS a un
+  tópico sin peers. `hub.dropped` cuenta lo descartado.
+
+`test/e2e/delivery_receipts_test.dart` usa `dropIf` para la entrega
+confirmada: el receptor acusa cada mensaje de chat (`readReceipt` con primera
+línea `@delivered`) y el emisor re-cifra y reenvía el MISMO mensaje (mismo id)
+hasta recibir el acuse — nunca re-envía los bytes viejos, porque un frame ya
+consumido es indescifrable y dispararía el auto-revive. Bases de backoff
+ajustables en test: `PhantomCore.deliveryRetryBase` /
+`PhantomCore.handshakeRetryBase`.
 
 Dividendos:
+- (2026-10-26) Con `dropIf`: el primer mensaje de un chat nuevo se perdía
+  aunque el handshake terminara (lo llevaba un INIT que se evaporó; un frame
+  posterior con el mismo EK armó la sesión) — nada lo reintentaba. Y al
+  aislar el ack perdido salió que **las OPK remotas jamás se guardaron**:
+  `getRemoteOpks` devolvía `const []` y `addRemoteOpk` tronaba en cada
+  preKeyShare; como el error del handler compartía el `try` del descifrado,
+  el frame se registraba como "replay" y en el camino MSG contaba como
+  desync (auto-revive).
 - Cazó la carrera de frames en ráfaga descifrando concurrentemente contra la
   misma sesión ratchet ("no session could decrypt" en cascada). Arreglado
   serializando el procesamiento entrante (`_SerialLock`).

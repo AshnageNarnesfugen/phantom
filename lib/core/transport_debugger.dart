@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'package:flutter/foundation.dart';
 
 /// Severity, inferred from the message itself (the call sites are plain
@@ -69,13 +70,15 @@ class TransportDebugger {
   /// Distinct rows kept. Beyond this the least recently seen group is evicted.
   static const _maxGroups = 400;
 
-  /// Raw lines kept for the tail of a diagnostic report.
-  static const _maxRaw = 400;
+  /// Raw lines kept for the tail of a diagnostic report. A handshake between
+  /// two cold phones logs several hundred lines on its own (every transport
+  /// fan-out, retry and store poll), so 400 lost the start of it.
+  static const _maxRaw = 3000;
 
   final _ctrl = StreamController<LogGroup>.broadcast();
   final _groups = <LogGroup>[];
   final _bySignature = <String, LogGroup>{};
-  final _raw = <String>[];
+  final _raw = ListQueue<String>();
 
   DateTime? _startedAt;
   int _totalLines = 0;
@@ -106,7 +109,7 @@ class TransportDebugger {
     final line = '[$ts] $msg';
 
     _raw.add(line);
-    if (_raw.length > _maxRaw) _raw.removeAt(0);
+    if (_raw.length > _maxRaw) _raw.removeFirst();
 
     final sig = signatureOf(msg);
     final existing = _bySignature[sig];

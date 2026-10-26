@@ -295,19 +295,22 @@ class RatchetSession {
   Future<Uint8List> decrypt(EncryptedMessage msg) async {
     if (_native != null) return _decryptNative(msg);
     RatchetHeader? header;
-    bool isSkipped = false;
+    MessageKey? skippedKey;
 
     // 1. Try current receiving header key
     if (_receivingHeaderKey != null) {
       try {
         final hBytes = await _decryptHeader(msg.encryptedHeader, _receivingHeaderKey!);
         header = RatchetHeader.decode(hBytes);
-        final skippedKey = _trySkippedKey(header);
-        if (skippedKey != null) {
-          isSkipped = true;
-          return _decryptMessage(msg.ciphertext, skippedKey, msg.nonce, msg.encryptedHeader);
-        }
+        skippedKey = _trySkippedKey(header);
       } catch (_) {}
+    }
+    // Outside the try on purpose: the skipped key is single-use and already
+    // removed, so a bad MAC under it is the answer, not a cue to try the next
+    // header key. (The un-awaited return inside the try had the same effect,
+    // by accident of the lint it tripped.)
+    if (skippedKey != null) {
+      return _decryptMessage(msg.ciphertext, skippedKey, msg.nonce, msg.encryptedHeader);
     }
 
     // 2. Try next receiving header key (triggers DH ratchet)
@@ -324,25 +327,21 @@ class RatchetSession {
       throw const RatchetException('Undecipherable header — unknown session or corrupt message.');
     }
 
-    if (!isSkipped) {
-      final needsDhRatchet = _dhRemotePublicKey == null ||
-          !_bytesEqual(header.dhPublicKey, _dhRemotePublicKey!);
+    final needsDhRatchet = _dhRemotePublicKey == null ||
+        !_bytesEqual(header.dhPublicKey, _dhRemotePublicKey!);
 
-      if (needsDhRatchet) {
-        await _skipMessageKeys(header.previousChainLen);
-        await _dhRatchet(header.dhPublicKey);
-      }
-
-      await _skipMessageKeys(header.messageNumber);
-
-      final (newCK, mk) = await _kdfChainKey(_receivingChainKey!);
-      _receivingChainKey = newCK;
-      _receivingN++;
-
-      return _decryptMessage(msg.ciphertext, mk, msg.nonce, msg.encryptedHeader);
+    if (needsDhRatchet) {
+      await _skipMessageKeys(header.previousChainLen);
+      await _dhRatchet(header.dhPublicKey);
     }
 
-    throw const RatchetException('Inconsistent decryption state.');
+    await _skipMessageKeys(header.messageNumber);
+
+    final (newCK, mk) = await _kdfChainKey(_receivingChainKey!);
+    _receivingChainKey = newCK;
+    _receivingN++;
+
+    return _decryptMessage(msg.ciphertext, mk, msg.nonce, msg.encryptedHeader);
   }
 
   // ── Native ratchet path ────────────────────────────────────────────────────
