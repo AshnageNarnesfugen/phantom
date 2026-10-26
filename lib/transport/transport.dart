@@ -1697,8 +1697,22 @@ class I2PTransport implements PhantomTransport {
       _myDest = valueMatch.group(1);
       dbg.log('I2P: session ready — dest=${_myDest!.substring(0, 16)}…');
 
-      // Drain remaining control lines silently so the socket doesn't block.
-      lines.listen((_) {}, onError: (_) {});
+      // Drain remaining control lines silently so the socket doesn't block —
+      // and treat the router hanging up as the end of the session. A SAM
+      // session lives exactly as long as its control socket; when i2pd dies
+      // (power-save stops it in the background, then starts a fresh one on
+      // resume) the new router has never heard of our session id and drops
+      // every datagram sent under it without a word. The maintainer used to
+      // await Socket.done, which only completes when WE close, so the dead
+      // session was kept "ready" until the app restarted (field, 2026-10-26:
+      // the secret chat said "not answering" on both phones for good).
+      // Destroying our end completes done, and the maintainer re-creates it.
+      void hangUp() {
+        if (!identical(_control, s)) return; // a newer session already
+        _ready = false;
+        s.destroy();
+      }
+      lines.listen((_) {}, onError: (_) => hangUp(), onDone: hangUp);
 
       _ready = true;
       _sessionReadyAt = DateTime.now();

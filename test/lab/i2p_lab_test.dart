@@ -58,6 +58,10 @@ void main() {
   }
 
   Future<PhantomCore> spawn(Directory dir) async {
+    // The app persists its SAM private key so the destination survives an
+    // i2pd restart; without this a restarted router would hand out a new
+    // TRANSIENT destination the contact has never heard of.
+    String? savedKey;
     final r = await PhantomCore.createAccount(
       storagePath: dir.path,
       storage: PhantomStorage.isolated(),
@@ -66,6 +70,8 @@ void main() {
           host: '127.0.0.1',
           samPort: bridge.samPort,
           samUdpPort: bridge.samUdpPort,
+          loadKey: () async => savedKey,
+          persistKey: (k) async => savedKey = k,
         ),
       ],
       enablePresence: false,
@@ -146,6 +152,35 @@ void main() {
     expect(bobOnAlice!.i2pDestination, i2pOf(bob).myDestination,
         reason: 'learning must never overwrite the QR-scanned address with a '
             'worse one');
+  });
+
+  test('a restarted i2pd is picked up again — no app restart needed',
+      () async {
+    // Field, 2026-10-26: power-save stopped i2pd in the background and
+    // started it again on resume. The transport never noticed the control
+    // socket die (it awaited Socket.done, which only completes when WE
+    // close), kept sending under a session id the new router had never
+    // heard of, and the secret chat stayed "not answering" until the app
+    // was restarted — on both phones, minutes after both were open.
+    await introduce();
+    final bobId = await _idOf(bob);
+    final staleSession = i2pOf(alice).sessionAge;
+    await bridge.restartRouter();
+
+    final deadline = DateTime.now().add(const Duration(seconds: 40));
+    while (!(i2pOf(alice).isSessionReady &&
+        i2pOf(bob).isSessionReady &&
+        (i2pOf(alice).sessionAge ?? Duration.zero) <
+            (staleSession ?? Duration.zero))) {
+      if (DateTime.now().isAfter(deadline)) {
+        fail('the transport never re-created its SAM session after the '
+            'router restarted');
+      }
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    final bobGets = nextMessage(bob);
+    await alice.sendMessage(recipientId: bobId, text: 'after the restart');
+    expect((await bobGets).textContent, 'after the restart');
   });
 
   test('secret chat: delivered live, I2P-only, filed under its own history',

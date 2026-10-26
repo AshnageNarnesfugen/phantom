@@ -109,6 +109,20 @@ class FakeSamBridge {
     _byDest.clear();
   }
 
+  /// The router process died and came back on the same ports — what the
+  /// app's power-save does to i2pd every time it goes to the background and
+  /// returns. Every control connection is dropped from OUR side (the client
+  /// sees the remote close) and every session is forgotten; a client still
+  /// sending under an old session id is sending into nothing.
+  Future<void> restartRouter() async {
+    for (final c in List.of(_clients)) {
+      try { c.destroy(); } catch (_) {}
+    }
+    _clients.clear();
+    _byId.clear();
+    _byDest.clear();
+  }
+
   /// The public destination the session named [sessionIdPrefix] ended up with.
   /// Tests normally use [destinationOf] via the transport instead.
   String? destinationFor(String sessionIdPrefix) => _byId.entries
