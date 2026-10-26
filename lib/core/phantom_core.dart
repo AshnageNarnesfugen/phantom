@@ -432,6 +432,17 @@ class PhantomCore {
       notifyContactChanged(contactId);
       return;
     }
+    // Our INIT is still unanswered: every encrypt now is another 3.7 KB INIT
+    // frame AND spends one of the session's bounded INIT re-sends
+    // (_maxInitResends) — past which frames go out as plain MSG the peer can
+    // never open without the INIT. The handshake auto-retry is already
+    // nudging; hold without spending an attempt, and the ack kicks us.
+    if (isAwaitingHandshakeAck(contactId)) {
+      _deliveryRetryTimers[key] = Timer(
+          _backoff(deliveryRetryBase, _deliveryRetryCap, attempt),
+          () => unawaited(_runDeliveryRetry(contactId, msgId)));
+      return;
+    }
     dbg.log('DELIVERY: re-send #$attempt of ${msgId.substring(0, 8)} → '
         '${contactId.substring(0, 8)} (no receipt yet)');
     try {
@@ -3706,6 +3717,7 @@ class PhantomCore {
       // secret state from being serialized to hex on every probe.
       final nativeBacked = entry.value.isNativeBacked;
       final snapshot = nativeBacked ? null : entry.value.takeSnapshot();
+      final wasAwaitingAck = entry.value.pendingX3dhEphemeralKey != null;
       final PhantomMessage message;
       try {
         message = await PhantomProtocol(entry.value).decode(frame.payload);
@@ -3738,6 +3750,11 @@ class PhantomCore {
       _lastSuccessfulDecryptAt[entry.key] = DateTime.now();
       _autoReviveStreak.remove(entry.key);
       _cancelHandshakeRetry(entry.key);
+      // The peer's first reply just completed our handshake: whatever the
+      // outbox held back while it was pending goes now, as plain MSG frames.
+      if (wasAwaitingAck && entry.value.pendingX3dhEphemeralKey == null) {
+        _kickDeliveryRetries(entry.key);
+      }
       if (i2pSourceDest != null) {
         await _learnI2pDestFromIncoming(entry.key, i2pSourceDest);
       }
