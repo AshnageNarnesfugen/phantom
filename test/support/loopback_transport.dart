@@ -29,6 +29,12 @@ class LoopbackHub {
   /// How many frames [dropIf] swallowed.
   int dropped = 0;
 
+  /// Delay AFTER the frame is delivered before the publish returns — the
+  /// slow transport of a fan-out (Waku retrying its store confirmation for
+  /// ~30 s) finishing long after the peer already has the frame and has
+  /// answered it. Per recipient, so the answer itself isn't slowed too.
+  Duration? Function(String recipientId)? returnDelay;
+
   /// Every frame that crossed the hub, in order — lets tests assert on wire
   /// traffic (how many frames a handshake produced, payload sizes, …).
   final List<({String recipientId, Uint8List bytes})> trace = [];
@@ -56,6 +62,8 @@ class LoopbackHub {
       transportName: 'loopback',
       receivedAt: DateTime.now(),
     ));
+    final hold = returnDelay?.call(recipientId);
+    if (hold != null) await Future<void>.delayed(hold);
   }
 
   /// Re-injects a previously traced frame — simulates a duplicate delivery

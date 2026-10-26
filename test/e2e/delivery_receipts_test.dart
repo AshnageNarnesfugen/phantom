@@ -95,6 +95,26 @@ void main() {
         await statusOf(alice, bob.myId, sent.id) == MessageStatus.delivered);
   });
 
+  test('un transporte lento que termina después del acuse no baja ✓✓ a ✓',
+      () async {
+    // Campo, 2026-10-26: el acuse volvió en 3 s por I2P mientras Waku seguía
+    // reintentando su confirmación ~30 s; al terminar, el envío escribía
+    // "sent" encima de "delivered".
+    final warm = nextText(bob);
+    await alice.sendMessage(recipientId: bob.myId, text: 'calentar');
+    await warm;
+    hub.returnDelay =
+        (to) => to == bob.myId ? const Duration(seconds: 2) : null;
+    final sending = alice.sendMessage(recipientId: bob.myId, text: 'lento');
+    final got = await nextText(bob);
+    await waitFor(() async =>
+        await statusOf(alice, bob.myId, got.id) == MessageStatus.delivered);
+    await sending;
+    hub.returnDelay = null;
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(await statusOf(alice, bob.myId, got.id), MessageStatus.delivered);
+  });
+
   test('el primer mensaje (INIT) perdido en la red se reenvía y llega',
       () async {
     // Se traga el PRIMER frame hacia Bob — el INIT que lleva el texto. Lo

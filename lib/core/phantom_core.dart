@@ -428,7 +428,7 @@ class PhantomCore {
       dbg.log('DELIVERY: ✗ ${msgId.substring(0, 8)} → '
           '${contactId.substring(0, 8)} never confirmed — giving up');
       _clearPendingDelivery(contactId, msgId);
-      await storage.updateMessageStatus(contactId, msgId, MessageStatus.failed);
+      await storage.advanceMessageStatus(contactId, msgId, MessageStatus.failed);
       notifyContactChanged(contactId);
       return;
     }
@@ -461,7 +461,7 @@ class PhantomCore {
       // a re-send leaves the device it is merely unconfirmed again.
       if (msg.status == MessageStatus.failed &&
           r.status != MessageStatus.failed) {
-        await storage.updateMessageStatus(contactId, msgId, r.status);
+        await storage.advanceMessageStatus(contactId, msgId, r.status);
         notifyContactChanged(contactId);
       }
     } catch (e) {
@@ -1797,7 +1797,7 @@ class PhantomCore {
       await storage.saveMessage(stored);
     }
     Future<void> setStatus(MessageStatus s) async {
-      if (!resend) await storage.updateMessageStatus(recipientId, message.id, s);
+      if (!resend) await storage.advanceMessageStatus(recipientId, message.id, s);
     }
 
     // Classify the outbound frame so the transport layer can pick the right
@@ -2767,7 +2767,7 @@ class PhantomCore {
         _meshDeliveredSub = _transportV2!.delivered.listen((p) async {
           final id = p.fullMessageId, target = p.targetPhantomId;
           if (id == null || target == null) return;
-          await storage.updateMessageStatus(target, id, MessageStatus.sent);
+          await storage.advanceMessageStatus(target, id, MessageStatus.sent);
           // contactChanges makes the open chat + list reload from storage.
           notifyContactChanged(target);
         });
@@ -3927,10 +3927,7 @@ class PhantomCore {
           continue;
         }
         // Never downgrade: the read receipt can overtake the delivery one.
-        final current = (await storage.getMessage(senderId, id))?.status;
-        if (current != null && current != MessageStatus.read) {
-          await storage.updateMessageStatus(senderId, id, MessageStatus.delivered);
-        }
+        await storage.advanceMessageStatus(senderId, id, MessageStatus.delivered);
       }
       // Emit so the sender's chat screen reloads and shows blue double ticks.
       _incomingController.add(StoredMessage.fromPhantomMessage(

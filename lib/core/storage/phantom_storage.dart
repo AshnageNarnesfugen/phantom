@@ -202,6 +202,27 @@ class PhantomStorage {
     await box.put(messageId, msg.copyWith(status: status).toJson());
   }
 
+  /// Like [updateMessageStatus] but never moves a confirmed message back:
+  /// once the peer has acknowledged it (delivered) or read it, a transport
+  /// finishing late ("sent"), a queue flushing ("sent") or a straggling
+  /// failure can't undo that. The delivery receipt routinely beats the
+  /// slowest transport of the original send home.
+  Future<void> advanceMessageStatus(
+      String conversationId, String messageId, MessageStatus status) async {
+    _assertInitialized();
+    final box  = await _openBox(_messagesBoxName(conversationId));
+    final data = box.get(messageId);
+    if (data == null) return;
+    final msg = StoredMessageJson.fromJson(Map<String, dynamic>.from(data as Map));
+    int rank(MessageStatus s) => switch (s) {
+          MessageStatus.read => 2,
+          MessageStatus.delivered => 1,
+          _ => 0,
+        };
+    if (rank(status) < rank(msg.status) || status == msg.status) return;
+    await box.put(messageId, msg.copyWith(status: status).toJson());
+  }
+
   Future<void> deleteMessage(String conversationId, String messageId) async {
     _assertInitialized();
     final box = await _openBox(_messagesBoxName(conversationId));
