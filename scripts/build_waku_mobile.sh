@@ -105,7 +105,7 @@ build_for_abi() {
     "$GO_BIN" build \
       -buildmode=pie \
       -tags="gowaku_no_rln" \
-      -ldflags="-s -w" \
+      -ldflags="-s -w ${WAKU_EXTRA_LDFLAGS:-}" \
       -o "$out_so" \
       ./cmd/waku || return 1
   echo "✓ wrote $out_so ($(du -h "$out_so" | cut -f1))"
@@ -130,8 +130,14 @@ build_version() {
   build_for_abi x86_64    amd64 x86_64-linux-android || return 1
 }
 
-if ! build_version "$WAKU_VERSION" "${GO_PIN:-1.23.11}"; then
+# Go >= 1.23 refuses go:linkname into the standard library unless told
+# otherwise, and go-libp2p's wlynxg/anet links net.zoneCache ("invalid
+# reference to net.zoneCache" — the first CI build of master died on it).
+# Same switch the yggdrasil build uses. The Go 1.20 linker of the fallback
+# doesn't know the flag, so it is set for the master build only.
+if ! WAKU_EXTRA_LDFLAGS="-checklinkname=0" \
+     build_version "$WAKU_VERSION" "${GO_PIN:-1.23.11}"; then
   echo "⚠ go-waku $WAKU_VERSION failed to build — falling back to $WAKU_FALLBACK_VERSION (legacy store only)"
   rm -f "$JNILIBS_DIR"/*/libgowaku.so
-  build_version "$WAKU_FALLBACK_VERSION" "${GO_PIN_FALLBACK:-1.20.14}"
+  WAKU_EXTRA_LDFLAGS="" build_version "$WAKU_FALLBACK_VERSION" "${GO_PIN_FALLBACK:-1.20.14}"
 fi
