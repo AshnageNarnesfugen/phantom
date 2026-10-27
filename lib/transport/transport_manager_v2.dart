@@ -88,22 +88,24 @@ class TransportManagerV2 {
       }),
     );
 
-    // Always start BLE mesh (works in parallel or as fallback)
-    final btOk = await _btMesh.initialize();
-    if (btOk) {
-      await _btMesh.start();
+    // Always start BLE mesh (works in parallel or as fallback). start() is
+    // called even with the radio off: the mesh brings itself up when the
+    // adapter turns on, which it can only do once it is "running". Gating it
+    // on initialize() — which used to misread the adapter as off at start-up
+    // — left the mesh dead on every phone.
+    await _btMesh.initialize();
+    await _btMesh.start();
 
-      // Receive messages from the BLE mesh
-      _subs.add(
-        _btMesh.deliveredEnvelopes.listen((envelope) {
-          _incomingController.add(IncomingEnvelope(
-            data: envelope,
-            source: TransportSource.bluetoothMesh,
-            receivedAt: DateTime.now(),
-          ));
-        }),
-      );
-    }
+    // Receive messages from the BLE mesh
+    _subs.add(
+      _btMesh.deliveredEnvelopes.listen((envelope) {
+        _incomingController.add(IncomingEnvelope(
+          data: envelope,
+          source: TransportSource.bluetoothMesh,
+          receivedAt: DateTime.now(),
+        ));
+      }),
+    );
 
     // Check initial connectivity — v6+ returns List<ConnectivityResult>
     final results = await Connectivity().checkConnectivity();

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:meta/meta.dart';
+import '../../core/transport_debugger.dart';
 import 'mesh_protocol.dart';
 import 'mesh_router.dart';
 import 'message_store.dart';
@@ -101,6 +102,12 @@ class BluetoothMeshTransport {
 
   // Estado
   bool _isRunning = false;
+
+  /// Subscriptions that belong to one BLE run (server, scan results, peer
+  /// characteristics). Cancelled when the radio goes away, so toggling
+  /// Bluetooth doesn't stack a second listener on every stream — each packet
+  /// would then be processed once per toggle.
+  final List<StreamSubscription<dynamic>> _runSubs = [];
   bool _btAvailable = false;
 
   // Stream público de estado del mesh
@@ -161,7 +168,22 @@ class BluetoothMeshTransport {
     // Escuchar relay decisions del router
     _subs.add(_router.packetsToRelay.listen(_broadcastPacket));
 
-    _btAvailable = FlutterBluePlus.adapterStateNow == BluetoothAdapterState.on;
+    // adapterStateNow is `unknown` until the plugin's first state event lands,
+    // a moment after start-up. Reading it straight away said "off" on every
+    // phone, so the caller never called start() — and the adapter listener
+    // above only restarts a mesh that is already running. The BLE mesh had
+    // never once scanned or advertised in the field (no Phantom entry in the
+    // system's GATT scanner/advertiser maps on either phone, 2026-10-26).
+    var state = FlutterBluePlus.adapterStateNow;
+    if (state == BluetoothAdapterState.unknown) {
+      try {
+        state = await FlutterBluePlus.adapterState
+            .firstWhere((s) => s != BluetoothAdapterState.unknown)
+            .timeout(const Duration(seconds: 5));
+      } catch (_) {}
+    }
+    _btAvailable = state == BluetoothAdapterState.on;
+    _log('adapter ${state.name}');
     return _btAvailable;
   }
 
@@ -187,14 +209,16 @@ class BluetoothMeshTransport {
     ).toAdvPayload();
     final startResult = await _gattServer.start(advPayload);
     if (!startResult.success) {
+      _log('✗ GATT server/advertising failed: ${startResult.reason}');
       _emitState(MeshState.unavailable(startResult.reason ?? 'No se pudo iniciar BLE'));
       return;
     }
+    _log('GATT server up, advertising');
 
     // Re-advertise only when the pending boundary flips. Restarting the
     // GATT server is expensive, so we deliberately skip updates that don't
     // change the broadcast bit other scanners can observe.
-    _subs.add(_store.pendingCountStream.listen((count) async {
+    _runSubs.add(_store.pendingCountStream.listen((count) async {
       if (!_isRunning) return;
       final next = count > 0;
       if (next == _lastAdvertisedHasPending) return;
@@ -209,12 +233,12 @@ class BluetoothMeshTransport {
     }));
 
     // Wire incoming GATT server writes to our receive pipeline
-    _subs.add(_gattServer.received.listen((data) {
+    _runSubs.add(_gattServer.received.listen((data) {
       _receivePacket(data);
     }));
 
     // React to server-side lifecycle events
-    _subs.add(_gattServer.events.listen((event) {
+    _runSubs.add(_gattServer.events.listen((event) {
       switch (event) {
         case ClientConnected() || ClientDisconnected():
           _emitState(MeshState.active(peerCount: _peers.length));
@@ -230,12 +254,17 @@ class BluetoothMeshTransport {
     }));
 
     await _startScanning();
+    _log('scanning for Phantom nodes');
     _startAnnounceTimer();
     _startPruneTimer();
     _emitState(MeshState.active(peerCount: _peers.length));
   }
 
   void _stopAll() {
+    for (final sub in _runSubs) {
+      sub.cancel();
+    }
+    _runSubs.clear();
     FlutterBluePlus.stopScan();
     _gattServer.stop();
     _announceTimer?.cancel();
@@ -249,7 +278,7 @@ class BluetoothMeshTransport {
 
   Future<void> _startScanning() async {
     await _kickScanCycle();
-    _subs.add(FlutterBluePlus.scanResults.listen((results) {
+    _runSubs.add(FlutterBluePlus.scanResults.listen((results) {
       for (final result in results) {
         _handleScanResult(result);
       }
@@ -272,7 +301,9 @@ class BluetoothMeshTransport {
         timeout: const Duration(seconds: 30),
         androidUsesFineLocation: false,
       );
-    } catch (_) {}
+    } catch (e) {
+      _log('✗ startScan failed: $e');
+    }
   }
 
   void _handleScanResult(ScanResult result) {
@@ -300,6 +331,11 @@ class BluetoothMeshTransport {
     final contactId = _contactHints.markInRange(adv.nodeHintBytes);
     if (contactId != null && !_contactInRangeController.isClosed) {
       _contactInRangeController.add(contactId);
+    }
+    if (!_peers.containsKey(deviceId)) {
+      _log('found node ${_hex(adv.nodeHintBytes)}'
+          '${contactId != null ? ' = contact ${contactId.substring(0, 8)}' : ''}'
+          ' (rssi ${result.rssi})');
     }
 
     // Ya conocemos el dispositivo → solo refrescamos presencia (arriba) y
@@ -376,6 +412,9 @@ class BluetoothMeshTransport {
         await Future.delayed(const Duration(milliseconds: 50));
       }
 
+      _log('✓ connected to ${peer.hintHex} (mtu ${_peerMtu[deviceId] ?? '?'}), '
+          '${pending.length} pending sent');
+
       // Monitorear desconexión — limpiar caché al desconectar
       _subs.add(peer.device.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
@@ -386,6 +425,7 @@ class BluetoothMeshTransport {
       }));
     } catch (e) {
       // Conexión fallida — no es crítico, intentar de nuevo en el próximo scan
+      _log('✗ connect to ${peer.hintHex} failed: $e');
       _peers.remove(deviceId);
       _peerChars.remove(deviceId);
       try {
@@ -442,8 +482,11 @@ class BluetoothMeshTransport {
     try {
       packet = MeshPacket.deserialize(assembled);
     } catch (e) {
+      _log('✗ undecodable packet (${assembled.length} B): $e');
       return;
     }
+    _log('← ${packet.type.name} ${assembled.length} B'
+        '${fromPeer != null ? ' from ${fromPeer.hintHex}' : ''}');
 
     // Try to match the sender to a known peer via nodeHint if not supplied
     final resolvedPeer = fromPeer ?? _findPeerByHint(packet.originHint);
@@ -520,6 +563,8 @@ class BluetoothMeshTransport {
     );
 
     // Enviar a todos los peers actuales
+    _log('→ message for ${recipientPhantomId.substring(0, 8)} '
+        '(${encryptedEnvelope.length} B) to ${_peers.length} peer(s)');
     await _broadcastPacket(packet);
   }
 
@@ -555,6 +600,13 @@ class BluetoothMeshTransport {
   // ── Estado ────────────────────────────────────────────────────────────────
 
   void _emitState(MeshState s) => _stateController.add(s);
+
+  /// The mesh used to be completely silent — every failure was a bare catch —
+  /// which is how it stayed off for good without anyone noticing.
+  static void _log(String msg) => TransportDebugger.instance.log('MESH: $msg');
+
+  static String _hex(Uint8List b) =>
+      b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
 
   Future<void> stop() async {
     _isRunning = false;
