@@ -139,6 +139,21 @@ void main() {
     hub.returnDelay = null;
   });
 
+  test('un chat abierto detrás de Home no cuenta como visto', () async {
+    // Campo, 2026-10-26: el Nothing quedó con el chat del Thor abierto y el
+    // usuario pulsó Home. El mensaje siguiente llegó (✓✓) SIN notificación
+    // — se suprimía por "chat activo" — y la pantalla de fondo lo marcaba
+    // leído ante el emisor.
+    bob.setActiveChat(alice.myId);
+    expect(bob.isViewingChat(alice.myId), isTrue);
+    await bob.onAppPaused();
+    expect(bob.isViewingChat(alice.myId), isFalse,
+        reason: 'en segundo plano nadie está mirando — hay que notificar');
+    expect(bob.isInForeground, isFalse);
+    await bob.onAppResumed();
+    expect(bob.isViewingChat(alice.myId), isTrue);
+  });
+
   test('el primer mensaje (INIT) perdido en la red se reenvía y llega',
       () async {
     // Se traga el PRIMER frame hacia Bob — el INIT que lleva el texto. Lo

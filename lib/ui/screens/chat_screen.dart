@@ -25,7 +25,7 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// The real contact phantomId (for presence, sending, contact lookup) —
   /// distinct from widget.contactId, which is the conversation key.
   String get _peerId =>
@@ -151,6 +151,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _core = core;
     if (core != null && _sub == null) {
       core.setActiveChat(widget.contactId);
+      WidgetsBinding.instance.addObserver(this);
       _sub = core.incomingMessages.listen((msg) {
         if (msg.conversationId == widget.contactId) _loadMessages(core);
       });
@@ -343,7 +344,13 @@ class _ChatScreenState extends State<ChatScreen> {
       WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
     }
 
-    // Mark all unread incoming messages as read and notify the sender.
+    // Mark all unread incoming messages as read and notify the sender — only
+    // while the user can actually see them. This screen is not disposed when
+    // the app goes to the background, so without the check every message
+    // that arrived behind Home was reported READ to its sender (blue ticks
+    // for something nobody saw). didChangeAppLifecycleState catches up on
+    // resume.
+    if (!core.isInForeground) return;
     final unread = msgs
         .where((m) =>
             m.direction == MessageDirection.incoming &&
@@ -568,8 +575,21 @@ class _ChatScreenState extends State<ChatScreen> {
     return text.length > 60 ? '${text.substring(0, 60)}…' : text;
   }
 
+  /// Back in front: mark what arrived while we were away as read. Deferred a
+  /// frame so the app-level observer (which flips the core to foreground)
+  /// has run first.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final core = _core;
+      if (mounted && core != null) _loadMessages(core);
+    });
+  }
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _core?.setActiveChat(null);
     _secretProbeTimer?.cancel();
     _sub?.cancel();

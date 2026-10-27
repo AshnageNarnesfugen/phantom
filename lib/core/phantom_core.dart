@@ -113,6 +113,17 @@ class PhantomCore {
   String? _activeChatId;
   void setActiveChat(String? contactId) => _activeChatId = contactId;
 
+  /// Whether the user is looking at [conversationId] right now. A chat
+  /// screen stays "active" while the app sits in the background (it is not
+  /// disposed), so the open chat alone said nothing — messages for it
+  /// arrived with NO notification as soon as the user pressed Home (seen on
+  /// the Nothing, 2026-10-26: delivered ✓✓, nothing on the shade).
+  bool isViewingChat(String conversationId) =>
+      !_appInBackground && _activeChatId == conversationId;
+
+  /// True while the app is in the foreground.
+  bool get isInForeground => !_appInBackground;
+
   bool _disposed = false;
 
   // ── INIT rate limit ──────────────────────────────────────────────────────────
@@ -1376,7 +1387,7 @@ class PhantomCore {
       }
     }
 
-    if (_activeChatId != stored.conversationId) {
+    if (!isViewingChat(stored.conversationId)) {
       final contact = await storage.getContact(senderId);
       final who = contact?.displayName ?? senderId.substring(0, 6);
       final preview = switch (stored.type) {
@@ -3973,7 +3984,7 @@ class PhantomCore {
       );
       await storage.saveMessage(stored);
       _incomingController.add(stored);
-      if (_activeChatId != convId) {
+      if (!isViewingChat(convId)) {
         final contact = await storage.getContact(senderId);
         final who = contact?.displayName ?? senderId.substring(0, 6);
         NotificationService.showMessage(
@@ -4034,7 +4045,7 @@ class PhantomCore {
       }
     }
 
-    if (_activeChatId != senderId) {
+    if (!isViewingChat(senderId)) {
       final contact = await storage.getContact(senderId);
       final name    = contact?.displayName ?? senderId.substring(0, 6);
       final preview = switch (message.type) {
