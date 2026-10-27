@@ -65,6 +65,9 @@ dependencies:
 
   # ── Image picker (wallpaper + avatar) ──────────────────────────────────────
   image_picker: ^1.1.2
+  # Pure-Dart JPEG encode/resize for photos before sending (core/image_prep.dart).
+  # Already in the lockfile as a transitive dependency of the QR stack.
+  image: ^4.9.1
 
   # ── Media / file / audio ───────────────────────────────────────────────────
   # file_picker pinned to 8.x — 9.x onwards removed FilePicker.platform.

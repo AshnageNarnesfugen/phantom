@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
@@ -17,6 +18,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 import 'package:record/record.dart';
 import '../theme/phantom_theme.dart';
+import '../../core/image_prep.dart';
 import '../../core/link_preview_service.dart';
 import '../../core/protocol/message.dart' show MessageStatus, MessageType;
 
@@ -1318,13 +1320,19 @@ class _MessageInputState extends State<MessageInput> {
             onTap: () async {
               Navigator.pop(ctx);
               final picked = await ImagePicker().pickImage(
-                  source: ImageSource.gallery, imageQuality: 80);
+                  source: ImageSource.gallery, imageQuality: 80,
+                  maxWidth: sendImageMaxSide.toDouble(),
+                  maxHeight: sendImageMaxSide.toDouble());
               if (picked == null || widget.onSendFile == null) return;
               final raw  = await picked.readAsBytes();
-              final bytes = widget.onEditImage != null
+              final edited = widget.onEditImage != null
                   ? await widget.onEditImage!(raw) ?? raw
                   : raw;
-              widget.onSendFile!(bytes, picked.name);
+              // The editor hands back a full-size PNG; send a bounded JPEG
+              // (see prepareImageForSend). Off the UI thread: a 12 MP decode
+              // is hundreds of milliseconds.
+              final bytes = await compute(prepareImageForSend, edited);
+              widget.onSendFile!(bytes, jpgName(picked.name));
             }),
           _AttachItem(icon: Icons.videocam_outlined, label: 'video from gallery', tokens: t,
             onTap: () async {
@@ -1339,13 +1347,19 @@ class _MessageInputState extends State<MessageInput> {
             onTap: () async {
               Navigator.pop(ctx);
               final picked = await ImagePicker().pickImage(
-                  source: ImageSource.camera, imageQuality: 80);
+                  source: ImageSource.camera, imageQuality: 80,
+                  maxWidth: sendImageMaxSide.toDouble(),
+                  maxHeight: sendImageMaxSide.toDouble());
               if (picked == null || widget.onSendFile == null) return;
               final raw  = await picked.readAsBytes();
-              final bytes = widget.onEditImage != null
+              final edited = widget.onEditImage != null
                   ? await widget.onEditImage!(raw) ?? raw
                   : raw;
-              widget.onSendFile!(bytes, picked.name);
+              // The editor hands back a full-size PNG; send a bounded JPEG
+              // (see prepareImageForSend). Off the UI thread: a 12 MP decode
+              // is hundreds of milliseconds.
+              final bytes = await compute(prepareImageForSend, edited);
+              widget.onSendFile!(bytes, jpgName(picked.name));
             }),
           _AttachItem(icon: Icons.folder_outlined, label: 'file', tokens: t,
             onTap: () async {
@@ -2231,7 +2245,11 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
     if (_sending) return;
     setState(() => _sending = true);
     try {
-      final result = await _applyTransforms();
+      // Untouched: hand back the original. Re-rendering it only to rotate by
+      // nothing produced a full-resolution PNG several times the JPEG's size.
+      final result = _rotation == 0 && !_flipH
+          ? widget.bytes
+          : await _applyTransforms();
       if (mounted) Navigator.pop(context, result);
     } catch (_) {
       if (mounted) Navigator.pop(context);
