@@ -117,6 +117,17 @@ class PhantomGattServer(
     private fun startAdvertising(msdPayload: ByteArray) {
         val advertiser = btAdapter.bluetoothLeAdvertiser ?: return
 
+        // start() is called again whenever the "has pending" bit flips. Without
+        // stopping the previous set first, its callback was overwritten and
+        // that advertiser could never be stopped again: every flip leaked one
+        // more, each on its own random address. Scanners then saw this node
+        // twice per scan, connected to both at once, and Android answered
+        // GATT 133 to every connection (both phones, 2026-10-26).
+        advertiseCallback?.let { previous ->
+            try { advertiser.stopAdvertising(previous) } catch (_: Exception) {}
+            advertiseCallback = null
+        }
+
         // msdPayload = [0xFF, 0xFF, 0x50, h0, h1, h2, h3, caps]
         // Android addManufacturerData(companyId=0xFFFF, data=[0x50, h0, h1, h2, h3, caps])
         val companyId = 0xFFFF

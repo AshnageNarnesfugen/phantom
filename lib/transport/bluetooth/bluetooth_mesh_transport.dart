@@ -332,15 +332,16 @@ class BluetoothMeshTransport {
     if (contactId != null && !_contactInRangeController.isClosed) {
       _contactInRangeController.add(contactId);
     }
-    if (!_peers.containsKey(deviceId)) {
-      _log('found node ${_hex(adv.nodeHintBytes)}'
-          '${contactId != null ? ' = contact ${contactId.substring(0, 8)}' : ''}'
-          ' (rssi ${result.rssi})');
-    }
 
     // Ya conocemos el dispositivo → solo refrescamos presencia (arriba) y
     // salimos; no reconectamos.
     if (_peers.containsKey(deviceId)) return;
+    // The same node seen under a second address (an advertiser restart, or
+    // a BLE private-address rotation): it is the same peer. Two concurrent
+    // connects to one phone are what Android answers with GATT 133.
+    if (_peers.values.any((p) => _hintMatches(p.nodeHint, adv!.nodeHintBytes))) {
+      return;
+    }
 
     final peer = MeshPeer(
       device: result.device,
@@ -350,6 +351,9 @@ class BluetoothMeshTransport {
     );
 
     _peers[deviceId] = peer;
+    _log('found node ${_hex(adv.nodeHintBytes)}'
+        '${contactId != null ? ' = contact ${contactId.substring(0, 8)}' : ''}'
+        ' (rssi ${result.rssi})');
     _emitState(MeshState.active(peerCount: _peers.length));
 
     // Conectar y hacer handshake
