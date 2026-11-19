@@ -155,7 +155,10 @@ class PhantomGattServer(
                     ADVERTISE_FAILED_INTERNAL_ERROR,
                     ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> {
                         mainHandler.postDelayed({
-                            if (advertiseCallback != null) {
+                            // Only retry if this is still the live set: after a
+                            // restart or stop() this callback is orphaned, and
+                            // restarting it would leak an unstoppable advertiser.
+                            if (advertiseCallback === this) {
                                 btAdapter.bluetoothLeAdvertiser
                                     ?.startAdvertising(settings, data, this)
                             }
@@ -176,14 +179,17 @@ class PhantomGattServer(
 
     fun stop() {
         val cb = advertiseCallback
-        if (cb != null) {
-            btAdapter.bluetoothLeAdvertiser?.stopAdvertising(cb)
-            advertiseCallback = null
+        advertiseCallback = null
+        try {
+            if (cb != null) btAdapter.bluetoothLeAdvertiser?.stopAdvertising(cb)
+        } catch (_: Exception) {
+            // Permission revoked or adapter off: still tear down the server.
+        } finally {
+            try { gattServer?.close() } catch (_: Exception) {}
+            gattServer = null
+            phantomChar = null
+            connectedDevices.clear()
         }
-        gattServer?.close()
-        gattServer = null
-        phantomChar = null
-        connectedDevices.clear()
     }
 
     // ── Notify all connected centrals ─────────────────────────────────────────
